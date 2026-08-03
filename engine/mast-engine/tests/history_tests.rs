@@ -227,3 +227,72 @@ async fn a_second_engine_does_not_silence_the_first() {
         .await;
     }
 }
+
+/// The redactor can learn a secret while a command is still running — a
+/// project imported mid-run, an `.env` written. What was recorded at start was
+/// redacted with what was known *then*, so the finish must re-run it through
+/// what is known *now*; otherwise the argv keeps the secret for the life of
+/// the ring while the output beside it is clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_learned_mid_command_scrubs_what_was_recorded_at_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "lateapp");
+    std::fs::write(project.join(".env"), "DB_PASSWORD=hunter2secretvalue\n").unwrap();
+    let engine = test_engine(tmp.path());
+    engine.start();
+
+    // A command that starts before anything knows the secret and only finishes
+    // when we say so — a gate, not a sleep, so the ordering is not a race.
+    let gate = tmp.path().join("gate");
+    let slow: Vec<String> = [
+        "bash".to_string(),
+        "-c".to_string(),
+        format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; echo slowtag-hunter2secretvalue-slowtag",
+            gate.display()
+        ),
+    ]
+    .to_vec();
+    let running = tokio::spawn(async move {
+        let _ = mast_docker::run_command(&slow, None, &[], Duration::from_secs(30), 64 * 1024).await;
+    });
+    wait_for_history(&engine, "the gated command to start", |entry| {
+        argv_of(entry).iter().any(|arg| arg.contains("slowtag-"))
+            && matches!(entry.outcome, HistoryOutcome::Running)
+    })
+    .await;
+
+    // Now teach the engine the secret, and wait until it has actually landed.
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let argv: Vec<String> = ["bash", "-c", "echo probe-hunter2secretvalue-probe"]
+            .map(String::from)
+            .to_vec();
+        let _ = mast_docker::run_command(&argv, None, &[], Duration::from_secs(10), 64 * 1024).await;
+        let entry = wait_for_history(&engine, "the probe", |entry| {
+            entry.output.iter().any(|line| line.contains("probe-"))
+        })
+        .await;
+        if entry.output.iter().all(|line| !line.contains("hunter2secretvalue")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for the redactor to learn the secret");
+    }
+
+    std::fs::write(&gate, b"go").unwrap();
+    running.await.unwrap();
+
+    let entry = wait_for_history(&engine, "the gated command to finish", |entry| {
+        entry.output.iter().any(|line| line.contains("slowtag-"))
+    })
+    .await;
+    assert!(
+        entry.output.iter().all(|line| !line.contains("hunter2secretvalue")),
+        "output must be redacted: {entry:?}"
+    );
+    assert!(
+        argv_of(&entry).iter().all(|arg| !arg.contains("hunter2secretvalue")),
+        "the argv recorded before the secret was known must be scrubbed at finish: {entry:?}"
+    );
+}
