@@ -270,6 +270,7 @@ async function apply() {
                   :model-value="currentTag(entry)"
                   :options="entry.versions.map((v) => ({ value: v, label: v }))"
                   :disabled="store.readOnly"
+                  size="sm"
                   @update:model-value="(tag: string) => openVersionPreview(entry, tag)"
                 />
               </div>
