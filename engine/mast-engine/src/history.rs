@@ -225,6 +225,24 @@ impl Engine {
         entry.outcome = outcome;
         entry.duration_ms = started.map(|at| at.elapsed().as_millis() as u64);
         entry.output = output_tail.iter().map(|line| redactor.redact(line)).collect();
+        // The union redactor can learn a secret while the command runs — a
+        // project imported mid-run, an `.env` written. What was recorded at
+        // start was redacted with what was known then, so re-run it through
+        // what is known now; redaction is idempotent. (An entry that both
+        // started and finished before the secret was known keeps its argv:
+        // nothing here knew it was a secret at the time.)
+        entry.label = redactor.redact_token(&entry.label);
+        if let HistoryDetail::Command { argv, cwd, env, .. } = &mut entry.detail {
+            for arg in argv.iter_mut() {
+                *arg = redactor.redact_token(arg);
+            }
+            if let Some(cwd) = cwd {
+                *cwd = redactor.redact_token(cwd);
+            }
+            for var in env.iter_mut().filter(|var| !var.masked) {
+                var.value = redactor.redact_token(&var.value);
+            }
+        }
         let updated = entry.clone();
         drop(history);
         let _ = self.inner.history_tx.send(updated);
