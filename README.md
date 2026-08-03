@@ -36,11 +36,25 @@ Discover, run, inspect, repair, and organise your Laravel Sail and Docker Compos
 
 ---
 
+## Why Mast?
+
+Laravel Herd delivers a polished local development experience, but it's only available on macOS and Windows and doesn't use Laravel Sail's containerised workflow. Docker Desktop manages containers, but isn't designed around Sail.
+
+Mast brings that experience to Laravel Sail. See what's running at a glance, launch complete workspaces in seconds, and get into your development workflow faster without giving up the containerised environment you already use.
+
+Docker remains the source of truth, and Mast stays in sync with changes made from the terminal.
+
+---
+
 ## A look around
 
 Every project gets one pane: its services, the app processes running inside them, and your own saved commands.
 
 <img src="docs/media/project.png" alt="Project pane showing service, process, and command chips for a running Sail project" width="900">
+
+The tray carries the same controls, so a workspace or a single project is two clicks away without opening the window. Verbs that don't apply to the current state are disabled.
+
+<img src="docs/media/tray.png" alt="Tray menu: workspaces, a Projects submenu listing every project with its status, and per-project Start, Stop, and Restart" width="456">
 
 Diagnostics checks the things that break a local environment, and each finding carries a repair with a risk tier and a preview of exactly what it will change.
 
@@ -53,16 +67,6 @@ Common services are one click away, matched to your compose file by image rather
 `.env` is editable in place, with secrets masked until you ask for them.
 
 <img src="docs/media/env.png" alt="Env panel with APP_KEY and DB_PASSWORD masked" width="900">
-
----
-
-## Why Mast?
-
-Laravel Herd delivers a polished local development experience, but it's only available on macOS and Windows and doesn't use Laravel Sail's containerised workflow. Docker Desktop manages containers, but isn't designed around Sail.
-
-Mast brings that experience to Laravel Sail. See what's running at a glance, launch complete workspaces in seconds, and get into your development workflow faster without giving up the containerised environment you already use.
-
-Docker remains the source of truth, and Mast stays in sync with changes made from the terminal.
 
 ---
 
