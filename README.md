@@ -15,6 +15,10 @@ Discover, run, inspect, repair, and organise your Laravel Sail and Docker Compos
 
 **Linux first.** macOS and Windows adapters coming soon.
 
+<img src="docs/media/workspace-start.gif" alt="Starting the Acme workspace: billing-api starts first, Mast waits for it to become healthy, then storefront follows" width="900">
+
+<sub>Starting a workspace. Members start in dependency order, and each layer waits for the one before it to report healthy.</sub>
+
 </div>
 
 ## Features
@@ -29,6 +33,26 @@ Discover, run, inspect, repair, and organise your Laravel Sail and Docker Compos
 - 🔧 Diagnostics with guided repairs
 - 🚀 Create Laravel projects without local PHP
 - 💻 Desktop app, system tray, and `mast` CLI
+
+---
+
+## A look around
+
+Every project gets one pane: its services, the app processes running inside them, and your own saved commands.
+
+<img src="docs/media/project.png" alt="Project pane showing service, process, and command chips for a running Sail project" width="900">
+
+Diagnostics checks the things that break a local environment, and each finding carries a repair with a risk tier and a preview of exactly what it will change.
+
+<img src="docs/media/diagnostics.png" alt="Diagnostics dialog listing two errors, each with a Repair button" width="900">
+
+Common services are one click away, matched to your compose file by image rather than by name.
+
+<img src="docs/media/services.png" alt="Services catalog showing installed and available services with version selectors" width="900">
+
+`.env` is editable in place, with secrets masked until you ask for them.
+
+<img src="docs/media/env.png" alt="Env panel with APP_KEY and DB_PASSWORD masked" width="900">
 
 ---
 
