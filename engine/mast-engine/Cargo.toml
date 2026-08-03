@@ -1,0 +1,26 @@
+[package]
+name = "mast-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mast-contract.workspace = true
+mast-compose.workspace = true
+mast-docker.workspace = true
+mast-project.workspace = true
+mast-registry.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+libc = "0.2.189"
+mast-diagnostics = { workspace = true }
+mast-laravel = { version = "0.1.0", path = "../mast-laravel" }
+mast-yaml-edit = { version = "0.1.0", path = "../mast-yaml-edit" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

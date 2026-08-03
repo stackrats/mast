@@ -1,0 +1,17 @@
+[package]
+name = "mast-client-local"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mast-contract.workspace = true
+mast-client.workspace = true
+mast-engine.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+mast-docker.workspace = true
+mast-project.workspace = true
+futures.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

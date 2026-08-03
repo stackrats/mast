@@ -1,0 +1,23 @@
+x-base: &base
+  restart: unless-stopped
+  labels: &lbl
+    com.example.team: platform
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  app:
+    <<: [*base, *logging]
+    image: repo/app:1.0
+    labels:
+      <<: *lbl
+      com.example.tier: web
+  worker:
+    <<: *base
+    image: repo/worker:1.0
+    restart: always
+  clone:
+    image: repo/app:1.0
+    labels: *lbl

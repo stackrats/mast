@@ -1,0 +1,12 @@
+explicit_str: !!str 123
+custom_tag: !myapp/thing {a: 1}
+tilde_null: ~
+word_null: null
+empty_value:
+empty_map: {}
+empty_seq: []
+services:
+  app:
+    image: repo/app:1
+    entrypoint: !reset null
+    user: !!str "1000"

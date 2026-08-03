@@ -1,0 +1,968 @@
+//! Diagnostics wiring (plan §8): the engine gathers `DiagCtx` facts (docker
+//! probes, filesystem inspection — all effect-context work), hands them to
+//! the pure check set in `mast-diagnostics`, and applies repairs through the
+//! same transactional machinery every other mutation uses. Every run and
+//! every applied repair lands in the rusqlite history db.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use mast_contract::{
+    DiagSeverity, DiagnosticFinding, DiagnosticReport, DiagnosticRunSummary, DiagnosticsHistory,
+    ErrorInfo, FileEditPreview, ProjectId, RepairAuditEntry, RepairOffer, RepairPlan, RepairRisk,
+};
+use mast_diagnostics::{
+    DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
+    SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
+    REPAIR_DOCKER_GROUP, REPAIR_NODE_INSTALL, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+};
+use mast_docker::run_command;
+
+use crate::{Engine, OperationEventKind, OperationId, workspace_summaries};
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_CAP: usize = 64 * 1024;
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn severity_to_contract(s: Severity) -> DiagSeverity {
+    match s {
+        Severity::Info => DiagSeverity::Info,
+        Severity::Warning => DiagSeverity::Warning,
+        Severity::Error => DiagSeverity::Error,
+    }
+}
+
+fn risk_to_contract(r: RiskTier) -> RepairRisk {
+    match r {
+        RiskTier::Safe => RepairRisk::Safe,
+        RiskTier::Caution => RepairRisk::Caution,
+        RiskTier::HighRisk => RepairRisk::HighRisk,
+    }
+}
+
+fn offer_to_contract(spec: RepairSpec) -> RepairOffer {
+    RepairOffer {
+        id: spec.id.to_string(),
+        title: spec.title,
+        risk: risk_to_contract(spec.risk),
+        description: spec.description,
+        arg: spec.arg,
+    }
+}
+
+/// The official Composer image. It ships PHP itself, so Mast never needs PHP
+/// on the host, and it tracks current PHP (8.5 today) — unlike the
+/// `laravelsail/phpXX-composer` images the docs used to point at, which are no
+/// longer documented and stop at 8.4.
+pub(crate) const COMPOSER_IMAGE: &str = "composer:latest";
+
+/// `docker run` prefix for [`COMPOSER_IMAGE`], mounting `dir` as the workdir.
+///
+/// `entrypoint` overrides the image's own (which is `composer`) — pass `php`
+/// to run Artisan. `COMPOSER_HOME` is redirected because the default cache
+/// path is not writable once `-u` drops us to the host user.
+fn composer_run(dir: &Path, uid: u32, gid: u32, entrypoint: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = ["docker", "run", "--rm", "-u"].map(String::from).into();
+    argv.push(format!("{uid}:{gid}"));
+    argv.extend(["-e".into(), "COMPOSER_HOME=/tmp".into(), "-v".into()]);
+    argv.push(format!("{}:/var/www/html", dir.display()));
+    argv.extend(["-w".into(), "/var/www/html".into()]);
+    if let Some(entrypoint) = entrypoint {
+        argv.extend(["--entrypoint".into(), entrypoint.into()]);
+    }
+    argv.push(COMPOSER_IMAGE.into());
+    argv
+}
+
+/// Containerized `composer install`.
+pub(crate) fn composer_install_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
+    let mut argv = composer_run(dir, uid, gid, None);
+    argv.extend(["install", "--ignore-platform-reqs"].map(String::from));
+    argv
+}
+
+/// Containerized `composer require laravel/sail --dev`.
+pub(crate) fn sail_require_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
+    let mut argv = composer_run(dir, uid, gid, None);
+    argv.extend(["require", "laravel/sail", "--dev", "--ignore-platform-reqs"].map(String::from));
+    argv
+}
+
+/// Containerized `php artisan sail:install --with=…` (non-interactive).
+pub(crate) fn sail_install_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
+    let mut argv = composer_run(dir, uid, gid, Some("php"));
+    argv.extend(
+        ["artisan", "sail:install", "--with=mysql,redis,mailpit", "--no-interaction"]
+            .map(String::from),
+    );
+    argv
+}
+
+/// Node installs run *inside* the app container rather than in a throwaway
+/// image the way composer's do. Two reasons: the container already carries
+/// npm, pnpm, yarn and bun (Sail's runtimes install them from PHP 8.2 on), and
+/// native modules have to be compiled against the Node that will load them.
+/// The cost is that the stack must be up — unlike `composer install`, which is
+/// what makes a vendor-less clone runnable in the first place.
+pub(crate) fn node_install_argv(
+    invocation: &mast_compose::ComposeInvocation,
+    dir: &Path,
+    manager: mast_project::PackageManager,
+    frozen: bool,
+) -> Vec<String> {
+    let tail = manager.install_argv(frozen);
+    match &invocation.runner {
+        // Terminal parity: the same line the developer would type.
+        mast_compose::Runner::Sail { script } => {
+            let mut argv = vec![script.to_string_lossy().into_owned()];
+            argv.extend(tail);
+            argv
+        }
+        mast_compose::Runner::DockerCompose => crate::project_ops::compose_exec_argv(
+            invocation,
+            &crate::project_ops::app_service_of(dir),
+            &tail,
+        ),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn uid_gid() -> (u32, u32) {
+    // SAFETY: getuid/getgid are always safe to call.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+/// Windows adapter TODO: WWWUSER parity is a unix-permissions concern.
+#[cfg(not(unix))]
+pub(crate) fn uid_gid() -> (u32, u32) {
+    (0, 0)
+}
+
+fn unix_socket_path(endpoint: &str) -> Option<&str> {
+    endpoint.strip_prefix("unix://")
+}
+
+fn socket_facts(path: &str) -> SocketFacts {
+    let exists = Path::new(path).exists();
+    #[cfg(unix)]
+    let writable = exists && {
+        let c_path = std::ffi::CString::new(path).ok();
+        // SAFETY: access() with a valid NUL-terminated path is safe.
+        c_path.is_some_and(|p| unsafe { libc::access(p.as_ptr(), libc::W_OK) } == 0)
+    };
+    #[cfg(not(unix))]
+    let writable = exists;
+    SocketFacts { path: path.to_string(), exists, writable }
+}
+
+#[cfg(unix)]
+fn free_bytes(path: &str) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: statvfs with a valid path pointer and zeroed out-struct.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &str) -> Option<u64> {
+    None
+}
+
+struct ProjectSeed {
+    id: String,
+    name: String,
+    path: PathBuf,
+    resolution_error: Option<String>,
+    service_names: Vec<String>,
+    host_ports: Vec<(String, u16)>,
+    external_networks: Vec<String>,
+}
+
+/// Filesystem half of a project's facts — runs in `spawn_blocking`.
+fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
+    let env_path = seed.path.join(".env");
+    let env_present = env_path.is_file();
+    let env = mast_compose::parse_env_file(&env_path);
+    let env_error_count = if env_present {
+        let src = std::fs::read_to_string(&env_path).unwrap_or_default();
+        let parsed = mast_laravel::EnvFile::parse(&src);
+        let pairs: Vec<(String, String)> =
+            parsed.entries().map(|e| (e.key.clone(), e.value.clone())).collect();
+        mast_laravel::validate(&pairs, &seed.service_names)
+            .iter()
+            .filter(|f| f.severity == mast_laravel::Severity::Error)
+            .count()
+    } else {
+        0
+    };
+    let node = mast_project::inspect_node_project(&seed.path);
+    ProjectFacts {
+        sail_flavored: mast_project::is_sail_flavored(&seed.path),
+        is_laravel: std::fs::read_to_string(seed.path.join("composer.json"))
+            .map(|c| c.contains("laravel/framework"))
+            .unwrap_or(false),
+        has_compose: mast_project::has_compose_file(&seed.path),
+        has_vendor: seed.path.join("vendor").is_dir(),
+        package_manager: node.as_ref().map(|n| n.manager.as_str().to_string()),
+        node_lockfile: node.as_ref().is_some_and(|n| n.frozen),
+        has_node_modules: node.as_ref().is_some_and(|n| n.has_node_modules),
+        conflicting_lockfiles: node
+            .as_ref()
+            .map(|n| n.conflicting_lockfiles.clone())
+            .unwrap_or_default(),
+        env_present,
+        env_example_present: seed.path.join(".env.example").is_file(),
+        wwwuser: env.get("WWWUSER").cloned(),
+        wwwgroup: env.get("WWWGROUP").cloned(),
+        env_error_count,
+        id: seed.id,
+        name: seed.name,
+        host_ports: seed.host_ports,
+        external_networks: seed.external_networks,
+        resolution_error: seed.resolution_error,
+    }
+}
+
+impl Engine {
+    async fn gather_diag_ctx(&self) -> DiagCtx {
+        let (docker, seeds, workspace_issues, docker_host_env) = {
+            let st = self.inner.state.lock().unwrap();
+            let seeds: Vec<ProjectSeed> = st
+                .projects
+                .values()
+                .map(|e| ProjectSeed {
+                    id: e.record.id.clone(),
+                    name: e.summary.name.clone(),
+                    path: e.record.path.clone(),
+                    resolution_error: e.summary.resolution_error.clone(),
+                    service_names: e
+                        .model
+                        .as_ref()
+                        .map(|m| {
+                            m.services
+                                .iter()
+                                .flat_map(|s| {
+                                    std::iter::once(s.name.clone())
+                                        .chain(s.aliases.iter().cloned())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    host_ports: e.host_ports.clone(),
+                    external_networks: e
+                        .model
+                        .as_ref()
+                        .map(|m| m.external_networks.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            let issues = workspace_summaries(&st)
+                .into_iter()
+                .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
+                .collect();
+            let docker_host_env = self
+                .inner
+                .deps
+                .process_env
+                .get("DOCKER_HOST")
+                .is_some_and(|v| !v.is_empty());
+            (st.docker.clone(), seeds, issues, docker_host_env)
+        };
+
+        let compose_version = {
+            let argv: Vec<String> =
+                ["docker", "compose", "version", "--short"].map(String::from).into();
+            run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                .await
+                .ok()
+                .filter(|o| o.success())
+                .map(|o| o.stdout.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        // Security options + data root in one daemon round trip.
+        let (rootless, docker_root) = {
+            let argv: Vec<String> =
+                ["docker", "info", "--format", "{{.SecurityOptions}}\t{{.DockerRootDir}}"]
+                    .map(String::from)
+                    .into();
+            match run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP).await {
+                Ok(out) if out.success() => {
+                    let line = out.stdout.lines().next().unwrap_or_default();
+                    let (security, root) = line.split_once('\t').unwrap_or((line, ""));
+                    (Some(security.contains("rootless")), Some(root.trim().to_string()))
+                }
+                _ => (None, None),
+            }
+        };
+
+        let docker_networks = if docker.available {
+            let argv: Vec<String> =
+                ["docker", "network", "ls", "--format", "{{.Name}}"].map(String::from).into();
+            run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                .await
+                .ok()
+                .filter(|o| o.success())
+                .map(|o| o.stdout.lines().map(|l| l.trim().to_string()).collect())
+        } else {
+            None
+        };
+
+        let endpoint = docker.endpoint.clone();
+        let (uid, gid) = uid_gid();
+        let socket = endpoint.as_deref().and_then(unix_socket_path).map(socket_facts);
+        // Disk facts only make sense for a local daemon.
+        let disk_free_bytes = match (&socket, &docker_root) {
+            (Some(_), Some(root)) if !root.is_empty() && Path::new(root).exists() => {
+                free_bytes(root)
+            }
+            _ => None,
+        };
+        let snap_docker = docker_root.as_deref().is_some_and(|r| r.contains("/var/snap"))
+            || endpoint.as_deref().is_some_and(|e| e.contains("/snap"));
+        let selinux_enforcing = std::fs::read_to_string("/sys/fs/selinux/enforce")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+
+        let projects = tokio::task::spawn_blocking(move || {
+            seeds.into_iter().map(inspect_project).collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+
+        DiagCtx {
+            system: SystemFacts {
+                docker_connected: docker.available,
+                docker_error: docker.error.clone(),
+                endpoint,
+                context_name: docker.context_name.clone(),
+                docker_host_env,
+                compose_version,
+                socket,
+                rootless,
+                snap_docker,
+                disk_free_bytes,
+                selinux_enforcing,
+                uid,
+                gid,
+            },
+            projects,
+            docker_networks,
+            workspace_issues,
+        }
+    }
+
+    fn finding_to_contract(&self, f: Finding) -> DiagnosticFinding {
+        let project_name = f.project.as_ref().and_then(|id| {
+            let st = self.inner.state.lock().unwrap();
+            st.projects.get(id).map(|e| e.summary.name.clone())
+        });
+        DiagnosticFinding {
+            check: f.check.to_string(),
+            severity: severity_to_contract(f.severity),
+            title: f.title,
+            detail: f.detail,
+            project: f.project.map(ProjectId),
+            project_name,
+            repair: f.repair.map(offer_to_contract),
+        }
+    }
+
+    /// Run every applicable check and record the run in history. Failure to
+    /// record is logged, never fatal — the report is the point.
+    pub async fn run_diagnostics(&self) -> Result<DiagnosticReport, ErrorInfo> {
+        let ctx = self.gather_diag_ctx().await;
+        let (checks_run, findings) = mast_diagnostics::run_all(&ctx);
+        let taken_unix = now_unix();
+
+        let db_path = self.inner.deps.store.diagnostics_db_path();
+        let for_history = findings.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            DiagnosticsDb::open(&db_path)?.record_run(taken_unix, checks_run, &for_history)
+        })
+        .await;
+        if let Ok(Err(e)) = recorded {
+            tracing::warn!("failed to record diagnostics run: {e}");
+        }
+
+        Ok(DiagnosticReport {
+            taken_unix,
+            checks_run: checks_run as u32,
+            findings: findings.into_iter().map(|f| self.finding_to_contract(f)).collect(),
+        })
+    }
+
+    pub async fn diagnostics_history(&self) -> Result<DiagnosticsHistory, ErrorInfo> {
+        let db_path = self.inner.deps.store.diagnostics_db_path();
+        tokio::task::spawn_blocking(move || {
+            let db = DiagnosticsDb::open(&db_path)
+                .map_err(crate::internal_err)?;
+            let runs = db
+                .recent_runs(20)
+                .map_err(crate::internal_err)?
+                .into_iter()
+                .map(|r| DiagnosticRunSummary {
+                    id: r.id,
+                    taken_unix: r.taken_unix,
+                    checks_run: r.checks_run,
+                    errors: r.errors,
+                    warnings: r.warnings,
+                    infos: r.infos,
+                })
+                .collect();
+            let repairs = db
+                .recent_repairs(20)
+                .map_err(crate::internal_err)?
+                .into_iter()
+                .map(|r| RepairAuditEntry {
+                    applied_unix: r.applied_unix,
+                    repair: r.repair,
+                    project_name: r.project_name,
+                    risk: r.risk,
+                    outcome: r.outcome,
+                })
+                .collect();
+            Ok(DiagnosticsHistory { runs, repairs })
+        })
+        .await
+        .map_err(crate::internal_err)?
+    }
+
+    /// What a repair will do, before consent. Env-file repairs return a full
+    /// before/after preview; command repairs describe their exact argv.
+    pub async fn repair_preview(
+        &self,
+        repair: &str,
+        arg: Option<&str>,
+        project: Option<&ProjectId>,
+    ) -> Result<RepairPlan, ErrorInfo> {
+        let spec = mast_diagnostics::repair_spec(repair, arg)
+            .ok_or_else(|| ErrorInfo::InvalidInput { message: format!("unknown repair {repair}") })?;
+        let offer = offer_to_contract(spec);
+        let (uid, gid) = uid_gid();
+
+        match repair {
+            REPAIR_SET_WWWUSER => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let before = std::fs::read_to_string(&env_path)
+                        .map_err(crate::internal_err)?;
+                    let mut file = mast_laravel::EnvFile::parse(&before);
+                    let mut summary = Vec::new();
+                    for (key, value) in [
+                        ("WWWUSER".to_string(), uid.to_string()),
+                        ("WWWGROUP".to_string(), gid.to_string()),
+                    ] {
+                        if file.get(&key).map(|e| e.value.clone()) != Some(value.clone()) {
+                            file.set(&key, &value)
+                                .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                            summary.push(format!("set {key}={value}"));
+                        }
+                    }
+                    let no_op = summary.is_empty();
+                    if no_op {
+                        summary.push("already matching your uid/gid".into());
+                    }
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            after: file.to_string(),
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_COPY_ENV_EXAMPLE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let example_path = path.join(".env.example");
+                    let no_op = env_path.exists();
+                    let after = std::fs::read_to_string(&example_path)
+                        .map_err(|_| ErrorInfo::InvalidInput {
+                            message: "no .env.example to copy from".into(),
+                        })?;
+                    let summary = if no_op {
+                        vec![".env already exists — nothing to do".to_string()]
+                    } else {
+                        vec![format!("create .env as a copy of .env.example")]
+                    };
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            before: String::new(),
+                            after,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_COMPOSER_INSTALL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let argv = composer_install_argv(&path, uid, gid);
+                    Ok(RepairPlan {
+                        summary: vec![
+                            format!("run: {}", argv.join(" ")),
+                            format!("in: {}", path.display()),
+                            format!(
+                                "{COMPOSER_IMAGE} carries its own PHP — nothing is installed on \
+                                 the host"
+                            ),
+                        ],
+                        repair: offer,
+                        file_preview: None,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_NODE_INSTALL => {
+                let project = self.require_project(project)?;
+                let (invocation, dir, _) = self.process_context(project)?;
+                let (manager, frozen) = self.node_install_target(&dir, arg)?;
+                let argv = node_install_argv(&invocation, &dir, manager, frozen);
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: {}", argv.join(" ")),
+                        format!("in: {}", dir.display()),
+                        if frozen {
+                            format!(
+                                "the committed lockfile is honoured — {} refuses to \
+                                 re-resolve it",
+                                manager.as_str()
+                            )
+                        } else {
+                            "no lockfile is committed, so this will write one".to_string()
+                        },
+                        "runs in the app container, which must be running".into(),
+                    ],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_CREATE_NETWORK => {
+                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "create-network needs a network name".into(),
+                })?;
+                Ok(RepairPlan {
+                    summary: vec![format!("run: docker network create {net}")],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_SAIL_INSTALL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    Ok(RepairPlan {
+                        summary: vec![
+                            format!("run: {}", sail_require_argv(&path, uid, gid).join(" ")),
+                            format!("then: {}", sail_install_argv(&path, uid, gid).join(" ")),
+                            "sail:install writes compose.yaml with mysql, redis and \
+                             mailpit (editable afterwards via the Services card)"
+                                .into(),
+                        ],
+                        repair: offer,
+                        file_preview: None,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_DOCKER_GROUP => {
+                let user = self.current_username()?;
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: pkexec usermod -aG docker {user}"),
+                        "asks for elevation via polkit".into(),
+                        "log out and back in for group membership to apply".into(),
+                    ],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            _ => unreachable!("repair_spec covered above"),
+        }
+    }
+
+    /// Which manager to install with, and whether the install can be frozen.
+    ///
+    /// The finding carries the manager it detected, but the repo can have moved
+    /// on between the report and the click, so detection is re-run and the
+    /// `arg` is only honoured when it still matches something real. Re-reading
+    /// is also what supplies `frozen` — the finding does not carry it.
+    fn node_install_target(
+        &self,
+        dir: &Path,
+        arg: Option<&str>,
+    ) -> Result<(mast_project::PackageManager, bool), ErrorInfo> {
+        let node = mast_project::inspect_node_project(dir).ok_or_else(|| {
+            ErrorInfo::InvalidInput {
+                message: format!("{} has no package.json — nothing to install", dir.display()),
+            }
+        })?;
+        match arg.and_then(mast_project::PackageManager::parse) {
+            // The repo changed its mind since the report was generated; the
+            // lockfile on disk wins over a stale click.
+            Some(requested) if requested != node.manager => Err(ErrorInfo::Conflict {
+                message: format!(
+                    "this project now uses {}, not {} — re-run diagnostics",
+                    node.manager.as_str(),
+                    requested.as_str()
+                ),
+            }),
+            _ => Ok((node.manager, node.frozen)),
+        }
+    }
+
+    fn require_project<'p>(&self, project: Option<&'p ProjectId>) -> Result<&'p ProjectId, ErrorInfo> {
+        project.ok_or_else(|| ErrorInfo::InvalidInput {
+            message: "this repair needs a project".into(),
+        })
+    }
+
+    fn current_username(&self) -> Result<String, ErrorInfo> {
+        self.inner
+            .deps
+            .process_env
+            .get("USER")
+            .filter(|u| !u.is_empty())
+            .cloned()
+            .ok_or_else(|| ErrorInfo::Internal { message: "cannot determine your username".into() })
+    }
+
+    /// Apply a repair (already previewed client-side). Streams output for the
+    /// command-shaped ones; records an audit row whatever the outcome.
+    pub(crate) async fn apply_repair(
+        &self,
+        handle: &std::sync::Arc<crate::OpHandle>,
+        op: OperationId,
+        repair: &str,
+        arg: Option<&str>,
+        project: Option<&ProjectId>,
+    ) -> Result<(), ErrorInfo> {
+        let result = self.apply_repair_inner(handle, op, repair, arg, project).await;
+
+        let risk = mast_diagnostics::repair_spec(repair, arg)
+            .map(|s| s.risk)
+            .unwrap_or(RiskTier::Safe);
+        let project_name = project.and_then(|p| {
+            let st = self.inner.state.lock().unwrap();
+            st.projects.get(&p.0).map(|e| e.summary.name.clone())
+        });
+        let outcome = match &result {
+            Ok(()) => "applied".to_string(),
+            Err(e) => format!("failed: {e:?}"),
+        };
+        let db_path = self.inner.deps.store.diagnostics_db_path();
+        let repair_owned = repair.to_string();
+        let recorded = tokio::task::spawn_blocking(move || {
+            DiagnosticsDb::open(&db_path)?.record_repair(
+                now_unix(),
+                &repair_owned,
+                project_name.as_deref(),
+                risk,
+                &outcome,
+            )
+        })
+        .await;
+        if let Ok(Err(e)) = recorded {
+            tracing::warn!("failed to record repair audit: {e}");
+        }
+        result
+    }
+
+    async fn apply_repair_inner(
+        &self,
+        handle: &std::sync::Arc<crate::OpHandle>,
+        op: OperationId,
+        repair: &str,
+        arg: Option<&str>,
+        project: Option<&ProjectId>,
+    ) -> Result<(), ErrorInfo> {
+        let (uid, gid) = uid_gid();
+        match repair {
+            REPAIR_SET_WWWUSER => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                tokio::task::spawn_blocking(move || {
+                    mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                        f.set("WWWUSER", &uid.to_string())?;
+                        f.set("WWWGROUP", &gid.to_string())
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::env_write_error)?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_COPY_ENV_EXAMPLE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    if env_path.exists() {
+                        return Err(ErrorInfo::Conflict {
+                            message: ".env already exists — refusing to overwrite".into(),
+                        });
+                    }
+                    std::fs::copy(path.join(".env.example"), &env_path)
+                        .map(|_| ())
+                        .map_err(crate::internal_err)
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_CREATE_NETWORK => {
+                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "create-network needs a network name".into(),
+                })?;
+                let argv: Vec<String> =
+                    ["docker", "network", "create", net].map(String::from).into();
+                let out = run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                // Idempotent by design: racing an existing network is success.
+                if out.success() || out.stderr.contains("already exists") {
+                    self.hint();
+                    Ok(())
+                } else {
+                    Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
+                }
+            }
+            REPAIR_COMPOSER_INSTALL => {
+                let project = self.require_project(project)?;
+                let (path, redactor) = {
+                    let st = self.inner.state.lock().unwrap();
+                    let entry = st.projects.get(&project.0).ok_or(ErrorInfo::NotFound {
+                        what: format!("project {}", project.0),
+                    })?;
+                    (entry.record.path.clone(), entry.redactor.clone())
+                };
+                let argv = composer_install_argv(&path, uid, gid);
+                self.run_streamed_command(handle, op, &argv, Some(&path), &redactor,
+                    // First run pulls the composer image and the whole
+                    // dependency tree — generous.
+                    Duration::from_secs(30 * 60))
+                    .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_NODE_INSTALL => {
+                let project = self.require_project(project)?;
+                let (invocation, dir, redactor) = self.process_context(project)?;
+                let (manager, frozen) = self.node_install_target(&dir, arg)?;
+                let argv = node_install_argv(&invocation, &dir, manager, frozen);
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output { line: format!("$ {}", argv.join(" ")), stderr: false },
+                );
+                // A cold pnpm/npm store on a large frontend is slow, and the
+                // first run may pull the app image too.
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&dir),
+                    &redactor,
+                    Duration::from_secs(30 * 60),
+                )
+                .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_SAIL_INSTALL => {
+                let project = self.require_project(project)?;
+                let (path, redactor) = {
+                    let st = self.inner.state.lock().unwrap();
+                    let entry = st.projects.get(&project.0).ok_or(ErrorInfo::NotFound {
+                        what: format!("project {}", project.0),
+                    })?;
+                    (entry.record.path.clone(), entry.redactor.clone())
+                };
+                let timeout = Duration::from_secs(30 * 60);
+                let require = sail_require_argv(&path, uid, gid);
+                self.run_streamed_command(handle, op, &require, Some(&path), &redactor, timeout)
+                    .await?;
+                let install = sail_install_argv(&path, uid, gid);
+                self.run_streamed_command(handle, op, &install, Some(&path), &redactor, timeout)
+                    .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_DOCKER_GROUP => {
+                let user = self.current_username()?;
+                let argv: Vec<String> =
+                    ["pkexec", "usermod", "-aG", "docker", user.as_str()].map(String::from).into();
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    None,
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "{user} added to the docker group — log out and back in, then \
+                             re-run diagnostics."
+                        ),
+                        stderr: false,
+                    },
+                );
+                Ok(())
+            }
+            other => {
+                Err(ErrorInfo::InvalidInput { message: format!("unknown repair {other}") })
+            }
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project dir resolvable by `mast_compose`, with the Node shape the
+    /// test needs. `sail` present makes the invocation a Sail runner.
+    fn node_project(files: &[(&str, &str)], sail: bool) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("compose.yaml"), "services: {}\n").unwrap();
+        for (name, body) in files {
+            std::fs::write(tmp.path().join(name), body).unwrap();
+        }
+        if sail {
+            std::fs::create_dir_all(tmp.path().join("vendor/bin")).unwrap();
+            std::fs::write(tmp.path().join("vendor/bin/sail"), "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    tmp.path().join("vendor/bin/sail"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+        }
+        tmp
+    }
+
+    fn invocation(dir: &Path) -> mast_compose::ComposeInvocation {
+        mast_compose::resolve_invocation(dir, &std::collections::HashMap::new()).unwrap()
+    }
+
+    #[test]
+    fn node_install_on_sail_is_the_line_the_developer_would_type() {
+        let tmp = node_project(&[("package.json", "{}"), ("pnpm-lock.yaml", "")], true);
+        let node = mast_project::inspect_node_project(tmp.path()).unwrap();
+        let argv = node_install_argv(&invocation(tmp.path()), tmp.path(), node.manager, node.frozen);
+        assert!(argv[0].ends_with("vendor/bin/sail"), "{argv:?}");
+        assert_eq!(&argv[1..], ["pnpm", "install", "--frozen-lockfile"]);
+    }
+
+    #[test]
+    fn node_install_without_sail_execs_in_the_app_service() {
+        let tmp = node_project(&[("package.json", "{}"), (".env", "APP_SERVICE=api\n")], false);
+        let node = mast_project::inspect_node_project(tmp.path()).unwrap();
+        let argv = node_install_argv(&invocation(tmp.path()), tmp.path(), node.manager, node.frozen);
+        let exec_at = argv.iter().position(|a| a == "exec").unwrap();
+        // No lockfile committed, so npm may resolve freely.
+        assert_eq!(&argv[exec_at..], ["exec", "-T", "api", "npm", "install"]);
+    }
+
+    #[test]
+    fn a_committed_lockfile_freezes_the_install() {
+        let tmp = node_project(&[("package.json", "{}"), ("package-lock.json", "{}")], false);
+        let node = mast_project::inspect_node_project(tmp.path()).unwrap();
+        let argv = node_install_argv(&invocation(tmp.path()), tmp.path(), node.manager, node.frozen);
+        assert_eq!(argv.last().unwrap(), "ci");
+    }
+
+    #[test]
+    fn composer_argv_matches_laravel_docs() {
+        let argv = composer_install_argv(Path::new("/home/me/app"), 1000, 1000);
+        assert_eq!(
+            argv,
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-u",
+                "1000:1000",
+                "-e",
+                "COMPOSER_HOME=/tmp",
+                "-v",
+                "/home/me/app:/var/www/html",
+                "-w",
+                "/var/www/html",
+                "composer:latest",
+                "install",
+                "--ignore-platform-reqs",
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn sail_install_argvs_share_the_composer_image_contract() {
+        let dir = Path::new("/home/me/app");
+        let require = sail_require_argv(dir, 1000, 1000);
+        // The image's own entrypoint is composer, so the verb comes first.
+        assert_eq!(
+            &require[require.len() - 4..],
+            ["require", "laravel/sail", "--dev", "--ignore-platform-reqs"]
+        );
+        assert!(require.contains(&COMPOSER_IMAGE.to_string()));
+        assert!(!require.contains(&"--entrypoint".to_string()));
+
+        let install = sail_install_argv(dir, 1000, 1000);
+        assert_eq!(
+            &install[install.len() - 4..],
+            ["artisan", "sail:install", "--with=mysql,redis,mailpit", "--no-interaction"]
+        );
+        assert!(install.contains(&COMPOSER_IMAGE.to_string()));
+        // Artisan needs php, which means overriding the composer entrypoint.
+        let entrypoint = install.iter().position(|a| a == "--entrypoint").expect("entrypoint");
+        assert_eq!(install[entrypoint + 1], "php");
+        assert!(entrypoint < install.iter().position(|a| a == COMPOSER_IMAGE).unwrap());
+    }
+}

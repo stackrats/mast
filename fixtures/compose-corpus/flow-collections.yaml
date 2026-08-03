@@ -1,0 +1,9 @@
+services:
+  app:
+    image: repo/app:1
+    environment: {FOO: bar, EMPTY: "", NUM: 3, NESTED_JSONISH: '{"a": [1, 2]}'}
+    ports: [{target: 80, published: 8080, protocol: tcp}, "9090:90"]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+    deploy:
+      placement: {constraints: [node.role == manager, "node.labels.zone != z1"]}
+volumes: {data: {}, cache: null}

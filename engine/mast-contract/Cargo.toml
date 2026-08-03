@@ -1,0 +1,11 @@
+[package]
+name = "mast-contract"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+specta.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

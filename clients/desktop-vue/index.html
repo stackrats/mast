@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mast</title>
+    <script>
+      // Apply the persisted theme before first paint so neither the splash
+      // nor the app flashes the wrong background (mirrors lib/prefs.ts).
+      try {
+        var theme = localStorage.getItem("mast.theme");
+        var dark =
+          theme === "dark" ||
+          (theme !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      } catch (_) {}
+    </script>
+    <style>
+      html {
+        background: #ffffff;
+      }
+      html.dark {
+        background: #0a0a0a;
+      }
+      /* Splash shown until Vue mounts and replaces #app's children. */
+      #splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+      }
+      /* The wordmark is drawn from block glyphs, so it has to stay on a
+         monospace family with tight, uniform line boxes or the rows shear. */
+      #splash pre {
+        margin: 0;
+        font-family:
+          "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", ui-monospace, SFMono-Regular, Menlo,
+          Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.05;
+        letter-spacing: 0;
+        white-space: pre;
+        color: #334155;
+      }
+      html.dark #splash pre {
+        color: #cbd5e1;
+      }
+      #splash p {
+        margin: 0;
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: #737373;
+      }
+      html.dark #splash p {
+        color: #a3a3a3;
+      }
+      /* 54 columns wide, so it needs ~430px at 13px. Shrink rather than let
+         the rows wrap, which would destroy the shape. */
+      @media (max-width: 560px) {
+        #splash pre {
+          font-size: 9px;
+        }
+      }
+      @media (max-width: 380px) {
+        #splash pre {
+          font-size: 7px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="splash">
+        <pre aria-label="Mast">
+ ██╗██╗        ███╗   ███╗  █████╗  ███████╗ ████████╗
+ ██║█████╗     ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝
+ ██║████████╗  ██╔████╔██║ ███████║ ███████╗    ██║
+ ██║█████╔═╝   ██║╚██╔╝██║ ██╔══██║ ╚════██║    ██║
+ ██║██╔═╝      ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║
+ ╚═╝╚═╝        ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝</pre>
+        <p>control tower for local Laravel Sail</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

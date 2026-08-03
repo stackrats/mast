@@ -1,0 +1,14 @@
+[package]
+name = "mast-client-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mast-contract.workspace = true
+mast-client.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true

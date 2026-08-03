@@ -1,0 +1,20 @@
+[package]
+name = "mast-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mast"
+path = "src/main.rs"
+
+[dependencies]
+mast-contract.workspace = true
+mast-client.workspace = true
+mast-client-local = { workspace = true }
+mast-engine.workspace = true
+mast-project.workspace = true
+mast-client-ipc.workspace = true
+mast-daemon.workspace = true
+clap = { version = "4", features = ["derive"] }
+futures.workspace = true
+tokio.workspace = true

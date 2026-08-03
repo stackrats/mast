@@ -1,0 +1,23 @@
+# gnarly kitchen sink
+x-hc: &hc
+  interval: 10s
+  retries: 3
+
+services:
+  api: # the api
+    image: ghcr.io/acme/api:${TAG:?tag required}
+    healthcheck:
+      <<: *hc
+      test: ["CMD-SHELL", "curl -fsS localhost/up || exit 1"]
+    environment:
+      - FOO=bar            # list-form env
+      - 'QUOTED=with space'
+      - EMPTY=
+    command: >
+      serve --port 8080
+      --workers 4
+    labels: {a: 1, "b:c": {d: [e, {f: g}]}}
+  worker:
+    image: ghcr.io/acme/worker:${TAG:?tag required}
+    depends_on:
+      api: {condition: service_healthy}

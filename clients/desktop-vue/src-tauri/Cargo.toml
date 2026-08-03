@@ -1,0 +1,38 @@
+[package]
+name = "mast-desktop"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "mast_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mast-contract.workspace = true
+mast-client.workspace = true
+mast-client-local.workspace = true
+mast-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+specta.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta-typescript = "=0.0.9"
+mast-project.workspace = true
+mast-daemon.workspace = true
+tracing.workspace = true
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-dialog = "2.4.0"
+
+# Raising the window from the tray needs a real X11 activation (see
+# tray::reveal_window). Versions must track the gtk stack tao/wry already
+# link, or the handle types won't match.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdkx11 = "0.18"

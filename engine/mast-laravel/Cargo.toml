@@ -1,0 +1,12 @@
+[package]
+name = "mast-laravel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+mast-docker = { path = "../mast-docker" }
+tempfile = "3.27.0"
+tokio = "1"

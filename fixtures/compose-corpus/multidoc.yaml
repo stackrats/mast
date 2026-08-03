@@ -1,0 +1,9 @@
+%YAML 1.2
+---
+doc: one
+list: [a, b]
+---
+doc: two
+nested:
+  x: 1
+...

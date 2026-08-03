@@ -1,0 +1,26 @@
+services:
+  app:
+    image: repo/app:1
+    healthcheck:
+      test: |
+        CMD-SHELL
+        curl -fsS http://localhost/up || exit 1
+    entrypoint: >-
+      sh -c
+      "echo starting &&
+       exec app"
+    environment:
+      BANNER: |+
+        line one
+          indented line
+        line three
+
+      MOTD: |2
+          two-space indicator keeps this leading indent
+        back to normal
+      FOLDED: >
+        folded
+        into one line
+
+        second paragraph
+      AFTER: plain

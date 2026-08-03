@@ -1,0 +1,20 @@
+# header comment
+# second header line
+
+services: # trailing on key
+  # comment before service
+  app:
+    image: repo/app:1 # trailing on value
+    ports:
+      # comment inside sequence
+      - "8080:80" # trailing on item
+      - "9090:90"
+    # comment after sequence
+    environment:
+      FOO: bar # after scalar
+      # between pairs
+      BAZ: qux # last pair has a comment too
+  # between services
+  db:
+    image: repo/db:1
+# footer comment

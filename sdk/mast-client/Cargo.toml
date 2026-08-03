@@ -1,0 +1,10 @@
+[package]
+name = "mast-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mast-contract.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true

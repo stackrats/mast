@@ -1,0 +1,17 @@
+{
+  "name": "mast",
+  "private": true,
+  "scripts": {
+    "dev": "vp run --filter ./clients/desktop-vue dev",
+    "build": "vp run --filter ./clients/desktop-vue build",
+    "test": "vp run --filter ./clients/desktop-vue test",
+    "check": "vp run --filter ./clients/desktop-vue check",
+    "fallback:verify": "bash scripts/verify-vanilla-fallback.sh",
+    "prepare": "vp config"
+  },
+  "devDependencies": {
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "packageManager": "pnpm@11.1.2"
+}

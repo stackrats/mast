@@ -1,0 +1,9 @@
+services:
+  app:
+    image: alpine:latest
+    command: ["sleep", "600"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      timeout: 1s
+      retries: 2

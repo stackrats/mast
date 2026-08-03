@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (Linux) — clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Early cross-platform honesty (plan §9): Linux ships first, but macOS and
+  # Windows must at least type-check every commit.
+  check-macos:
+    name: cargo check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  check-windows:
+    name: cargo check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  # Primary frontend toolchain: Vite Plus (vp) — check (fmt+lint+types),
+  # tests, and production build, exactly as local dev runs them.
+  frontend-vp:
+    name: Frontend — Vite Plus
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/desktop-vue
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Vite Plus
+        run: curl -fsSL https://vite.plus | bash
+      - name: vp install
+        run: |
+          export PATH="$HOME/.vite-plus/bin:$PATH"
+          vp install
+      - name: vp check + test + build
+        run: |
+          export PATH="$HOME/.vite-plus/bin:$PATH"
+          vp check
+          vp test run
+          vp build
+
+  # Proves the vanilla vite/vitest escape hatch continuously (plan §9): the
+  # workspace routes `vite` to vite-plus-core via a pnpm override, so this
+  # assembles the frontend with plain vite + vitest in a temp dir and runs
+  # the suite + build there. If Vite Plus (beta) breaks, this stays green.
+  frontend-fallback:
+    name: Frontend — vanilla vite fallback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bash scripts/verify-vanilla-fallback.sh

@@ -1,0 +1,13 @@
+services:
+  app:
+    image: "repo/app:${TAG:-latest}"
+    environment:
+      DQ: "line1\nline2\t\"quoted\" é accent"
+      SQ: 'it''s got ''doubled'' quotes'
+      PLAIN_INTERP: ${APP_PORT:-80}
+      COLON_VALUE: "key: value looking"
+      HASH_VALUE: "not # a comment"
+      UNICODE: "καλημέρα — 你好 — 🚀"
+      EMPTY_DQ: ""
+      SPACES: "  padded  "
+    command: ["sh", "-c", "echo \"hi there\" && exit 0"]

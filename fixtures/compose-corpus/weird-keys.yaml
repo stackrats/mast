@@ -1,0 +1,13 @@
+"quoted:key:with:colons": v1
+22:22: time-looking-key
+no: boolean-looking-key
+"on": quoted-on
+? |
+  explicit block key
+: block-key-value
+services:
+  "my.service-name":
+    image: repo/x:1
+    labels:
+      "com.example/slash": ok
+      com.example.numeric.0: zero

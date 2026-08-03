@@ -1,0 +1,18 @@
+services:
+  laravel.test:
+    image: "alpine:latest"
+    command: ["sleep", "600"]
+    environment:
+      WWWUSER: "${WWWUSER}"
+      WWWGROUP: "${WWWGROUP}"
+      APP_PORT_SEEN: "${APP_PORT:-80}"
+    networks:
+      - sail
+  redis:
+    image: "alpine:latest"
+    command: ["sleep", "600"]
+    networks:
+      - sail
+networks:
+  sail:
+    driver: bridge

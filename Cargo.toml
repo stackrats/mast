@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+  "engine/mast-contract",
+  "engine/mast-compose",
+  "engine/mast-docker",
+  "engine/mast-registry",
+  "engine/mast-engine",
+  "engine/mast-project",
+  "sdk/mast-client",
+  "sdk/mast-client-local",
+  "clients/desktop-vue/src-tauri",
+  "engine/mast-yaml-edit",
+  "engine/mast-laravel",
+  "engine/mast-diagnostics",
+  "clients/mast-cli",
+  "daemon/mast-daemon",
+  "sdk/mast-client-ipc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+mast-contract = { path = "engine/mast-contract" }
+mast-compose = { path = "engine/mast-compose" }
+mast-docker = { path = "engine/mast-docker" }
+mast-registry = { path = "engine/mast-registry" }
+mast-engine = { path = "engine/mast-engine" }
+mast-project = { path = "engine/mast-project" }
+mast-client = { path = "sdk/mast-client" }
+mast-client-local = { path = "sdk/mast-client-local" }
+mast-diagnostics = { path = "engine/mast-diagnostics" }
+mast-daemon = { path = "daemon/mast-daemon" }
+mast-client-ipc = { path = "sdk/mast-client-ipc" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "process",
+  "fs",
+  "io-util",
+] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+# RC-grade tooling pinned exactly per plan §9 (lockfiles committed too).
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
