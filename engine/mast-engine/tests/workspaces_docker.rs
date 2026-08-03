@@ -213,3 +213,104 @@ async fn workspace_start_waits_for_health_and_orders_members() {
         sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(dir)).await;
     }
 }
+
+/// Regression: two members that publish the same host port only through a
+/// compose default must be warned about *before* the start that would fail.
+///
+/// Sail writes `'${VITE_PORT:-5173}:${VITE_PORT:-5173}'`, so a pair of
+/// projects that never set `VITE_PORT` both claim 5173 with nothing in either
+/// `.env` to compare — the shape that used to slip through the collision check
+/// and surface only as `start failed (exit 1) — dependents blocked`.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_warns_on_ports_that_collide_only_via_compose_defaults() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let mut dirs = Vec::new();
+    for (name, app_port) in [("one", 8181), ("two", 8182)] {
+        let dir = tmp.path().join(format!("mast-it-vite{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            concat!(
+                "services:\n",
+                "  laravel.test:\n",
+                "    image: alpine:latest\n",
+                "    command: ['sleep', '600']\n",
+                "    ports:\n",
+                "      - '${APP_PORT:-80}:80'\n",
+                "      - '${VITE_PORT:-5173}:${VITE_PORT:-5173}'\n",
+            ),
+        )
+        .unwrap();
+        // APP_PORT differs per project; VITE_PORT is deliberately absent.
+        std::fs::write(dir.join(".env"), format!("APP_PORT={app_port}\n")).unwrap();
+        dirs.push(dir);
+    }
+
+    let engine = Engine::new(
+        EngineConfig {
+            hint_debounce: Duration::from_millis(100),
+            reconcile_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+        EngineDeps {
+            connector: Arc::new(RealConnector),
+            store: MetadataStore::open(tmp.path().join("meta")).unwrap(),
+            process_env: HashMap::new(),
+            runner: Arc::new(RealLifecycleRunner),
+            ownership: acquire_ownership(Some(tmp.path().join("lock"))),
+        },
+    );
+    engine.start();
+
+    for dir in &dirs {
+        let op = engine
+            .dispatch(Action::ImportProject { path: dir.to_string_lossy().into() })
+            .unwrap();
+        let mut events = engine.operation_events(op).unwrap();
+        while let Some(e) = events.next().await {
+            if e.kind.is_terminal() {
+                break;
+            }
+        }
+    }
+    let snap = wait_until(&engine, "both resolved", Duration::from_secs(30), |s| {
+        s.projects.len() == 2 && s.projects.iter().all(|p| p.compose_project_name.is_some())
+    })
+    .await;
+
+    let members: Vec<WorkspaceMember> = snap
+        .projects
+        .iter()
+        .map(|p| WorkspaceMember { project: p.id.clone(), depends_on: vec![] })
+        .collect();
+    let op = engine
+        .dispatch(Action::SaveWorkspace { id: None, name: "vite-clash".into(), members })
+        .unwrap();
+    let mut events = engine.operation_events(op).unwrap();
+    while let Some(e) = events.next().await {
+        if e.kind.is_terminal() {
+            break;
+        }
+    }
+
+    let snap = wait_until(&engine, "collision warning", Duration::from_secs(30), |s| {
+        s.workspaces.first().is_some_and(|w| w.warnings.iter().any(|x| x.contains("5173")))
+    })
+    .await;
+    let warnings = &snap.workspaces[0].warnings;
+    assert!(
+        warnings.iter().any(|w| w.contains("5173")),
+        "the compose-default collision must be warned about: {warnings:#?}"
+    );
+    // The per-project APP_PORTs differ, so they must not be reported.
+    assert!(
+        !warnings.iter().any(|w| w.contains("8181") || w.contains("8182")),
+        "distinct APP_PORTs are not a collision: {warnings:#?}"
+    );
+}
