@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { cva } from "class-variance-authority";
 import { Check, ChevronDown } from "lucide-vue-next";
 import {
   SelectContent,
@@ -12,21 +13,39 @@ import {
   SelectViewport,
 } from "reka-ui";
 
+import { cn } from "../../lib/utils";
+
 const model = defineModel<string>({ default: "" });
-defineProps<{
+const { size = "default" } = defineProps<{
   options: { value: string; label: string }[];
   placeholder?: string;
   disabled?: boolean;
+  size?: "default" | "sm";
 }>();
+
+// Sizes mirror Button's, so a Select in a row with buttons sits flush with
+// them: `default` pairs with Button `default`, `sm` with Button `sm`.
+const trigger = cva(
+  "flex w-full items-center justify-between gap-2 overflow-hidden rounded-md border border-slate-200 bg-white whitespace-nowrap shadow-xs transition-colors outline-none focus-visible:border-slate-400 disabled:opacity-50 data-placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900",
+  {
+    variants: {
+      size: {
+        default: "h-8 px-2.5 py-1 text-sm",
+        sm: "h-7 px-2 py-0.5 text-xs",
+      },
+    },
+  },
+);
 </script>
 
 <template>
   <SelectRoot v-model="model" :disabled="disabled">
-    <SelectTrigger
-      class="flex h-8 w-full items-center justify-between gap-2 overflow-hidden rounded-md border border-slate-200 bg-white px-2.5 py-1 text-sm whitespace-nowrap shadow-xs transition-colors outline-none focus-visible:border-slate-400 disabled:opacity-50 data-placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900"
-    >
+    <SelectTrigger :class="cn(trigger({ size }))">
       <SelectValue class="truncate" :placeholder="placeholder ?? ''" />
-      <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-400" />
+      <ChevronDown
+        class="shrink-0 text-slate-400"
+        :class="size === 'sm' ? 'h-3 w-3' : 'h-3.5 w-3.5'"
+      />
     </SelectTrigger>
     <SelectPortal>
       <SelectContent
