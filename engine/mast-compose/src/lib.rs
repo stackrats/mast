@@ -290,6 +290,11 @@ pub struct ResolvedService {
     /// `container_name` plus every per-network alias. Hostname cross-checks
     /// must accept these, not just the service key.
     pub aliases: Vec<String>,
+    /// Host ports this service publishes, post-interpolation. Sail's own
+    /// shape (`'${VITE_PORT:-5173}:${VITE_PORT:-5173}'`) leaves nothing in
+    /// `.env` to read, so collision checks that scan `.env` alone miss it —
+    /// this is the authoritative list.
+    pub published_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +304,32 @@ pub struct ResolvedModel {
     /// Daemon-side names of networks the model declares `external: true`
     /// (compose refuses to start until these exist).
     pub external_networks: Vec<String>,
+}
+
+/// Host port(s) claimed by one `ports` entry of the resolved model.
+///
+/// `published` arrives as a string from current compose versions and as a
+/// number from older ones. An absent or empty value means "pick any free
+/// port", which claims nothing predictable; a range (`"8000-8005"`) claims
+/// every port in it.
+fn parse_published_port(value: Option<&serde_json::Value>) -> Vec<u16> {
+    // Keeps a malformed range from expanding into tens of thousands of ports.
+    const MAX_RANGE: usize = 128;
+    let raw = match value {
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => return Vec::new(),
+    };
+    if let Some((low, high)) = raw.split_once('-') {
+        let (Ok(low), Ok(high)) = (low.trim().parse::<u16>(), high.trim().parse::<u16>()) else {
+            return Vec::new();
+        };
+        if low > high {
+            return Vec::new();
+        }
+        return (low..=high).take(MAX_RANGE).collect();
+    }
+    raw.parse::<u16>().map(|port| vec![port]).unwrap_or_default()
 }
 
 /// Run the runner's `config --format json` (read-only; works with the daemon
@@ -370,10 +401,22 @@ pub async fn resolve_model(invocation: &ComposeInvocation) -> Result<ResolvedMod
                     }
                     aliases.sort();
                     aliases.dedup();
+                    let mut published_ports: Vec<u16> = def
+                        .get("ports")
+                        .and_then(|p| p.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .flat_map(|p| parse_published_port(p.get("published")))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    published_ports.sort_unstable();
+                    published_ports.dedup();
                     ResolvedService {
                         name: service.clone(),
                         image: def.get("image").and_then(|i| i.as_str()).map(String::from),
                         aliases,
+                        published_ports,
                     }
                 })
                 .collect()
@@ -556,5 +599,51 @@ mod tests {
         let names: Vec<_> = model.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["app", "db"]);
         assert_eq!(model.services[0].image.as_deref(), Some("alpine:latest"));
+    }
+
+    #[test]
+    fn published_ports_parse_across_compose_shapes() {
+        use serde_json::json;
+        let parse = |v: serde_json::Value| parse_published_port(Some(&v));
+        assert_eq!(parse(json!("8081")), vec![8081]);
+        assert_eq!(parse(json!(8081)), vec![8081]);
+        assert_eq!(parse(json!("8000-8002")), vec![8000, 8001, 8002]);
+        // Empty published = "pick any free port": claims nothing predictable.
+        assert_eq!(parse(json!("")), Vec::<u16>::new());
+        assert_eq!(parse(json!("8005-8000")), Vec::<u16>::new());
+        assert_eq!(parse(json!("nonsense")), Vec::<u16>::new());
+        assert_eq!(parse_published_port(None), Vec::<u16>::new());
+        // A malformed range stays bounded rather than expanding to 64k.
+        assert_eq!(parse(json!("1-65535")).len(), 128);
+    }
+
+    #[tokio::test]
+    async fn published_ports_see_compose_defaults_with_no_env_file() {
+        // The Sail shape that defeated the .env-only port scan: nothing sets
+        // VITE_PORT, so only the resolved model knows 5173 is claimed.
+        if mast_docker::run_command(
+            &["docker".into(), "compose".into(), "version".into()],
+            None,
+            &[],
+            Duration::from_secs(5),
+            4096,
+        )
+        .await
+        .map(|o| !o.success())
+        .unwrap_or(true)
+        {
+            eprintln!("skipping: docker compose CLI not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "compose.yaml",
+            "services:\n  laravel.test:\n    image: alpine:latest\n    ports:\n      \
+             - '${APP_PORT:-80}:80'\n      - '${VITE_PORT:-5173}:${VITE_PORT:-5173}'\n",
+        );
+        let inv = resolve_invocation(tmp.path(), &env(&[])).unwrap();
+        let model = resolve_model(&inv).await.unwrap();
+        assert_eq!(model.services[0].published_ports, vec![80, 5173]);
     }
 }

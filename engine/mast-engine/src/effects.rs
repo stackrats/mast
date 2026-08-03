@@ -359,9 +359,8 @@ async fn reconcile(engine: &Engine) {
             if let Some(redactor) = redactors.get(&id) {
                 entry.redactor = redactor.clone();
             }
-            if let Some((app_port, host_ports)) = app_ports.get(&id) {
+            if let Some((app_port, _)) = app_ports.get(&id) {
                 entry.app_port = *app_port;
-                entry.host_ports = host_ports.clone();
             }
             match resolutions.get(&id) {
                 Some(Ok(invocation)) => {
@@ -385,6 +384,13 @@ async fn reconcile(engine: &Engine) {
                     entry.summary.resolution_error = Some(entry.redactor.redact(e));
                 }
                 None => {}
+            }
+
+            // Ports must be merged after the model update above: `.env` gives
+            // the actionable key names, the resolved model gives the ports
+            // compose actually publishes.
+            if let Some((_, env_ports)) = app_ports.get(&id) {
+                entry.host_ports = merge_host_ports(env_ports, entry.model.as_ref());
             }
 
             let mut summary = entry.summary.clone();
@@ -488,6 +494,33 @@ fn parse_git_status(text: &str) -> (Option<String>, Option<bool>) {
     (branch, dirty)
 }
 
+/// Host ports this project publishes, labelled for the collision warnings.
+///
+/// The `.env` scan alone is not enough: Sail publishes its Vite port as
+/// `'${VITE_PORT:-5173}:${VITE_PORT:-5173}'`, so two projects that never set
+/// `VITE_PORT` both claim 5173 with nothing in either `.env` to compare. The
+/// resolved model carries the post-interpolation ports, so it is the source of
+/// truth; `.env` keys only supply the better label, since "change APP_PORT" is
+/// more actionable than the service name.
+fn merge_host_ports(
+    env_ports: &[(String, u16)],
+    model: Option<&mast_compose::ResolvedModel>,
+) -> Vec<(String, u16)> {
+    let mut ports = env_ports.to_vec();
+    if let Some(model) = model {
+        for service in &model.services {
+            for port in &service.published_ports {
+                if !ports.iter().any(|(_, known)| known == port) {
+                    ports.push((service.name.clone(), *port));
+                }
+            }
+        }
+    }
+    ports.sort();
+    ports.dedup();
+    ports
+}
+
 /// ADR-0002/0001 association cross-check: same project name is not enough —
 /// the container must actually come from this directory (guards against
 /// same-name projects in different directories).
@@ -534,7 +567,45 @@ fn build_services(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_git_status;
+    use super::{merge_host_ports, parse_git_status};
+
+    fn model(services: &[(&str, &[u16])]) -> mast_compose::ResolvedModel {
+        mast_compose::ResolvedModel {
+            name: "demo".into(),
+            services: services
+                .iter()
+                .map(|(name, ports)| mast_compose::ResolvedService {
+                    name: (*name).into(),
+                    image: None,
+                    aliases: Vec::new(),
+                    published_ports: ports.to_vec(),
+                })
+                .collect(),
+            external_networks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_ports_include_compose_defaults_absent_from_env() {
+        // Sail's `'${VITE_PORT:-5173}:${VITE_PORT:-5173}'` with no VITE_PORT
+        // in .env — the case that let two workspace members collide silently.
+        let env = vec![("APP_PORT".to_string(), 8081)];
+        let merged = merge_host_ports(&env, Some(&model(&[("laravel.test", &[8081, 5173])])));
+        assert_eq!(merged, vec![("APP_PORT".into(), 8081), ("laravel.test".into(), 5173)]);
+    }
+
+    #[test]
+    fn env_key_labels_win_over_service_names() {
+        let env = vec![("FORWARD_DB_PORT".to_string(), 33061)];
+        let merged = merge_host_ports(&env, Some(&model(&[("mariadb", &[33061])])));
+        assert_eq!(merged, vec![("FORWARD_DB_PORT".into(), 33061)]);
+    }
+
+    #[test]
+    fn host_ports_survive_a_missing_model() {
+        let env = vec![("APP_PORT".to_string(), 8081)];
+        assert_eq!(merge_host_ports(&env, None), env);
+    }
 
     #[test]
     fn git_status_parsing_covers_branch_shapes() {
