@@ -232,6 +232,18 @@ impl Engine {
                         })?;
                     (invocation, entry.redactor.clone())
                 };
+                // Layer by layer, so an earlier member's ports are already
+                // bound by the time a later one checks — which is exactly
+                // how two members that publish the same port get separated.
+                if verb == LifecycleVerb::Up {
+                    self.preflight_ports(
+                        handle,
+                        op_id,
+                        &ProjectId(member.clone()),
+                        &format!("[{name}] "),
+                    )
+                    .await;
+                }
                 let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
                 let forwarder = {
                     let engine = self.clone();

@@ -413,7 +413,7 @@ mod tests {
             seq: 0,
             read_only: false,
             docker: Default::default(),
-            integrations: mast_contract::IntegrationSettings { terminal: None, editor: None },
+            integrations: mast_contract::IntegrationSettings::default(),
             watched_directories: Vec::new(),
             discovered: Vec::new(),
             projects,

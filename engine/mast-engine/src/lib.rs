@@ -12,6 +12,7 @@ mod lifecycle;
 mod lock;
 mod catalog_ops;
 mod ops;
+mod ports;
 mod project_ops;
 mod snapshot_ops;
 mod workspace_ops;
@@ -277,6 +278,7 @@ impl Engine {
                     integrations: IntegrationSettings {
                         terminal: settings.terminal.clone(),
                         editor: settings.editor.clone(),
+                        auto_port_remap: settings.auto_port_remap,
                     },
                     watched_directories: settings.watched_directories,
                     discovered: Vec::new(),
@@ -1031,6 +1033,7 @@ impl Engine {
                 watched_directories: st.watched_directories.clone(),
                 terminal: st.integrations.terminal.clone(),
                 editor: st.integrations.editor.clone(),
+                auto_port_remap: st.integrations.auto_port_remap,
             }
         };
         self.inner

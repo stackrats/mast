@@ -38,6 +38,7 @@ pub const REPAIR_CREATE_NETWORK: &str = "create-network";
 pub const REPAIR_DOCKER_GROUP: &str = "docker-group";
 pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
+pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -115,8 +116,12 @@ pub struct ProjectFacts {
     pub wwwgroup: Option<String>,
     /// Error-severity findings from the `.env` validator.
     pub env_error_count: usize,
-    /// Host-side port declarations from `.env` (key → port).
+    /// Host ports this project publishes, labelled with the `.env` key that
+    /// moves each one — or with a service name when no key does.
     pub host_ports: Vec<(String, u16)>,
+    /// At least one container of this project is up. A stopped project is
+    /// the one whose ports a conflict repair should move.
+    pub running: bool,
     /// Networks the compose model declares as `external: true`.
     pub external_networks: Vec<String>,
     pub resolution_error: Option<String>,
@@ -196,6 +201,16 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Runs `composer require laravel/sail --dev` then `php artisan \
                           sail:install` inside the official composer image — no local PHP \
                           needed."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_REASSIGN_PORTS => Some(RepairSpec {
+            id: REPAIR_REASSIGN_PORTS,
+            title: "Move this project's conflicting host ports".into(),
+            risk: RiskTier::Safe,
+            description: "Writes free port numbers to the `.env` keys that publish the \
+                          contested ports (`APP_PORT`, `VITE_PORT`, `FORWARD_*_PORT`), through \
+                          the transactional writer. The compose file is untouched."
                 .into(),
             arg: None,
         }),

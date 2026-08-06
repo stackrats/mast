@@ -12,6 +12,7 @@ import {
   type NotificationPrefs,
   type Theme,
 } from "../lib/prefs";
+import type { IntegrationSettings } from "../bindings";
 import { pickDirectory } from "../lib/transport";
 import { useEngineStore } from "../stores/engine";
 import Button from "./ui/Button.vue";
@@ -25,6 +26,7 @@ const store = useEngineStore();
 
 const terminal = ref("");
 const editor = ref("");
+const autoPortRemap = ref(true);
 const newDirectory = ref("");
 const theme = ref<Theme>(loadTheme());
 const notifications = ref<NotificationPrefs>(loadNotificationPrefs());
@@ -34,6 +36,7 @@ watch(open, (isOpen) => {
   if (isOpen) {
     terminal.value = store.integrations.terminal ?? "";
     editor.value = store.integrations.editor ?? "";
+    autoPortRemap.value = store.integrations.autoPortRemap;
     theme.value = loadTheme();
     notifications.value = loadNotificationPrefs();
     void isEnabled()
@@ -63,14 +66,22 @@ function setTheme(next: Theme) {
   applyTheme(next);
 }
 
-async function saveIntegrations() {
+async function saveIntegrations(overrides: Partial<IntegrationSettings> = {}) {
   await store.run({
     type: "setIntegrations",
     integrations: {
       terminal: terminal.value.trim() || null,
       editor: editor.value.trim() || null,
+      autoPortRemap: autoPortRemap.value,
+      ...overrides,
     },
   });
+}
+
+/** Checkboxes save on click; the text inputs wait for the Save button. */
+async function setAutoPortRemap(value: boolean) {
+  autoPortRemap.value = value;
+  await saveIntegrations({ autoPortRemap: value });
 }
 
 async function addDirectory() {
@@ -172,6 +183,20 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
             @update:model-value="(v) => setNotification('operations', v)"
           />
         </div>
+      </section>
+
+      <section class="space-y-2">
+        <h4 :class="headingClass">Starting projects</h4>
+        <Checkbox
+          :model-value="autoPortRemap"
+          label="Move a host port when something else already has it"
+          @update:model-value="setAutoPortRemap"
+        />
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          On start, Mast checks the ports the project publishes. If one is taken it writes a free
+          port to the key that governs it (APP_PORT, VITE_PORT, FORWARD_*_PORT) and says so in the
+          operation output. Your compose file is never touched.
+        </p>
       </section>
 
       <section class="space-y-2">

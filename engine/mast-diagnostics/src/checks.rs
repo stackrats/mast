@@ -3,9 +3,9 @@
 //! tells the user everything passed).
 
 use crate::{
-    Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
+    repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
     REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DOCKER_GROUP,
-    REPAIR_NODE_INSTALL, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
 };
 
 fn finding(
@@ -524,10 +524,11 @@ impl Check for PortConflicts {
         ctx.projects.len() > 1
     }
     fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
-        let mut by_port: std::collections::BTreeMap<u16, Vec<(&str, &str)>> = Default::default();
+        let mut by_port: std::collections::BTreeMap<u16, Vec<(&ProjectFacts, &str)>> =
+            Default::default();
         for p in &ctx.projects {
             for (key, port) in &p.host_ports {
-                by_port.entry(*port).or_default().push((p.name.as_str(), key.as_str()));
+                by_port.entry(*port).or_default().push((p, key.as_str()));
             }
         }
         by_port
@@ -536,15 +537,32 @@ impl Check for PortConflicts {
             .map(|(port, users)| {
                 let list = users
                     .iter()
-                    .map(|(name, key)| format!("{name} ({key})"))
+                    .map(|(p, key)| format!("{} ({key})", p.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                finding(
+                let mut f = finding(
                     self.id(),
                     Severity::Warning,
                     format!("Host port {port} is claimed by multiple projects"),
                     format!("{list} — they cannot run at the same time until one changes."),
-                )
+                );
+                // Offer to move one of them. A stopped project is the polite
+                // choice: moving a port under a running stack would only take
+                // effect on its next start, and would misdescribe what is
+                // published right now.
+                if let Some((mover, _)) = users
+                    .iter()
+                    .find(|(p, key)| !p.running && mast_laravel::is_host_port_key(key))
+                {
+                    f.project = Some(mover.id.clone());
+                    f.detail = format!(
+                        "{list} — they cannot run at the same time until one changes. \
+                         {} is stopped, so its ports are the ones that can be moved.",
+                        mover.name
+                    );
+                    f.repair = repair_spec(REPAIR_REASSIGN_PORTS, None);
+                }
+                f
             })
             .collect()
     }
@@ -720,6 +738,7 @@ mod tests {
             wwwgroup: Some("1000".into()),
             env_error_count: 0,
             host_ports: Vec::new(),
+            running: false,
             external_networks: Vec::new(),
             resolution_error: None,
         }
@@ -893,6 +912,32 @@ mod tests {
         let conflicts: Vec<_> = findings.iter().filter(|f| f.check == "port-conflicts").collect();
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].title.contains("80"));
+    }
+
+    #[test]
+    fn the_port_conflict_repair_targets_a_stopped_claimant() {
+        let mut a = sail_project("a");
+        a.host_ports = vec![("APP_PORT".into(), 80)];
+        a.running = true;
+        let mut b = sail_project("b");
+        b.host_ports = vec![("APP_PORT".into(), 80)];
+        let (_, findings) = run_all(&ctx(vec![a, b]));
+        let f = findings.iter().find(|f| f.check == "port-conflicts").unwrap();
+        // `a` is up and publishing 80; `b` is the one that can move.
+        assert_eq!(f.project.as_deref(), Some("b"));
+        assert_eq!(f.repair.as_ref().map(|r| r.id), Some(REPAIR_REASSIGN_PORTS));
+        assert!(f.detail.contains("b is stopped"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_port_no_env_key_governs_is_reported_without_a_repair() {
+        let mut a = sail_project("a");
+        a.host_ports = vec![("minio".into(), 9000)];
+        let mut b = sail_project("b");
+        b.host_ports = vec![("minio".into(), 9000)];
+        let (_, findings) = run_all(&ctx(vec![a, b]));
+        let f = findings.iter().find(|f| f.check == "port-conflicts").unwrap();
+        assert!(f.repair.is_none(), "nothing in .env would move it");
     }
 
     #[test]

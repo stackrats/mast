@@ -94,7 +94,7 @@ export const useEngineStore = defineStore("engine", {
     resyncs: 0,
     readOnly: false,
     docker: null as DockerStatus | null,
-    integrations: { terminal: null, editor: null } as IntegrationSettings,
+    integrations: { terminal: null, editor: null, autoPortRemap: true } as IntegrationSettings,
     watchedDirectories: [] as string[],
     discovered: [] as DiscoveredProject[],
     projects: [] as ProjectSummary[],

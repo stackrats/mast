@@ -164,14 +164,30 @@ pub struct EngineSnapshot {
     pub workspaces: Vec<WorkspaceSummary>,
 }
 
-/// External-tool preferences (M4 integrations). `None` = auto-detect.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+/// User preferences: which external tools to launch (M4 integrations, `None`
+/// = auto-detect) and how Mast should behave on the user's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationSettings {
-    /// Terminal emulator binary (e.g. "ghostty", "kitty", "gnome-terminal").
+    /// Terminal emulator binary (e.g. "ghostty", "kitty", "gnome-terminal");
+    /// on macOS also an app bundle ("Terminal.app").
     pub terminal: Option<String>,
     /// Editor binary (e.g. "code", "zed").
     pub editor: Option<String>,
+    /// Move a published host port into `.env` when something else already
+    /// holds it, instead of letting `up` fail on the bind. Defaults on.
+    #[serde(default = "yes")]
+    pub auto_port_remap: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for IntegrationSettings {
+    fn default() -> Self {
+        Self { terminal: None, editor: None, auto_port_remap: true }
+    }
 }
 
 // ---------- workspaces (M6) ----------
@@ -830,7 +846,11 @@ mod tests {
         roundtrip(&sample_project());
         roundtrip(&sample_docker());
         roundtrip(&LogLine { service: "redis".into(), message: "ready".into(), stderr: false });
-        roundtrip(&IntegrationSettings { terminal: Some("kitty".into()), editor: None });
+        roundtrip(&IntegrationSettings {
+            terminal: Some("kitty".into()),
+            editor: None,
+            auto_port_remap: true,
+        });
         roundtrip(&SnapshotReport {
             snapshot: WorkspaceSnapshot {
                 id: "snap-1".into(),
@@ -915,7 +935,11 @@ mod tests {
             PatchEvent::WatchedDirectoriesChanged { directories: vec!["/x".into()] },
             PatchEvent::DockerStatusChanged { status: sample_docker() },
             PatchEvent::IntegrationsChanged {
-                integrations: IntegrationSettings { terminal: None, editor: Some("code".into()) },
+                integrations: IntegrationSettings {
+                    terminal: None,
+                    editor: Some("code".into()),
+                    auto_port_remap: false,
+                },
             },
         ] {
             roundtrip(&EnginePatch { seq: 7, event });
@@ -936,7 +960,11 @@ mod tests {
             Action::RevealInFileManager { id: ProjectId("p1".into()) },
             Action::OpenInBrowser { id: ProjectId("p1".into()) },
             Action::SetIntegrations {
-                integrations: IntegrationSettings { terminal: Some("kitty".into()), editor: None },
+                integrations: IntegrationSettings {
+                    terminal: Some("kitty".into()),
+                    editor: None,
+                    auto_port_remap: true,
+                },
             },
             Action::SetEnvVar {
                 id: ProjectId("p1".into()),

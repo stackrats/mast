@@ -1218,6 +1218,7 @@ async fn integrations_persist_and_launch_context_flows() {
             integrations: mast_contract::IntegrationSettings {
                 terminal: Some("true".into()),
                 editor: Some("true".into()),
+                auto_port_remap: true,
             },
         },
     )
@@ -1875,4 +1876,99 @@ async fn service_image_retag_previews_and_applies() {
     // A service with no image: (the built app) cannot be retagged.
     let denied = engine.service_image_preview(&pid, "nope", "redis:8").await;
     assert!(denied.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
+    // Only ports the resolved model publishes are moved, and resolving the
+    // model shells out to `docker compose config` (no daemon needed).
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Something else on this machine is already listening — the exact
+    // situation `up` would fail on with "bind: address already in use".
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let busy = squatter.local_addr().unwrap().port();
+
+    let project = make_project(tmp.path(), "portapp");
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    ports:\n      - '${APP_PORT:-80}:80'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), format!("APP_PORT={busy}\nAPP_KEY=base64:x\n")).unwrap();
+
+    let adapter = FakeAdapter::new();
+    let runner = FakeRunner::new(Duration::from_millis(20), 0);
+    let engine = test_engine_with(tmp.path(), Arc::new(FakeConnector(adapter)), runner);
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    // The reconcile has read .env and resolved the model once the app URL
+    // reflects APP_PORT and the declared service is listed.
+    wait_until(&engine, "env read and model resolved", |s| {
+        s.projects.first().is_some_and(|p| {
+            p.app_url.as_deref() == Some(&format!("http://localhost:{busy}"))
+                && p.services.iter().any(|svc| svc.name == "app")
+        })
+    })
+    .await;
+
+    let id = project_id(&engine);
+    let op = engine.dispatch(Action::StartProject { id }).unwrap();
+    let mut events = engine.operation_events(op).unwrap();
+    let mut moved_line = None;
+    while let Some(event) = events.next().await {
+        if let OperationEventKind::Output { line, .. } = &event.kind
+            && line.contains("already in use")
+        {
+            moved_line = Some(line.clone());
+        }
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(!env.contains(&format!("APP_PORT={busy}")), "the busy port survived: {env}");
+    assert!(env.contains(&format!("APP_PORT={}", busy + 1)), "{env}");
+    // Untouched keys keep their bytes.
+    assert!(env.contains("APP_KEY=base64:x"), "{env}");
+    let moved = moved_line.expect("the move is reported in the operation output");
+    assert!(moved.contains("APP_PORT") && moved.contains(&(busy + 1).to_string()), "{moved}");
+
+    // With the setting off, the same start leaves .env alone.
+    drop(squatter);
+    let squatter2 = std::net::TcpListener::bind(("127.0.0.1", busy + 1)).unwrap();
+    run_action(
+        &engine,
+        Action::SetIntegrations {
+            integrations: mast_contract::IntegrationSettings {
+                terminal: None,
+                editor: None,
+                auto_port_remap: false,
+            },
+        },
+    )
+    .await;
+    let before = std::fs::read_to_string(project.join(".env")).unwrap();
+    run_action(&engine, Action::StartProject { id: project_id(&engine) }).await;
+    assert_eq!(std::fs::read_to_string(project.join(".env")).unwrap(), before);
+    drop(squatter2);
+}
+
+/// `docker compose config` runs without a daemon, but the CLI still has to be
+/// installed; tests that need a resolved model skip without it.
+async fn compose_cli_available() -> bool {
+    mast_docker::run_command(
+        &["docker".into(), "compose".into(), "version".into()],
+        None,
+        &[],
+        Duration::from_secs(5),
+        4096,
+    )
+    .await
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
