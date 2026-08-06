@@ -1,6 +1,7 @@
 <div align="center">
 
-<pre style="white-space: pre; overflow-x: auto;">
+<div style="width: 100%; overflow-x: auto; background-color: #0d1117; padding: 15px; border-radius: 6px;">
+<pre style="white-space: pre !important; word-wrap: normal !important; font-family: monospace; font-size: 14px; line-height: 1.2; margin: 0; color: #c9d1d9;">
  ██╗██╗        ███╗   ███╗  █████╗  ███████╗ ████████╗
  ██║█████╗     ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝
  ██║████████╗  ██╔████╔██║ ███████║ ███████╗    ██║   
@@ -8,6 +9,7 @@
  ██║██╔═╝      ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║   
  ╚═╝╚═╝        ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝   
 </pre>
+</div>
 
 Control tower for local Laravel Sail development.
 
