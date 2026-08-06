@@ -1,5 +1,6 @@
 <div align="center">
 
+<table align="center"><tr><td align="left">
 <pre>
  ██╗██╗        ███╗   ███╗  █████╗  ███████╗ ████████╗
  ██║█████╗     ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝
@@ -8,6 +9,7 @@
  ██║██╔═╝      ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║   
  ╚═╝╚═╝        ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝   
 </pre>
+</td></tr></table>
 
 Control tower for local Laravel Sail development.
 
@@ -48,11 +50,11 @@ Docker remains the source of truth, and Mast stays in sync with changes made fro
 
 ## A look around
 
-Every project gets one pane: its services, the app processes running inside them, and your own saved commands.
+Every project displays its services, the app processes running inside them, and your own saved commands.
 
 <img src="docs/media/project.png" alt="Project pane showing service, process, and command chips for a running Sail project" width="900">
 
-The tray carries the same controls, so a workspace or a single project is two clicks away without opening the window. Verbs that don't apply to the current state are disabled.
+The tray carries the same controls, so a workspace or a single project is two clicks away without opening the window.
 
 <img src="docs/media/tray.png" alt="Tray menu: workspaces, a Projects submenu listing every project with its status, and per-project Start, Stop, and Restart" width="456">
 
@@ -60,11 +62,11 @@ Diagnostics checks the things that break a local environment, and each finding c
 
 <img src="docs/media/diagnostics.png" alt="Diagnostics dialog listing two errors, each with a Repair button" width="900">
 
-Common services are one click away, matched to your compose file by image rather than by name.
+Common services are one click away, matched to your compose file.
 
 <img src="docs/media/services.png" alt="Services catalog showing installed and available services with version selectors" width="900">
 
-`.env` is editable in place, with secrets masked until you ask for them.
+`.env` is editable in place.
 
 <img src="docs/media/env.png" alt="Env panel with APP_KEY and DB_PASSWORD masked" width="900">
 
