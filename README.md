@@ -1,7 +1,6 @@
 <div align="center">
 
-<table align="center"><tr><td align="left">
-<pre>
+<pre style="white-space: pre; overflow-x: auto;">
  ██╗██╗        ███╗   ███╗  █████╗  ███████╗ ████████╗
  ██║█████╗     ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝
  ██║████████╗  ██╔████╔██║ ███████║ ███████╗    ██║   
@@ -9,7 +8,6 @@
  ██║██╔═╝      ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║   
  ╚═╝╚═╝        ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝   
 </pre>
-</td></tr></table>
 
 Control tower for local Laravel Sail development.
 
