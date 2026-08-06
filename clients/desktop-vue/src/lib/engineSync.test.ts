@@ -31,7 +31,7 @@ function snap(seq: number): EngineSnapshot {
     seq,
     readOnly: false,
     docker: { available: true, contextName: "default", endpoint: "unix:///x", error: null },
-    integrations: { terminal: null, editor: null },
+    integrations: { terminal: null, editor: null, autoPortRemap: true },
     watchedDirectories: [],
     discovered: [],
     projects: [project("p1", "fake-sail-app")],

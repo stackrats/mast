@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Domain vocabulary only (which `.env` keys publish a host port) — no I/O,
+# so the check set stays pure over gathered facts.
+mast-laravel = { path = "../mast-laravel" }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 

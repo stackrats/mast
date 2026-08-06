@@ -518,17 +518,24 @@ export type HistoryOutcome =
  */
 { type: "applied" }
 /**
- * External-tool preferences (M4 integrations). `None` = auto-detect.
+ * User preferences: which external tools to launch (M4 integrations, `None`
+ * = auto-detect) and how Mast should behave on the user's behalf.
  */
 export type IntegrationSettings = { 
 /**
- * Terminal emulator binary (e.g. "ghostty", "kitty", "gnome-terminal").
+ * Terminal emulator binary (e.g. "ghostty", "kitty", "gnome-terminal");
+ * on macOS also an app bundle ("Terminal.app").
  */
 terminal: string | null; 
 /**
  * Editor binary (e.g. "code", "zed").
  */
-editor: string | null }
+editor: string | null; 
+/**
+ * Move a published host port into `.env` when something else already
+ * holds it, instead of letting `up` fail on the bind. Defaults on.
+ */
+autoPortRemap?: boolean }
 /**
  * One line of a container log stream (delivered over a dedicated channel,
  * never through the patch store — plan §3 transport split).

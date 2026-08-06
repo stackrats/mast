@@ -3,7 +3,7 @@
 //! file changes only schedule a reconcile; the reconcile re-inspects and
 //! diffs fresh observations into minimal patches.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,8 +192,9 @@ async fn reconcile(engine: &Engine) {
         HashMap::new();
     let mut warnings: HashMap<String, Vec<String>> = HashMap::new();
     let mut redactors: HashMap<String, crate::Redactor> = HashMap::new();
-    // (probe port, declared host-port forwards) per project.
-    type PortInfo = (Option<u16>, Vec<(String, u16)>);
+    // (probe port, declared host-port forwards, compose port → `.env` key)
+    // per project.
+    type PortInfo = (Option<u16>, Vec<(String, u16)>, BTreeMap<u16, String>);
     let mut app_ports: HashMap<String, PortInfo> = HashMap::new();
     // (branch, dirty) per project — display-only git chips (M8).
     let mut git_infos: HashMap<String, (Option<String>, Option<bool>)> = HashMap::new();
@@ -209,16 +210,25 @@ async fn reconcile(engine: &Engine) {
             tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
+                // Which key moves which published port, read from the compose
+                // source — the resolved model only carries the numbers.
+                let port_keys: BTreeMap<u16, String> = resolved
+                    .as_ref()
+                    .map(|inv| {
+                        inv.files
+                            .iter()
+                            .filter_map(|f| std::fs::read_to_string(&f.path).ok())
+                            .flat_map(|text| mast_compose::published_port_env_keys(&text))
+                            .filter(|(_, key)| mast_laravel::is_host_port_key(key))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let redactor = crate::Redactor::from_env_file(&dir.join(".env"));
                 let env = mast_compose::parse_env_file(&dir.join(".env"));
                 let app_port = env.get("APP_PORT").and_then(|v| v.parse::<u16>().ok());
                 let mut host_ports: Vec<(String, u16)> = env
                     .iter()
-                    .filter(|(k, _)| {
-                        k.as_str() == "APP_PORT"
-                            || k.as_str() == "VITE_PORT"
-                            || (k.starts_with("FORWARD_") && k.ends_with("_PORT"))
-                    })
+                    .filter(|(k, _)| mast_laravel::is_host_port_key(k))
                     .filter_map(|(k, v)| v.parse::<u16>().ok().map(|p| (k.clone(), p)))
                     .collect();
                 host_ports.sort();
@@ -233,7 +243,7 @@ async fn reconcile(engine: &Engine) {
                     resolved,
                     mast_project::project_warnings(&dir),
                     redactor,
-                    (app_port, host_ports),
+                    (app_port, host_ports, port_keys),
                     git_info(&dir),
                     (detected, app_service),
                     mast_laravel::app_url(&env),
@@ -245,7 +255,7 @@ async fn reconcile(engine: &Engine) {
                     Err(e.to_string()),
                     Vec::new(),
                     crate::Redactor::default(),
-                    (None, Vec::new()),
+                    (None, Vec::new(), BTreeMap::new()),
                     (None, None),
                     (Vec::new(), String::new()),
                     None,
@@ -359,7 +369,7 @@ async fn reconcile(engine: &Engine) {
             if let Some(redactor) = redactors.get(&id) {
                 entry.redactor = redactor.clone();
             }
-            if let Some((app_port, _)) = app_ports.get(&id) {
+            if let Some((app_port, _, _)) = app_ports.get(&id) {
                 entry.app_port = *app_port;
             }
             match resolutions.get(&id) {
@@ -389,8 +399,8 @@ async fn reconcile(engine: &Engine) {
             // Ports must be merged after the model update above: `.env` gives
             // the actionable key names, the resolved model gives the ports
             // compose actually publishes.
-            if let Some((_, env_ports)) = app_ports.get(&id) {
-                entry.host_ports = merge_host_ports(env_ports, entry.model.as_ref());
+            if let Some((_, env_ports, port_keys)) = app_ports.get(&id) {
+                entry.host_ports = merge_host_ports(env_ports, port_keys, entry.model.as_ref());
             }
 
             let mut summary = entry.summary.clone();
@@ -494,16 +504,20 @@ fn parse_git_status(text: &str) -> (Option<String>, Option<bool>) {
     (branch, dirty)
 }
 
-/// Host ports this project publishes, labelled for the collision warnings.
+/// Host ports this project publishes, labelled for the collision warnings and
+/// for the remapper, which can only move a port it can name a key for.
 ///
 /// The `.env` scan alone is not enough: Sail publishes its Vite port as
 /// `'${VITE_PORT:-5173}:${VITE_PORT:-5173}'`, so two projects that never set
 /// `VITE_PORT` both claim 5173 with nothing in either `.env` to compare. The
 /// resolved model carries the post-interpolation ports, so it is the source of
-/// truth; `.env` keys only supply the better label, since "change APP_PORT" is
-/// more actionable than the service name.
+/// truth; the label comes from whichever key governs the port — `.env` first
+/// (it is definitive), then the compose default (`${VITE_PORT:-5173}` names
+/// the key even when `.env` is silent), and only then the service name, which
+/// says where the port comes from but not how to move it.
 fn merge_host_ports(
     env_ports: &[(String, u16)],
+    port_keys: &BTreeMap<u16, String>,
     model: Option<&mast_compose::ResolvedModel>,
 ) -> Vec<(String, u16)> {
     let mut ports = env_ports.to_vec();
@@ -511,7 +525,9 @@ fn merge_host_ports(
         for service in &model.services {
             for port in &service.published_ports {
                 if !ports.iter().any(|(_, known)| known == port) {
-                    ports.push((service.name.clone(), *port));
+                    let label =
+                        port_keys.get(port).cloned().unwrap_or_else(|| service.name.clone());
+                    ports.push((label, *port));
                 }
             }
         }
@@ -585,26 +601,43 @@ mod tests {
         }
     }
 
+    fn keys(pairs: &[(u16, &str)]) -> std::collections::BTreeMap<u16, String> {
+        pairs.iter().map(|(port, key)| (*port, (*key).to_string())).collect()
+    }
+
     #[test]
     fn host_ports_include_compose_defaults_absent_from_env() {
         // Sail's `'${VITE_PORT:-5173}:${VITE_PORT:-5173}'` with no VITE_PORT
         // in .env — the case that let two workspace members collide silently.
+        // The compose default still names the key that moves it.
         let env = vec![("APP_PORT".to_string(), 8081)];
-        let merged = merge_host_ports(&env, Some(&model(&[("laravel.test", &[8081, 5173])])));
-        assert_eq!(merged, vec![("APP_PORT".into(), 8081), ("laravel.test".into(), 5173)]);
+        let merged = merge_host_ports(
+            &env,
+            &keys(&[(80, "APP_PORT"), (5173, "VITE_PORT")]),
+            Some(&model(&[("laravel.test", &[8081, 5173])])),
+        );
+        assert_eq!(merged, vec![("APP_PORT".into(), 8081), ("VITE_PORT".into(), 5173)]);
+    }
+
+    #[test]
+    fn a_port_no_key_governs_is_labelled_by_its_service() {
+        // A hand-written `- '9000:9000'`: nothing in `.env` moves it.
+        let merged =
+            merge_host_ports(&[], &keys(&[(80, "APP_PORT")]), Some(&model(&[("minio", &[9000])])));
+        assert_eq!(merged, vec![("minio".into(), 9000)]);
     }
 
     #[test]
     fn env_key_labels_win_over_service_names() {
         let env = vec![("FORWARD_DB_PORT".to_string(), 33061)];
-        let merged = merge_host_ports(&env, Some(&model(&[("mariadb", &[33061])])));
+        let merged = merge_host_ports(&env, &keys(&[]), Some(&model(&[("mariadb", &[33061])])));
         assert_eq!(merged, vec![("FORWARD_DB_PORT".into(), 33061)]);
     }
 
     #[test]
     fn host_ports_survive_a_missing_model() {
         let env = vec![("APP_PORT".to_string(), 8081)];
-        assert_eq!(merge_host_ports(&env, None), env);
+        assert_eq!(merge_host_ports(&env, &keys(&[]), None), env);
     }
 
     #[test]

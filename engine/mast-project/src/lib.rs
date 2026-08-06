@@ -158,7 +158,9 @@ pub struct ProjectCommandRecord {
     pub auto_start: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` is what a machine with no `settings.json` starts from, so it has
+/// to agree with the serde defaults below rather than with `bool::default()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub watched_directories: Vec<PathBuf>,
@@ -168,6 +170,25 @@ pub struct Settings {
     /// Preferred editor binary (None = auto-detect).
     #[serde(default)]
     pub editor: Option<String>,
+    /// Move a busy host port into `.env` on start rather than failing the
+    /// bind. Absent in settings written before this existed — on by default.
+    #[serde(default = "yes")]
+    pub auto_port_remap: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            watched_directories: Vec::new(),
+            terminal: None,
+            editor: None,
+            auto_port_remap: yes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +542,7 @@ mod tests {
             watched_directories: vec![tmp.path().to_path_buf()],
             terminal: Some("kitty".into()),
             editor: None,
+            auto_port_remap: false,
         };
         store.save_settings(&settings).unwrap();
         assert_eq!(store.load_settings().unwrap(), settings);

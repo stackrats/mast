@@ -14,7 +14,8 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DOCKER_GROUP, REPAIR_NODE_INSTALL, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_DOCKER_GROUP, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER,
 };
 use mast_docker::run_command;
 
@@ -188,6 +189,7 @@ struct ProjectSeed {
     service_names: Vec<String>,
     host_ports: Vec<(String, u16)>,
     external_networks: Vec<String>,
+    running: bool,
 }
 
 /// Filesystem half of a project's facts — runs in `spawn_blocking`.
@@ -230,6 +232,7 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
         id: seed.id,
         name: seed.name,
         host_ports: seed.host_ports,
+        running: seed.running,
         external_networks: seed.external_networks,
         resolution_error: seed.resolution_error,
     }
@@ -266,6 +269,7 @@ impl Engine {
                         .as_ref()
                         .map(|m| m.external_networks.clone())
                         .unwrap_or_default(),
+                    running: e.summary.status != mast_contract::ProjectStatus::Stopped,
                 })
                 .collect();
             let issues = workspace_summaries(&st)
@@ -580,6 +584,31 @@ impl Engine {
                     no_op: false,
                 })
             }
+            REPAIR_REASSIGN_PORTS => {
+                let project = self.require_project(project)?;
+                let env_path = self.project_path(project)?.join(".env");
+                let (remaps, notes, before, after) =
+                    self.preview_port_remap(project, crate::ports::RemapMode::BoundOrClaimed).await?;
+                let no_op = remaps.is_empty();
+                let mut summary: Vec<String> =
+                    remaps.iter().map(|r| format!("set {}={} (was {})", r.key, r.to, r.from)).collect();
+                summary.extend(notes);
+                if no_op && summary.is_empty() {
+                    summary.push("no host port is in the way — nothing to move".into());
+                }
+                Ok(RepairPlan {
+                    repair: offer,
+                    file_preview: Some(FileEditPreview {
+                        file: env_path.to_string_lossy().into_owned(),
+                        before,
+                        after,
+                        summary: summary.clone(),
+                        no_op,
+                    }),
+                    summary,
+                    no_op,
+                })
+            }
             REPAIR_SAIL_INSTALL => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -762,6 +791,30 @@ impl Engine {
                 } else {
                     Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
                 }
+            }
+            REPAIR_REASSIGN_PORTS => {
+                let project = self.require_project(project)?;
+                let (remaps, notes) = self
+                    .remap_conflicting_ports(project, crate::ports::RemapMode::BoundOrClaimed)
+                    .await?;
+                for line in remaps
+                    .iter()
+                    .map(|r| format!("moved {} to {} (was {})", r.key, r.to, r.from))
+                    .chain(notes)
+                {
+                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                }
+                if remaps.is_empty() {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "no host port needed moving".into(),
+                            stderr: false,
+                        },
+                    );
+                }
+                Ok(())
             }
             REPAIR_COMPOSER_INSTALL => {
                 let project = self.require_project(project)?;

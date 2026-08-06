@@ -647,6 +647,7 @@ impl Engine {
                         });
                     }
                 });
+                engine.preflight_ports(&handle, id, &project, "").await;
             }
 
             let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);

@@ -332,6 +332,39 @@ fn parse_published_port(value: Option<&serde_json::Value>) -> Vec<u16> {
     raw.parse::<u16>().map(|port| vec![port]).unwrap_or_default()
 }
 
+/// Which `.env` key governs which published host port, read from the compose
+/// source as `port default → key`.
+///
+/// The resolved model has already lost this: `'${APP_PORT:-80}:80'` becomes
+/// the number 80, with nothing left to say that writing `APP_PORT` is how you
+/// move it. Sail's own files are full of that shape and Laravel's
+/// `.env.example` ships none of those keys, so without this a stock project
+/// publishes 80, 5173 and 3306 with no key in `.env` to point at.
+///
+/// This reads the file as text rather than YAML on purpose: it is a label
+/// lookup, not an edit (edits go through `mast-yaml-edit`'s parser per
+/// ADR-0003), and only list entries under a `ports:` key can carry a
+/// published port — an interpolation anywhere else (an `environment:` value,
+/// say) must not be mistaken for one.
+pub fn published_port_env_keys(compose_text: &str) -> std::collections::BTreeMap<u16, String> {
+    let mut keys = std::collections::BTreeMap::new();
+    for line in compose_text.lines() {
+        let Some(entry) = line.trim().strip_prefix('-') else { continue };
+        let entry = entry.trim().trim_matches(['\'', '"']);
+        // `[HOST_IP:]HOST:CONTAINER` — the host side comes first, so the
+        // first interpolation in the entry is the published port.
+        let Some(interp) = entry.split_once("${") else { continue };
+        let Some((body, _)) = interp.1.split_once('}') else { continue };
+        // Only the `:-default` form names a port we can recognise later; a
+        // bare `${APP_PORT}` publishes whatever `.env` already says, which
+        // the `.env` scan sees on its own.
+        let Some((key, default)) = body.split_once(":-") else { continue };
+        let (Ok(port), true) = (default.trim().parse::<u16>(), !key.is_empty()) else { continue };
+        keys.entry(port).or_insert_with(|| key.trim().to_string());
+    }
+    keys
+}
+
 /// Run the runner's `config --format json` (read-only; works with the daemon
 /// down — ADR-0001 finding 6) and parse the resolved model.
 pub async fn resolve_model(invocation: &ComposeInvocation) -> Result<ResolvedModel, ComposeError> {
@@ -645,5 +678,39 @@ mod tests {
         let inv = resolve_invocation(tmp.path(), &env(&[])).unwrap();
         let model = resolve_model(&inv).await.unwrap();
         assert_eq!(model.services[0].published_ports, vec![80, 5173]);
+    }
+
+    fn corpus(name: &str) -> String {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compose-corpus").join(name);
+        std::fs::read_to_string(path).expect("corpus file")
+    }
+
+    #[test]
+    fn port_env_keys_come_from_sails_own_shapes() {
+        let keys = published_port_env_keys(&corpus("sail-stock.yaml"));
+        assert_eq!(keys.get(&80).map(String::as_str), Some("APP_PORT"));
+        assert_eq!(keys.get(&5173).map(String::as_str), Some("VITE_PORT"));
+        assert_eq!(keys.get(&3306).map(String::as_str), Some("FORWARD_DB_PORT"));
+        assert_eq!(keys.get(&6379).map(String::as_str), Some("FORWARD_REDIS_PORT"));
+    }
+
+    #[test]
+    fn interpolations_outside_a_ports_list_are_not_ports() {
+        // `PLAIN_INTERP: ${APP_PORT:-80}` under `environment:` — same text,
+        // publishes nothing.
+        assert!(published_port_env_keys(&corpus("quoting-escapes.yaml")).is_empty());
+        assert!(published_port_env_keys("services:\n  a:\n    x: ${APP_PORT:-80}\n").is_empty());
+    }
+
+    #[test]
+    fn published_port_is_the_host_side_even_behind_an_ip() {
+        let keys = published_port_env_keys(
+            "    ports:\n      - '127.0.0.1:${FORWARD_DB_PORT:-3306}:3306'\n      \
+             - 8080:80\n      - ${APP_PORT}:80\n",
+        );
+        assert_eq!(keys.get(&3306).map(String::as_str), Some("FORWARD_DB_PORT"));
+        // A literal, and a key with no default: neither names a port default.
+        assert_eq!(keys.len(), 1);
     }
 }
