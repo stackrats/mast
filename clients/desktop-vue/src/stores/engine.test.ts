@@ -2,7 +2,7 @@ import { computed } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { OperationEvent } from "../bindings";
+import type { LogCapture, OperationEvent } from "../bindings";
 import { useEngineStore } from "./engine";
 
 // The store must work against Pinia's reactive proxies — the regression this
@@ -30,6 +30,10 @@ vi.mock("../lib/transport", () => ({
   customServicePreview: vi.fn(async () => null),
   streamServiceLogs: vi.fn(),
   stopLogStream: vi.fn(async () => {}),
+  historyRecent: vi.fn(async () => []),
+  startHistoryStream: vi.fn(async () => {}),
+  logCaptures: vi.fn(async () => []),
+  startCaptureStream: vi.fn(async () => {}),
 }));
 
 import { dispatchAction, streamServiceLogs, stopLogStream } from "../lib/transport";
@@ -244,5 +248,76 @@ describe("operations reactivity", () => {
 
     store.dismissOperation("new:x");
     expect(keys.value).not.toContain("new:x");
+  });
+});
+
+describe("log captures", () => {
+  const capture = (id: number, overrides: Partial<LogCapture> = {}): LogCapture => ({
+    id,
+    atUnixMs: 1_700_000_000_000 + id,
+    project: "p1",
+    projectName: "acme",
+    service: "queue",
+    containerId: `cid-${id}`,
+    reason: { type: "exited", status: 1 },
+    windowSecs: 60,
+    lines: [{ at: null, message: "boom", stderr: true }],
+    truncated: false,
+    ...overrides,
+  });
+
+  it("keeps captures newest first however they arrive", () => {
+    const store = useEngineStore();
+    // The live stream and the backlog fetch overlap, so order is not given.
+    store.addCapture(capture(2));
+    store.addCapture(capture(5));
+    store.addCapture(capture(3));
+
+    expect(store.captures.map((c) => c.id)).toEqual([5, 3, 2]);
+  });
+
+  it("ignores a capture already held, so an overlapping backlog is harmless", () => {
+    const store = useEngineStore();
+    store.addCapture(capture(4));
+    store.addCapture(capture(4));
+
+    expect(store.captures).toHaveLength(1);
+  });
+
+  it("drops the oldest past the cap", () => {
+    const store = useEngineStore();
+    for (let id = 1; id <= 60; id += 1) store.addCapture(capture(id));
+
+    expect(store.captures).toHaveLength(50);
+    expect(store.captures[0].id).toBe(60);
+    expect(store.captures.at(-1)!.id).toBe(11);
+  });
+
+  it("badges only what the user has not seen", () => {
+    const store = useEngineStore();
+    store.addCapture(capture(1));
+    store.addCapture(capture(2));
+    expect(store.unseenCaptureCount).toBe(2);
+
+    store.markCapturesSeen();
+    expect(store.unseenCaptureCount).toBe(0);
+
+    // A capture that lands afterwards badges again.
+    store.addCapture(capture(3));
+    expect(store.unseenCaptureCount).toBe(1);
+  });
+
+  it("clearing empties the view and asks the engine to delete the store", async () => {
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      onEvent({ operation: 1, kind: { type: "completed" } });
+      return 1;
+    });
+    const store = useEngineStore();
+    store.addCapture(capture(1));
+
+    await store.clearCaptures();
+
+    expect(store.captures).toHaveLength(0);
+    expect(dispatchMock).toHaveBeenCalledWith({ type: "clearLogCaptures" }, expect.any(Function));
   });
 });

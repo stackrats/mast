@@ -14,8 +14,8 @@ use mast_client::MastClient;
 use mast_client_local::LocalClient;
 use mast_contract::{
     Action, CatalogEntry, CustomServiceSpec, DiagnosticReport, DiagnosticsHistory, EngineSnapshot,
-    EnvReport, FileEditPreview, HistoryEntry, LogLine, OperationEvent, OperationId, ProjectId,
-    RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
+    EnvReport, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
+    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
 };
 use mast_engine::{Engine, EngineConfig, EngineDeps, RealConnector, RealLifecycleRunner};
 use mast_project::MetadataStore;
@@ -37,6 +37,7 @@ pub struct AppState {
     /// The single active history forwarder; replaced (and aborted) on
     /// resubscribe, like the patch task.
     history_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 /// Global event carrying patch-stream items. `stream_id` lets the frontend
@@ -143,6 +144,36 @@ async fn start_history_stream(
         }
     });
     if let Some(old) = state.history_task.lock().unwrap().replace(task) {
+        old.abort();
+    }
+    Ok(())
+}
+
+/// Stored log captures (M10), newest first: what each container was saying
+/// just before it went down. Read from disk, so this survives an app restart.
+#[tauri::command]
+#[specta::specta]
+async fn log_captures(state: State<'_, AppState>, limit: u32) -> Result<Vec<LogCapture>, String> {
+    state.client.log_captures(limit).await.map_err(|e| e.to_string())
+}
+
+/// Follow log captures. Append-only — the frontend prepends. Replaces any
+/// earlier subscription.
+#[tauri::command]
+#[specta::specta]
+async fn start_capture_stream(
+    state: State<'_, AppState>,
+    on_capture: Channel<LogCapture>,
+) -> Result<(), String> {
+    let mut stream = state.client.subscribe_log_captures().await.map_err(|e| e.to_string())?;
+    let task = tauri::async_runtime::spawn(async move {
+        while let Some(capture) = stream.next().await {
+            if on_capture.send(capture).is_err() {
+                break;
+            }
+        }
+    });
+    if let Some(old) = state.capture_task.lock().unwrap().replace(task) {
         old.abort();
     }
     Ok(())
@@ -310,6 +341,8 @@ fn specta_builder() -> tauri_specta::Builder {
             stop_log_stream,
             history_recent,
             start_history_stream,
+            log_captures,
+            start_capture_stream,
         ])
         .events(tauri_specta::collect_events![PatchStreamItem])
 }
@@ -375,6 +408,7 @@ pub fn run() {
                 log_streams: Mutex::new(HashMap::new()),
                 next_log_stream: AtomicU32::new(0),
                 history_task: Mutex::new(None),
+                capture_task: Mutex::new(None),
             });
             builder.mount_events(app);
             tauri::async_runtime::spawn(tray::refresh_loop(app.handle().clone()));

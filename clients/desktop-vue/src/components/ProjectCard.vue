@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
+  Camera,
   ChevronDown,
   FileCog,
   Globe,
@@ -47,6 +48,7 @@ const store = useEngineStore();
 const op = computed(() => store.operations[project.id]);
 const processes = computed(() => project.processes ?? []);
 const opRunning = computed(() => op.value != null && op.value.terminal === null);
+
 const showEnv = ref(false);
 
 function serviceDot(service: ServiceState): string {
@@ -297,6 +299,13 @@ async function addCommand() {
                 @select="store.openLogs(project.id, service.name)"
               >
                 <ScrollText class="h-3.5 w-3.5 text-slate-400" /> Logs
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                :class="menuItemClass"
+                :disabled="service.containerId == null || store.readOnly"
+                @select="store.captureServiceLogs(project.id, service.name)"
+              >
+                <Camera class="h-3.5 w-3.5 text-slate-400" /> Capture logs
               </DropdownMenuItem>
               <DropdownMenuItem
                 :class="menuItemClass"

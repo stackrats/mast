@@ -2,7 +2,15 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { Check, ChevronDown, ChevronRight, Copy, Eraser, TextWrap } from "lucide-vue-next";
 
-import type { HistoryEntry } from "../bindings";
+import type { HistoryEntry, LogCapture } from "../bindings";
+import {
+  captureSummary,
+  copyableCapture,
+  isPostMortem,
+  isUnprompted,
+  lineTime,
+  reasonLabel,
+} from "../lib/captures";
 import {
   commandLine,
   copyableCommand,
@@ -61,8 +69,14 @@ function toggleWrap() {
 
 /** Expanded history rows, by entry id. */
 const expanded = ref(new Set<number>());
+/** Expanded capture rows. A separate set from `expanded`: capture ids and
+ * history ids are both small integers from different sequences, so one set
+ * would have them expanding each other. */
+const expandedCaptures = ref(new Set<number>());
 /** Entry whose command was just copied — resets the icon after a moment. */
 const copied = ref<number | null>(null);
+/** Same, for captures — separate for the same reason the expanded sets are. */
+const copiedCapture = ref<number | null>(null);
 let copiedTimer: ReturnType<typeof setTimeout> | null = null;
 
 const failures = computed(() => store.history.filter((e) => isFailure(e.outcome)).length);
@@ -71,6 +85,23 @@ function toggle(entry: HistoryEntry) {
   const next = new Set(expanded.value);
   if (!next.delete(entry.id)) next.add(entry.id);
   expanded.value = next;
+}
+
+function toggleCapture(capture: LogCapture) {
+  const next = new Set(expandedCaptures.value);
+  if (!next.delete(capture.id)) next.add(capture.id);
+  expandedCaptures.value = next;
+}
+
+async function copyCapture(capture: LogCapture) {
+  try {
+    await navigator.clipboard.writeText(copyableCapture(capture));
+    copiedCapture.value = capture.id;
+    if (copiedTimer) clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => (copiedCapture.value = null), 1500);
+  } catch {
+    // Clipboard access can be refused; the lines are on screen anyway.
+  }
 }
 
 async function copyCommand(entry: HistoryEntry) {
@@ -156,11 +187,15 @@ watch(
     if (tab === "output") {
       pinned.value = true;
       void scrollToEnd();
-    } else if (store.historyFocus === null) {
-      // History reads newest-first, so it wants the top, not the tail.
+    } else if (tab === "history" && store.historyFocus !== null) {
+      // The focus watcher above is bringing a specific entry into view.
+    } else {
+      // History and captures both read newest-first, so they want the top.
       await nextTick();
       if (scroller.value) scroller.value.scrollTop = 0;
     }
+    // Arriving on the tab is what counts as having seen what is on it.
+    if (tab === "captures") store.markCapturesSeen();
   },
 );
 </script>
@@ -183,6 +218,12 @@ watch(
           <TabsTrigger value="history">
             history
             <Badge v-if="failures > 0" variant="destructive">{{ failures }}</Badge>
+          </TabsTrigger>
+          <TabsTrigger value="captures">
+            captures
+            <Badge v-if="store.unseenCaptureCount > 0" variant="destructive">
+              {{ store.unseenCaptureCount }}
+            </Badge>
           </TabsTrigger>
         </TabsList>
         <div class="flex items-center gap-1">
@@ -207,6 +248,14 @@ watch(
           </Tooltip>
           <Tooltip v-if="store.logsTab === 'output'" text="Clear the log output.">
             <Button variant="ghost" size="iconSm" @click="store.activity = []">
+              <Eraser class="h-3.5 w-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip
+            v-if="store.logsTab === 'captures'"
+            text="Delete every stored capture. Captures live on disk, so this clears them for good."
+          >
+            <Button variant="ghost" size="iconSm" @click="store.clearCaptures()">
               <Eraser class="h-3.5 w-3.5" />
             </Button>
           </Tooltip>
@@ -366,6 +415,100 @@ watch(
               >
                 no output
               </p>
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="captures">
+          <p v-if="store.captures.length === 0" class="text-slate-400">
+            Nothing captured yet — when a container stops, crashes or goes unhealthy, Mast keeps its
+            last minute of output here.
+          </p>
+          <div
+            v-for="capture in store.captures"
+            :key="capture.id"
+            class="border-b border-slate-100 py-1 last:border-0 dark:border-slate-800"
+          >
+            <div class="flex items-start gap-1.5">
+              <button
+                :class="['mt-0.5 shrink-0', ICON_BUTTON_CLASS]"
+                :aria-label="expandedCaptures.has(capture.id) ? 'Collapse' : 'Expand'"
+                @click="toggleCapture(capture)"
+              >
+                <ChevronDown v-if="expandedCaptures.has(capture.id)" class="h-3 w-3" />
+                <ChevronRight v-else class="h-3 w-3" />
+              </button>
+              <span
+                class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                :class="
+                  isPostMortem(capture.reason)
+                    ? 'bg-red-500'
+                    : isUnprompted(capture.reason)
+                      ? 'bg-amber-400'
+                      : 'bg-slate-400'
+                "
+              />
+              <div class="min-w-0 flex-1 cursor-pointer" @click="toggleCapture(capture)">
+                <div class="flex items-baseline gap-2">
+                  <span class="truncate font-medium text-slate-700 dark:text-slate-200">
+                    {{ capture.projectName }} · {{ capture.service }}
+                  </span>
+                </div>
+                <p class="truncate text-slate-500 dark:text-slate-400">
+                  {{ captureSummary(capture) }}
+                </p>
+              </div>
+              <div class="flex shrink-0 items-center gap-1.5 pl-1">
+                <!-- The reason carries the colour; the time stays neutral so
+                   the two read as separate fields rather than one block. -->
+                <span
+                  class="tabular-nums"
+                  :class="
+                    isPostMortem(capture.reason)
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-slate-500 dark:text-slate-400'
+                  "
+                >
+                  {{ reasonLabel(capture.reason) }}
+                </span>
+                <span class="text-slate-400 tabular-nums">
+                  {{ formatTime(capture.atUnixMs) }}
+                </span>
+                <Tooltip text="Copy these lines, with a header naming what they came from.">
+                  <button :class="ICON_BUTTON_CLASS" @click.stop="copyCapture(capture)">
+                    <Check
+                      v-if="copiedCapture === capture.id"
+                      class="h-3.5 w-3.5 text-emerald-600"
+                    />
+                    <Copy v-else class="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            </div>
+
+            <div v-if="expandedCaptures.has(capture.id)" class="mt-1 ml-6 space-y-0.5">
+              <p v-if="capture.truncated" class="text-slate-400 italic">
+                older lines dropped — this is the tail of the window
+              </p>
+              <div
+                v-for="(line, i) in capture.lines"
+                :key="`cap-${capture.id}-${i}`"
+                class="flex gap-2 font-mono"
+              >
+                <span class="shrink-0 text-slate-400 tabular-nums">
+                  {{ lineTime(line.at, capture.atUnixMs) }}
+                </span>
+                <span
+                  :class="[
+                    lineClass,
+                    line.stderr
+                      ? 'text-amber-700 dark:text-amber-500'
+                      : 'text-slate-600 dark:text-slate-300',
+                  ]"
+                >
+                  {{ line.message }}
+                </span>
+              </div>
             </div>
           </div>
         </TabsContent>

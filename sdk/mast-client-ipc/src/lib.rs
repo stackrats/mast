@@ -220,6 +220,18 @@ impl MastClient for IpcClient {
         self.open_stream::<mast_contract::HistoryEntry>("subscribeHistory", json!({})).await
     }
 
+    async fn log_captures(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<mast_contract::LogCapture>, ClientError> {
+        self.call("logCaptures", json!({"limit": limit})).await
+    }
+
+    async fn subscribe_log_captures(&self) -> Result<mast_client::CaptureStream, ClientError> {
+        self.open_stream::<mast_contract::LogCapture>("subscribeLogCaptures", json!({})).await
+    }
+
+
     async fn network_attach_preview(
         &self,
         workspace: WorkspaceId,

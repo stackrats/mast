@@ -7,14 +7,15 @@
 use futures::stream::BoxStream;
 use mast_contract::{
     Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport,
-    ErrorInfo, FileEditPreview, HistoryEntry, LogLine, OperationEvent, OperationId, ProjectId,
-    RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
+    ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
+    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
 };
 
 pub type PatchStream = BoxStream<'static, SubscriptionItem>;
 pub type OperationStream = BoxStream<'static, OperationEvent>;
 pub type LogStream = BoxStream<'static, LogLine>;
 pub type HistoryStream = BoxStream<'static, HistoryEntry>;
+pub type CaptureStream = BoxStream<'static, LogCapture>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -69,6 +70,16 @@ pub trait MastClient: Send + Sync {
     /// this is a dedicated stream — its volume would evict real state patches
     /// from the replay window.
     async fn subscribe_history(&self) -> Result<HistoryStream, ClientError>;
+
+    /// Stored log captures, newest first — the tail of a container's output
+    /// read at the moment it went down. Unlike history these outlive the
+    /// process: they are on disk, because a container that dies while Mast is
+    /// closed is exactly the one nobody can explain afterwards.
+    async fn log_captures(&self, limit: u32) -> Result<Vec<LogCapture>, ClientError>;
+
+    /// Live log captures. Append-only — a capture is never revised after it is
+    /// written, so consumers only prepend.
+    async fn subscribe_log_captures(&self) -> Result<CaptureStream, ClientError>;
 
     /// Preview attaching a workspace member to the shared network (apply via
     /// `Action::AttachNetwork`).

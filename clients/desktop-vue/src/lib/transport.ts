@@ -10,6 +10,7 @@ import {
   type Action,
   type CustomServiceSpec,
   type HistoryEntry,
+  type LogCapture,
   type LogLine,
   type OperationEvent,
   type OperationId,
@@ -134,4 +135,18 @@ export async function startHistoryStream(onEntry: (entry: HistoryEntry) => void)
   const channel = new Channel<HistoryEntry>();
   channel.onmessage = onEntry;
   unwrap(await commands.startHistoryStream(channel));
+}
+
+/** Stored log captures, newest first — read from disk, so this returns
+ * captures taken before the app was last closed. */
+export async function logCaptures(limit: number): Promise<LogCapture[]> {
+  return unwrap(await commands.logCaptures(limit));
+}
+
+/** Follow log captures. Append-only: a capture is never revised once written,
+ * so the consumer prepends rather than upserting. */
+export async function startCaptureStream(onCapture: (capture: LogCapture) => void): Promise<void> {
+  const channel = new Channel<LogCapture>();
+  channel.onmessage = onCapture;
+  unwrap(await commands.startCaptureStream(channel));
 }

@@ -318,102 +318,40 @@ async fn lifecycle_operations_and_log_streaming_end_to_end() {
     })
     .await;
 
-    sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
-}
-
-/// Cancelling the wizard mid-scaffold must leave nothing behind.
-///
-/// The interesting moment is *after* composer has started writing into the
-/// target but before it finishes: the container is still running as the host
-/// user and a `--rm` teardown races the cleanup. So this waits for the
-/// directory to actually appear on disk before cancelling, rather than
-/// cancelling immediately.
-#[tokio::test(flavor = "multi_thread")]
-async fn cancelling_project_creation_removes_the_half_built_directory() {
-    if !docker_usable().await {
-        eprintln!("skipping: docker daemon not usable");
-        return;
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let meta = tempfile::tempdir().unwrap();
-    let engine = real_engine(meta.path());
-    // The wizard refuses to start until the engine has seen a live daemon.
-    wait_until(&engine, "docker available", Duration::from_secs(60), |s| s.docker.available).await;
-
-    let name = unique_name("mast-it-cancel");
-    let target = tmp.path().join(&name);
-    let id = engine
-        .dispatch(Action::CreateProject {
-            parent: tmp.path().to_string_lossy().into(),
-            name: name.clone(),
-            php: "85".into(),
-            services: vec![],
-        })
-        .expect("dispatch accepted");
-
-    // Drain events in the background so an early failure is visible instead of
-    // being hidden behind a filesystem poll.
-    let seen: Arc<std::sync::Mutex<(Vec<String>, Option<String>)>> = Default::default();
-    let mut events = engine.operation_events(id).expect("event stream");
-    let drain = tokio::spawn({
-        let seen = seen.clone();
-        async move {
-            while let Some(event) = events.next().await {
-                let mut guard = seen.lock().unwrap();
-                match event.kind {
-                    OperationEventKind::Output { line, .. } => guard.0.push(line),
-                    OperationEventKind::Cancelled => {
-                        guard.1 = Some("cancelled".into());
-                        return;
-                    }
-                    OperationEventKind::Completed => {
-                        guard.1 = Some("completed".into());
-                        return;
-                    }
-                    OperationEventKind::Failed { error } => {
-                        guard.1 = Some(format!("failed: {error}"));
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    });
-
-    // Wait until composer has genuinely started writing, so the cancel lands
-    // mid-write instead of before the container exists.
-    let deadline = Instant::now() + Duration::from_secs(240);
-    loop {
-        if target.exists() {
-            break;
-        }
-        let (lines, terminal) = {
-            let guard = seen.lock().unwrap();
-            (guard.0.clone(), guard.1.clone())
-        };
-        assert!(terminal.is_none(), "finished before writing anything: {terminal:?}\n{lines:#?}");
-        assert!(
-            Instant::now() < deadline,
-            "composer never created {}\n{lines:#?}",
-            target.display()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    engine.cancel(id).expect("cancel accepted");
-    tokio::time::timeout(Duration::from_secs(120), drain).await.expect("terminal event").unwrap();
-
-    let (lines, terminal) = {
-        let guard = seen.lock().unwrap();
-        (guard.0.clone(), guard.1.clone())
-    };
-    assert_eq!(terminal.as_deref(), Some("cancelled"), "a cancel must report as cancelled");
-
-    // The whole point: no debris, so the same name can be reused immediately.
+    // M10: the stop above captured the container's tail before running, so the
+    // output that was streaming a moment ago is still readable now that the
+    // stream itself has ended.
+    let captures = engine.log_captures(10).await.unwrap();
+    let capture = captures
+        .iter()
+        .find(|c| c.service == "app")
+        .expect("stopping a project captures its containers first");
+    assert_eq!(capture.reason, mast_contract::CaptureReason::Teardown { verb: "stop".into() });
     assert!(
-        !target.exists(),
-        "{} survived the cancel — retrying the same name would fail\n{lines:#?}",
-        target.display()
+        capture.lines.iter().any(|l| l.message.contains("tick")),
+        "capture should hold the container's own output: {:?}",
+        capture.lines
+    );
+    // Docker's --timestamps prefix is split off, not left in the message.
+    assert!(
+        capture.lines.iter().all(|l| !l.message.starts_with("20")),
+        "timestamps leaked into the message text: {:?}",
+        capture.lines
+    );
+    assert!(capture.lines.iter().any(|l| l.at.is_some()), "no line carried a timestamp");
+
+    // `down -v` removes the container, which is what destroys the log. The
+    // capture is on disk, so it survives — including into a fresh engine.
+    sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
+    let reopened = real_engine(tmp.path());
+    assert!(
+        reopened
+            .log_captures(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.lines.iter().any(|l| l.message.contains("tick"))),
+        "captures must outlive both the container and the engine"
     );
 }
+

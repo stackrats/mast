@@ -8,7 +8,9 @@ pub mod command;
 pub mod endpoint;
 pub mod observer;
 
-pub use adapter::{BollardAdapter, ContainerObservation, LogChunk, RuntimeAdapter, RuntimeEvent};
+pub use adapter::{
+    BollardAdapter, CapturedLine, ContainerObservation, LogChunk, RuntimeAdapter, RuntimeEvent,
+};
 pub use command::{
     CommandError, CommandOutcome, CommandOutput, OutputLine, run_command, run_streaming,
     spawn_detached,
