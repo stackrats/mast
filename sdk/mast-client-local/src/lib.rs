@@ -72,6 +72,9 @@ impl MastClient for LocalClient {
         Ok(self.engine.subscribe_log_captures())
     }
 
+    async fn subscribe_usage(&self) -> Result<mast_client::UsageStream, ClientError> {
+        Ok(self.engine.subscribe_usage())
+    }
 
     async fn network_attach_preview(
         &self,
@@ -216,6 +219,12 @@ mod tests {
             _max_lines: u32,
         ) -> Result<Vec<mast_docker::CapturedLine>, DockerError> {
             Ok(vec![])
+        }
+        async fn container_stats(
+            &self,
+            _container_id: &str,
+        ) -> Result<mast_docker::StatsSample, DockerError> {
+            Ok(mast_docker::StatsSample::default())
         }
     }
 

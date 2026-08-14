@@ -15,7 +15,8 @@ use mast_client_local::LocalClient;
 use mast_contract::{
     Action, CatalogEntry, CustomServiceSpec, DiagnosticReport, DiagnosticsHistory, EngineSnapshot,
     EnvReport, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
-    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
+    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use mast_engine::{Engine, EngineConfig, EngineDeps, RealConnector, RealLifecycleRunner};
 use mast_project::MetadataStore;
@@ -38,6 +39,7 @@ pub struct AppState {
     /// resubscribe, like the patch task.
     history_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    usage_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 /// Global event carrying patch-stream items. `stream_id` lets the frontend
@@ -175,6 +177,40 @@ async fn start_capture_stream(
     });
     if let Some(old) = state.capture_task.lock().unwrap().replace(task) {
         old.abort();
+    }
+    Ok(())
+}
+
+/// Follow live CPU/memory usage (M11). **Calling this is what starts the
+/// engine sampling** — it makes no docker calls while nobody is subscribed, so
+/// the frontend stops the stream whenever the window is hidden. Replaces any
+/// earlier subscription.
+#[tauri::command]
+#[specta::specta]
+async fn start_usage_stream(
+    state: State<'_, AppState>,
+    on_sample: Channel<UsageSample>,
+) -> Result<(), String> {
+    let mut stream = state.client.subscribe_usage().await.map_err(|e| e.to_string())?;
+    let task = tauri::async_runtime::spawn(async move {
+        while let Some(sample) = stream.next().await {
+            if on_sample.send(sample).is_err() {
+                break;
+            }
+        }
+    });
+    if let Some(old) = state.usage_task.lock().unwrap().replace(task) {
+        old.abort();
+    }
+    Ok(())
+}
+
+/// Drop the usage subscription, which stops the engine sampling.
+#[tauri::command]
+#[specta::specta]
+async fn stop_usage_stream(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(task) = state.usage_task.lock().unwrap().take() {
+        task.abort();
     }
     Ok(())
 }
@@ -343,6 +379,8 @@ fn specta_builder() -> tauri_specta::Builder {
             start_history_stream,
             log_captures,
             start_capture_stream,
+            start_usage_stream,
+            stop_usage_stream,
         ])
         .events(tauri_specta::collect_events![PatchStreamItem])
 }
@@ -409,6 +447,7 @@ pub fn run() {
                 next_log_stream: AtomicU32::new(0),
                 history_task: Mutex::new(None),
                 capture_task: Mutex::new(None),
+                usage_task: Mutex::new(None),
             });
             builder.mount_events(app);
             tauri::async_runtime::spawn(tray::refresh_loop(app.handle().clone()));

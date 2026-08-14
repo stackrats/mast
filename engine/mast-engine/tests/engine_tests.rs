@@ -15,7 +15,7 @@ use mast_contract::{
 };
 use mast_docker::{
     CapturedLine, CommandOutcome, ContainerObservation, DockerError, LogChunk, OutputLine,
-    RuntimeAdapter, RuntimeEvent,
+    RuntimeAdapter, RuntimeEvent, StatsSample,
 };
 use mast_engine::{
     Engine, EngineConfig, EngineDeps, LifecycleRunner, LifecycleVerb, RealLifecycleRunner,
@@ -85,6 +85,10 @@ impl RuntimeAdapter for FakeAdapter {
             message: "fake captured line".into(),
             stderr: false,
         }])
+    }
+
+    async fn container_stats(&self, _container_id: &str) -> Result<StatsSample, DockerError> {
+        Ok(StatsSample::default())
     }
 }
 

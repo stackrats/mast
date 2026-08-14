@@ -355,3 +355,172 @@ async fn lifecycle_operations_and_log_streaming_end_to_end() {
     );
 }
 
+/// M11 verify: the CPU/memory formula against a real daemon. A container
+/// spinning a busy loop must read as roughly one core — the arithmetic is
+/// unit-tested, but only this proves the counters mean what we think.
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_usage_measures_a_real_container() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
+    janitor().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join(unique_name("mast-it-usage"));
+    std::fs::create_dir_all(&project).unwrap();
+    // One process, one core, forever — a predictable load to measure.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    command: [\"sh\", \"-c\", \"while :; do :; done\"]\n",
+    )
+    .unwrap();
+
+    let engine = real_engine(tmp.path());
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    wait_until(&engine, "resolved", Duration::from_secs(30), |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let id = engine.snapshot().projects[0].id.clone();
+    run_action(&engine, Action::StartProject { id: id.clone() }).await;
+    wait_until(&engine, "running", Duration::from_secs(30), |s| {
+        s.projects[0].status == ProjectStatus::Running
+    })
+    .await;
+
+    // Subscribing is what starts the sampler. The first sample has no
+    // predecessor, so keep reading until one carries a measurement.
+    let mut usage = engine.subscribe_usage();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let measured = loop {
+        assert!(Instant::now() < deadline, "no usage sample ever carried a reading");
+        let Ok(Some(sample)) = tokio::time::timeout(Duration::from_secs(15), usage.next()).await
+        else {
+            panic!("usage stream stalled");
+        };
+        if let Some(service) = sample.services.iter().find(|s| s.cpu_cores > 0.0) {
+            break (sample.clone(), service.clone());
+        }
+    };
+    let (sample, service) = measured;
+
+    assert_eq!(service.service, "app");
+    assert!(sample.host_cores >= 1, "host cores not reported");
+    assert!(sample.host_memory_bytes > 0, "host memory not reported");
+    // A single `while :; do :; done` is one busy process: at least a
+    // meaningful fraction of a core, and never more than the machine has.
+    assert!(
+        service.cpu_cores > 0.3 && service.cpu_cores <= sample.host_cores as f64,
+        "implausible cpu reading: {} cores on a {}-core host",
+        service.cpu_cores,
+        sample.host_cores
+    );
+    // Working set is real but modest for busybox, and must be under the limit.
+    assert!(service.memory_bytes > 0, "no memory reported");
+    assert!(
+        service.memory_bytes < service.memory_limit_bytes,
+        "working set {} exceeds limit {}",
+        service.memory_bytes,
+        service.memory_limit_bytes
+    );
+
+    sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
+}
+
+/// Cancelling the wizard mid-scaffold must leave nothing behind.
+///
+/// The interesting moment is *after* composer has started writing into the
+/// target but before it finishes: the container is still running as the host
+/// user and a `--rm` teardown races the cleanup. So this waits for the
+/// directory to actually appear on disk before cancelling, rather than
+/// cancelling immediately.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_project_creation_removes_the_half_built_directory() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let meta = tempfile::tempdir().unwrap();
+    let engine = real_engine(meta.path());
+    // The wizard refuses to start until the engine has seen a live daemon.
+    wait_until(&engine, "docker available", Duration::from_secs(60), |s| s.docker.available).await;
+
+    let name = unique_name("mast-it-cancel");
+    let target = tmp.path().join(&name);
+    let id = engine
+        .dispatch(Action::CreateProject {
+            parent: tmp.path().to_string_lossy().into(),
+            name: name.clone(),
+            php: "85".into(),
+            services: vec![],
+        })
+        .expect("dispatch accepted");
+
+    // Drain events in the background so an early failure is visible instead of
+    // being hidden behind a filesystem poll.
+    let seen: Arc<std::sync::Mutex<(Vec<String>, Option<String>)>> = Default::default();
+    let mut events = engine.operation_events(id).expect("event stream");
+    let drain = tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            while let Some(event) = events.next().await {
+                let mut guard = seen.lock().unwrap();
+                match event.kind {
+                    OperationEventKind::Output { line, .. } => guard.0.push(line),
+                    OperationEventKind::Cancelled => {
+                        guard.1 = Some("cancelled".into());
+                        return;
+                    }
+                    OperationEventKind::Completed => {
+                        guard.1 = Some("completed".into());
+                        return;
+                    }
+                    OperationEventKind::Failed { error } => {
+                        guard.1 = Some(format!("failed: {error}"));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // Wait until composer has genuinely started writing, so the cancel lands
+    // mid-write instead of before the container exists.
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        if target.exists() {
+            break;
+        }
+        let (lines, terminal) = {
+            let guard = seen.lock().unwrap();
+            (guard.0.clone(), guard.1.clone())
+        };
+        assert!(terminal.is_none(), "finished before writing anything: {terminal:?}\n{lines:#?}");
+        assert!(
+            Instant::now() < deadline,
+            "composer never created {}\n{lines:#?}",
+            target.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    engine.cancel(id).expect("cancel accepted");
+    tokio::time::timeout(Duration::from_secs(120), drain).await.expect("terminal event").unwrap();
+
+    let (lines, terminal) = {
+        let guard = seen.lock().unwrap();
+        (guard.0.clone(), guard.1.clone())
+    };
+    assert_eq!(terminal.as_deref(), Some("cancelled"), "a cancel must report as cancelled");
+
+    // The whole point: no debris, so the same name can be reused immediately.
+    assert!(
+        !target.exists(),
+        "{} survived the cancel — retrying the same name would fail\n{lines:#?}",
+        target.display()
+    );
+}

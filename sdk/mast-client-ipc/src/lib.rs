@@ -231,6 +231,9 @@ impl MastClient for IpcClient {
         self.open_stream::<mast_contract::LogCapture>("subscribeLogCaptures", json!({})).await
     }
 
+    async fn subscribe_usage(&self) -> Result<mast_client::UsageStream, ClientError> {
+        self.open_stream::<mast_contract::UsageSample>("subscribeUsage", json!({})).await
+    }
 
     async fn network_attach_preview(
         &self,
