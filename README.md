@@ -40,6 +40,8 @@ Mast gives your existing Sail projects a single control center.
 - Start complete development workspaces in dependency order.
 - Start, stop, and restart individual projects or services.
 - View live logs without hunting through terminal tabs.
+- Keep a container's last words when it dies, so the reason outlives the restart.
+- See what each project costs in CPU and memory, and what to stop.
 - Run Horizon, Reverb, queue workers, and project commands automatically.
 - Diagnose and repair common local environment problems.
 - Manage services and environment variables without leaving Mast.
@@ -157,6 +159,43 @@ Mast can automatically start:
 - Saved project commands
 
 These processes remain attached to the project they belong to rather than disappearing into another terminal window.
+
+---
+
+## Logs & captures
+
+Follow any service's logs from inside Mast, without keeping a terminal tab open for each one.
+
+A live log stream ends when its container does, and that is usually the moment the output becomes interesting. Worse, recreating a container — which `up -d` does whenever its configuration changed — starts a fresh log and discards the previous one entirely.
+
+So Mast keeps the last minute of a container's output whenever it goes down:
+
+- Before Mast stops, restarts, or rebuilds it — taken before the command runs, because a rebuild removes the container.
+- When it exits or turns unhealthy on its own, including while Mast was closed.
+- When a workspace start gives up waiting for it to become ready.
+- On demand, from the service menu.
+
+Captures are written to disk, so they survive both the container being replaced and Mast being restarted. Each one records why it was taken, and is listed newest first with a copy button.
+
+Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
+
+---
+
+## Resource usage
+
+See what your containers actually cost, per service, per project, per workspace, and in total.
+
+CPU is reported in **cores** rather than a percentage. Docker's percentage is a share of every core at once, so `800%` is a real reading on an eight-core machine and a progress bar cannot express it. `2.3 of 8 cores` needs no explanation.
+
+Memory is the **working set** — reclaimable page cache excluded, the same figure `docker stats` shows. A raw cgroup reading counts cache and can overstate a database container by an order of magnitude.
+
+Where a container has a memory limit, Mast shows how close it is to it, which is the number that predicts an out-of-memory kill. Where there is no limit, the same bar shows its share of the machine instead.
+
+The Resources tab ranks every running service across every project, so the answer to "what do I stop" is the top row. Sort by service, CPU, or memory by clicking a column.
+
+Short histories are kept alongside each reading, because one CPU number cannot tell a momentary spike apart from a steady climb.
+
+Sampling only runs while the Mast window is visible. Measuring the machine costs CPU, and a minimised Mast should not be part of the problem it reports on.
 
 ---
 
