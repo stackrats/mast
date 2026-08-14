@@ -44,9 +44,16 @@ const facts = computed(() => [
     value: store.docker?.available ? (store.docker.contextName ?? "connected") : "not connected",
   },
   { label: "Endpoint", value: store.docker?.endpoint ?? "—" },
-  // A second instance observes but cannot mutate, which explains a whole
-  // class of "the buttons do nothing" reports.
-  { label: "Mutation", value: store.readOnly ? "read-only (another instance owns it)" : "owned" },
+  // Only one Mast may change things at a time; a second one still watches
+  // live but its buttons are disabled. Said plainly, because this row exists
+  // to answer "why do my buttons do nothing" — it fails at that if it needs
+  // explaining itself.
+  {
+    label: "Control",
+    value: store.readOnly
+      ? "Read-only — another Mast window has control"
+      : "This window can make changes",
+  },
 ]);
 
 const copied = ref(false);
@@ -86,7 +93,7 @@ async function copyDetails() {
       <dl class="space-y-1 text-xs">
         <div v-for="fact in facts" :key="fact.label" class="flex gap-2">
           <dt class="w-20 shrink-0 text-slate-400">{{ fact.label }}</dt>
-          <dd class="min-w-0 flex-1 break-all text-slate-600 tabular-nums dark:text-slate-300">
+          <dd class="min-w-0 flex-1 break-words text-slate-600 dark:text-slate-300">
             {{ fact.value }}
           </dd>
         </div>
