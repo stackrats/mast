@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 
@@ -15,6 +15,7 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import Sidebar from "./components/Sidebar.vue";
 import WorkspaceDetail from "./components/WorkspaceDetail.vue";
 import WorkspaceDialog from "./components/WorkspaceDialog.vue";
+import UsageReadout from "./components/UsageReadout.vue";
 import Button from "./components/ui/Button.vue";
 import { TooltipProvider } from "reka-ui";
 
@@ -30,8 +31,21 @@ const editingWorkspace = ref<WorkspaceSummary | null>(null);
 
 applyTheme(loadTheme());
 
+// Sampling the machine costs real CPU, so it only runs while someone can see
+// the answer. The engine does nothing while unsubscribed; this is the client
+// half of that bargain.
+function syncUsageToVisibility() {
+  if (document.hidden) void store.disconnectUsage();
+  else void store.connectUsage();
+}
+
 onMounted(() => {
   void store.connect();
+  document.addEventListener("visibilitychange", syncUsageToVisibility);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", syncUsageToVisibility);
 });
 
 const selectedProject = computed(() => {
@@ -102,12 +116,15 @@ function editWorkspace(ws: WorkspaceSummary) {
           <ChevronDown v-if="store.logsOpen" class="h-3 w-3 text-slate-400" />
           <ChevronUp v-else class="h-3 w-3 text-slate-400" />
         </Button>
-        <span
-          v-if="store.phase !== 'live'"
-          class="rounded-full bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700 dark:bg-amber-900/60 dark:text-amber-300"
-        >
-          connecting…
-        </span>
+        <div class="ml-auto flex items-center gap-3">
+          <UsageReadout />
+          <span
+            v-if="store.phase !== 'live'"
+            class="rounded-full bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700 dark:bg-amber-900/60 dark:text-amber-300"
+          >
+            connecting…
+          </span>
+        </div>
       </div>
 
       <SettingsDialog v-model:open="settingsOpen" />

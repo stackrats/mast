@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
+  Camera,
+  ChartColumn,
   ChevronDown,
+  Cpu,
   FileCog,
   Globe,
   Plus,
   FolderOpen,
   GitBranch,
+  MemoryStick,
   Pencil,
   Play,
   RotateCw,
@@ -28,6 +32,7 @@ import {
 
 import type { ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
 import { menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
+import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
 import { commandKey, useEngineStore } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
@@ -37,6 +42,7 @@ import Button from "./ui/Button.vue";
 import Checkbox from "./ui/Checkbox.vue";
 import Chip from "./ui/Chip.vue";
 import Hint from "./ui/Hint.vue";
+import Sparkline from "./ui/Sparkline.vue";
 import Tooltip from "./ui/Tooltip.vue";
 import Input from "./ui/Input.vue";
 import Modal from "./ui/Modal.vue";
@@ -47,6 +53,25 @@ const store = useEngineStore();
 const op = computed(() => store.operations[project.id]);
 const processes = computed(() => project.processes ?? []);
 const opRunning = computed(() => op.value != null && op.value.terminal === null);
+
+/** This project's share of the machine, or null when nothing of it is running
+ * — which the template shows as a dash rather than a confident zero. */
+const usage = computed(() => {
+  const sample = store.latestUsage;
+  if (!sample || !sample.services.some((s) => s.project === project.id)) return null;
+  return rollupByProject(sample, project.id);
+});
+const hostCores = computed(() => store.latestUsage?.hostCores ?? 0);
+/** Scaling a per-project strip to the whole machine flattens it — a typical
+ * project sits well under a core, and every bar lands on the minimum height.
+ * A quarter-core floor keeps small numbers looking small while leaving the
+ * shape readable. */
+const SPARKLINE_FLOOR_CORES = 0.25;
+const cpuHistory = computed(() =>
+  series(store.usage, (sample) =>
+    sample.services.filter((s) => s.project === project.id).reduce((sum, s) => sum + s.cpuCores, 0),
+  ),
+);
 const showEnv = ref(false);
 
 function serviceDot(service: ServiceState): string {
@@ -256,6 +281,56 @@ async function addCommand() {
       </Tooltip>
     </div>
 
+    <!-- Same rhythm as the tool row above: h-7 rows, px-2 so the icons line up
+       under Terminal/Editor/Files, gap-1 between items. The readings are facts
+       rather than actions, so they carry no hover state — but they must still
+       sit on the row's grid, or the card reads as two unrelated strips.
+
+       Rendered even when stopped, showing dashes, so that live numbers
+       arriving does not shift everything below it — same reason the header
+       reserves room for late git badges. -->
+    <div class="mt-1 flex items-center gap-1 text-xs text-slate-400">
+      <Tooltip
+        :text="
+          usage
+            ? `${formatCores(usage.cpuCores)} of this machine's ${hostCores} cores, across every container in this project.`
+            : 'Nothing running to measure.'
+        "
+      >
+        <span class="flex h-7 items-center gap-1.5 px-2">
+          <Cpu class="h-3.5 w-3.5" />
+          <template v-if="usage">
+            <span class="tabular-nums text-slate-500 dark:text-slate-400">
+              {{ formatCores(usage.cpuCores) }}
+            </span>
+            <span>cores</span>
+            <Sparkline :values="cpuHistory" :floor="SPARKLINE_FLOOR_CORES" />
+          </template>
+          <span v-else>—</span>
+        </span>
+      </Tooltip>
+      <Tooltip
+        :text="
+          usage
+            ? 'Working set across this project — page cache excluded, as docker stats reports it.'
+            : 'Nothing running to measure.'
+        "
+      >
+        <span class="flex h-7 items-center gap-1.5 px-2">
+          <MemoryStick class="h-3.5 w-3.5" />
+          <span v-if="usage" class="tabular-nums text-slate-500 dark:text-slate-400">
+            {{ formatBytes(usage.memoryBytes) }}
+          </span>
+          <span v-else>—</span>
+        </span>
+      </Tooltip>
+      <Tooltip v-if="usage" text="Break this down by service, ranked across every project.">
+        <Button variant="ghost" size="sm" @click="store.showResources()">
+          <ChartColumn class="h-3.5 w-3.5" /> Breakdown
+        </Button>
+      </Tooltip>
+    </div>
+
     <p
       v-if="project.resolutionError"
       class="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
@@ -297,6 +372,13 @@ async function addCommand() {
                 @select="store.openLogs(project.id, service.name)"
               >
                 <ScrollText class="h-3.5 w-3.5 text-slate-400" /> Logs
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                :class="menuItemClass"
+                :disabled="service.containerId == null || store.readOnly"
+                @select="store.captureServiceLogs(project.id, service.name)"
+              >
+                <Camera class="h-3.5 w-3.5 text-slate-400" /> Capture logs
               </DropdownMenuItem>
               <DropdownMenuItem
                 :class="menuItemClass"

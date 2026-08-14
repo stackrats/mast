@@ -318,6 +318,113 @@ async fn lifecycle_operations_and_log_streaming_end_to_end() {
     })
     .await;
 
+    // M10: the stop above captured the container's tail before running, so the
+    // output that was streaming a moment ago is still readable now that the
+    // stream itself has ended.
+    let captures = engine.log_captures(10).await.unwrap();
+    let capture = captures
+        .iter()
+        .find(|c| c.service == "app")
+        .expect("stopping a project captures its containers first");
+    assert_eq!(capture.reason, mast_contract::CaptureReason::Teardown { verb: "stop".into() });
+    assert!(
+        capture.lines.iter().any(|l| l.message.contains("tick")),
+        "capture should hold the container's own output: {:?}",
+        capture.lines
+    );
+    // Docker's --timestamps prefix is split off, not left in the message.
+    assert!(
+        capture.lines.iter().all(|l| !l.message.starts_with("20")),
+        "timestamps leaked into the message text: {:?}",
+        capture.lines
+    );
+    assert!(capture.lines.iter().any(|l| l.at.is_some()), "no line carried a timestamp");
+
+    // `down -v` removes the container, which is what destroys the log. The
+    // capture is on disk, so it survives — including into a fresh engine.
+    sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
+    let reopened = real_engine(tmp.path());
+    assert!(
+        reopened
+            .log_captures(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.lines.iter().any(|l| l.message.contains("tick"))),
+        "captures must outlive both the container and the engine"
+    );
+}
+
+/// M11 verify: the CPU/memory formula against a real daemon. A container
+/// spinning a busy loop must read as roughly one core — the arithmetic is
+/// unit-tested, but only this proves the counters mean what we think.
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_usage_measures_a_real_container() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
+    janitor().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join(unique_name("mast-it-usage"));
+    std::fs::create_dir_all(&project).unwrap();
+    // One process, one core, forever — a predictable load to measure.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    command: [\"sh\", \"-c\", \"while :; do :; done\"]\n",
+    )
+    .unwrap();
+
+    let engine = real_engine(tmp.path());
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    wait_until(&engine, "resolved", Duration::from_secs(30), |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let id = engine.snapshot().projects[0].id.clone();
+    run_action(&engine, Action::StartProject { id: id.clone() }).await;
+    wait_until(&engine, "running", Duration::from_secs(30), |s| {
+        s.projects[0].status == ProjectStatus::Running
+    })
+    .await;
+
+    // Subscribing is what starts the sampler. The first sample has no
+    // predecessor, so keep reading until one carries a measurement.
+    let mut usage = engine.subscribe_usage();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let measured = loop {
+        assert!(Instant::now() < deadline, "no usage sample ever carried a reading");
+        let Ok(Some(sample)) = tokio::time::timeout(Duration::from_secs(15), usage.next()).await
+        else {
+            panic!("usage stream stalled");
+        };
+        if let Some(service) = sample.services.iter().find(|s| s.cpu_cores > 0.0) {
+            break (sample.clone(), service.clone());
+        }
+    };
+    let (sample, service) = measured;
+
+    assert_eq!(service.service, "app");
+    assert!(sample.host_cores >= 1, "host cores not reported");
+    assert!(sample.host_memory_bytes > 0, "host memory not reported");
+    // A single `while :; do :; done` is one busy process: at least a
+    // meaningful fraction of a core, and never more than the machine has.
+    assert!(
+        service.cpu_cores > 0.3 && service.cpu_cores <= sample.host_cores as f64,
+        "implausible cpu reading: {} cores on a {}-core host",
+        service.cpu_cores,
+        sample.host_cores
+    );
+    // Working set is real but modest for busybox, and must be under the limit.
+    assert!(service.memory_bytes > 0, "no memory reported");
+    assert!(
+        service.memory_bytes < service.memory_limit_bytes,
+        "working set {} exceeds limit {}",
+        service.memory_bytes,
+        service.memory_limit_bytes
+    );
+
     sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
 }
 

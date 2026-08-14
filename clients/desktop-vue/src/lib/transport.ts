@@ -10,12 +10,14 @@ import {
   type Action,
   type CustomServiceSpec,
   type HistoryEntry,
+  type LogCapture,
   type LogLine,
   type OperationEvent,
   type OperationId,
   type ProjectId,
   type Result,
   type SubscriptionItem,
+  type UsageSample,
 } from "../bindings";
 import type { PatchTransport } from "./engineSync";
 
@@ -134,4 +136,32 @@ export async function startHistoryStream(onEntry: (entry: HistoryEntry) => void)
   const channel = new Channel<HistoryEntry>();
   channel.onmessage = onEntry;
   unwrap(await commands.startHistoryStream(channel));
+}
+
+/** Stored log captures, newest first — read from disk, so this returns
+ * captures taken before the app was last closed. */
+export async function logCaptures(limit: number): Promise<LogCapture[]> {
+  return unwrap(await commands.logCaptures(limit));
+}
+
+/** Follow log captures. Append-only: a capture is never revised once written,
+ * so the consumer prepends rather than upserting. */
+export async function startCaptureStream(onCapture: (capture: LogCapture) => void): Promise<void> {
+  const channel = new Channel<LogCapture>();
+  channel.onmessage = onCapture;
+  unwrap(await commands.startCaptureStream(channel));
+}
+
+/** Follow live CPU/memory usage. Calling this is what makes the engine start
+ * sampling — it does no work while nobody is subscribed — so the caller is
+ * expected to stop the stream whenever the numbers are not being looked at. */
+export async function startUsageStream(onSample: (sample: UsageSample) => void): Promise<void> {
+  const channel = new Channel<UsageSample>();
+  channel.onmessage = onSample;
+  unwrap(await commands.startUsageStream(channel));
+}
+
+/** Drop the usage subscription, which stops the engine sampling. */
+export async function stopUsageStream(): Promise<void> {
+  unwrap(await commands.stopUsageStream());
 }

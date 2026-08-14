@@ -14,8 +14,8 @@ use mast_contract::{
     SubscriptionItem,
 };
 use mast_docker::{
-    CommandOutcome, ContainerObservation, DockerError, LogChunk, OutputLine, RuntimeAdapter,
-    RuntimeEvent,
+    CapturedLine, CommandOutcome, ContainerObservation, DockerError, LogChunk, OutputLine,
+    RuntimeAdapter, RuntimeEvent, StatsSample,
 };
 use mast_engine::{
     Engine, EngineConfig, EngineDeps, LifecycleRunner, LifecycleVerb, RealLifecycleRunner,
@@ -72,6 +72,23 @@ impl RuntimeAdapter for FakeAdapter {
             LogChunk { message: "fake log line".into(), stderr: false },
         ])
         .boxed())
+    }
+
+    async fn container_log_tail(
+        &self,
+        _container_id: &str,
+        _since_unix: i64,
+        _max_lines: u32,
+    ) -> Result<Vec<CapturedLine>, DockerError> {
+        Ok(vec![CapturedLine {
+            at: Some("2026-08-12T14:22:03.000000000Z".into()),
+            message: "fake captured line".into(),
+            stderr: false,
+        }])
+    }
+
+    async fn container_stats(&self, _container_id: &str) -> Result<StatsSample, DockerError> {
+        Ok(StatsSample::default())
     }
 }
 
@@ -245,6 +262,7 @@ fn observation(project_name: &str, project_dir: &Path, service: &str, state: &st
         working_dir: Some(project_dir.to_string_lossy().into_owned()),
         state: state.into(),
         health: None,
+        exit_code: None,
         config_hash: Some("hash".into()),
     }
 }

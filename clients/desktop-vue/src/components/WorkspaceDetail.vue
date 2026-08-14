@@ -4,6 +4,7 @@ import { Network, Pencil, Play, Square, Trash2, TriangleAlert, X } from "lucide-
 
 import type { ProjectId, WorkspaceSummary } from "../bindings";
 import { statusBadgeVariant } from "../lib/status";
+import { formatBytes, formatCores, rollupByWorkspace } from "../lib/usage";
 import { useEngineStore } from "../stores/engine";
 import NetworkAttachDialog from "./NetworkAttachDialog.vue";
 import ProjectCard from "./ProjectCard.vue";
@@ -24,6 +25,14 @@ const memberProjects = computed(() =>
     .map((m) => store.projects.find((p) => p.id === m.project))
     .filter((p) => p != null),
 );
+
+/// What this workspace is costing, or null when none of it is running.
+const usage = computed(() => {
+  const sample = store.latestUsage;
+  if (!sample) return null;
+  const total = rollupByWorkspace(sample, workspace);
+  return total.memoryBytes > 0 ? total : null;
+});
 
 /// Aggregated health across every member's services (the M6 dashboard line).
 const health = computed(() => {
@@ -114,6 +123,8 @@ function projectName(id: string): string {
         · {{ health.starting }} health-starting</template
       ><template v-if="health.unhealthy">
         · <span class="text-red-500">{{ health.unhealthy }} unhealthy</span></template
+      ><template v-if="usage">
+        · {{ formatCores(usage.cpuCores) }} cores · {{ formatBytes(usage.memoryBytes) }}</template
       >
     </p>
 

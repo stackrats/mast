@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use mast_compose::ComposeInvocation;
 use mast_contract::{
-    ErrorInfo, FileEditPreview, OperationEventKind, OperationId, PatchEvent, ProjectId,
-    ProjectStatus, ServiceHealth, WorkspaceId,
+    CaptureReason, ErrorInfo, FileEditPreview, OperationEventKind, OperationId, PatchEvent,
+    ProjectId, ProjectStatus, ServiceHealth, WorkspaceId,
 };
 use mast_docker::CommandOutcome;
 use mast_project::WorkspaceRecord;
@@ -244,6 +244,19 @@ impl Engine {
                     )
                     .await;
                 }
+                // Stopping a whole workspace is the same evidence-destroying
+                // moment as stopping one project, and members go down in
+                // dependency order — so the one that failed first is often
+                // the one whose log matters.
+                if verb == LifecycleVerb::Stop {
+                    let requests = self.capture_requests_for_project(
+                        &ProjectId(member.clone()),
+                        CaptureReason::Teardown { verb: verb.label().to_string() },
+                    );
+                    for request in requests {
+                        self.run_capture(request).await;
+                    }
+                }
                 let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
                 let forwarder = {
                     let engine = self.clone();
@@ -408,6 +421,10 @@ impl Engine {
             }
 
             if std::time::Instant::now() >= deadline {
+                // The whole workspace start is about to fail on this member,
+                // and the reason is in its output. Nobody was tailing it —
+                // that is precisely why the timeout is so opaque today.
+                self.capture_stalled_services(project_id).await;
                 return Err("did not become ready in time".into());
             }
             self.hint();

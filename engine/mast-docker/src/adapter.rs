@@ -31,6 +31,10 @@ pub struct ContainerObservation {
     pub state: String,
     /// Parsed from the status text: `healthy` / `unhealthy` / `starting`.
     pub health: Option<String>,
+    /// Parsed from the status text of an exited container: `Exited (1) …`.
+    /// Only the log-capture path reads it — a crash worth capturing is worth
+    /// labelling with the code it died on.
+    pub exit_code: Option<i32>,
     pub config_hash: Option<String>,
 }
 
@@ -47,6 +51,40 @@ pub struct LogChunk {
     pub stderr: bool,
 }
 
+/// One line read out of a container's retained log, for a capture. Unlike
+/// [`LogChunk`] it carries Docker's own timestamp: a capture is read after the
+/// fact, so "when did this happen" is not answerable from arrival order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedLine {
+    /// Docker's RFC3339 stamp, verbatim. `None` if the line arrived without
+    /// one — clients render the capture's own time instead.
+    pub at: Option<String>,
+    pub message: String,
+    pub stderr: bool,
+}
+
+/// One raw stats reading for a container: counters as the daemon reports
+/// them, with no arithmetic applied.
+///
+/// CPU is cumulative-since-start, so a single reading says nothing on its own
+/// — usage is the *delta* between two readings over a known interval. Keeping
+/// the raw counters here rather than a computed percentage puts that
+/// subtraction where the previous reading lives, in the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatsSample {
+    /// Total CPU time consumed by the container since it started, in ns.
+    pub cpu_total_ns: u64,
+    /// Total CPU time available on the host over the same period, in ns.
+    pub system_cpu_ns: u64,
+    pub online_cpus: u32,
+    /// Includes page cache; subtract [`StatsSample::memory_cache`] for the
+    /// working set, which is what `docker stats` shows.
+    pub memory_usage: u64,
+    pub memory_cache: u64,
+    /// The cgroup limit — host RAM when the container has no limit of its own.
+    pub memory_limit: u64,
+}
+
 #[async_trait::async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn ping(&self) -> Result<(), DockerError>;
@@ -61,6 +99,24 @@ pub trait RuntimeAdapter: Send + Sync {
         container_id: &str,
         tail: u32,
     ) -> Result<BoxStream<'static, LogChunk>, DockerError>;
+    /// Read a bounded slice of what Docker still holds for a container, newest
+    /// `max_lines` since `since_unix`. Does not follow: this is the
+    /// post-mortem read, and for an exited container it returns its final
+    /// life. The evidence survives until the container is *removed*, which is
+    /// why a capture taken before `up -d --force-recreate` must be taken
+    /// before the command, not after.
+    async fn container_log_tail(
+        &self,
+        container_id: &str,
+        since_unix: i64,
+        max_lines: u32,
+    ) -> Result<Vec<CapturedLine>, DockerError>;
+    /// One immediate stats reading. Uses Docker's `one-shot` mode, which
+    /// returns straight away instead of blocking ~1s while the daemon
+    /// collects two cycles to compute its own delta. The caller holds the
+    /// previous reading and takes the delta over its own interval, which is
+    /// both cheaper and steadier than the daemon's one-second window.
+    async fn container_stats(&self, container_id: &str) -> Result<StatsSample, DockerError>;
 }
 
 pub struct BollardAdapter {
@@ -97,6 +153,27 @@ fn connect_unix(host: &str) -> Result<Docker, DockerError> {
 #[cfg(not(unix))]
 fn connect_unix(host: &str) -> Result<Docker, DockerError> {
     Err(DockerError::UnsupportedEndpoint(host.to_string()))
+}
+
+/// `Exited (137) 3 minutes ago` → `137`. Anything else yields `None`, which
+/// reads as "it stopped and Docker did not say why".
+fn parse_exit_code(status_text: &str) -> Option<i32> {
+    let rest = status_text.trim().strip_prefix("Exited (")?;
+    let (code, _) = rest.split_once(')')?;
+    code.trim().parse().ok()
+}
+
+/// Split Docker's `--timestamps` prefix off a log line. The stamp is kept as
+/// an opaque string: clients parse RFC3339 natively, so the engine gains
+/// nothing from a date crate here.
+fn split_timestamp(line: &str) -> (Option<String>, &str) {
+    match line.split_once(' ') {
+        // A stamp, not a first word that happens to contain a dash.
+        Some((stamp, rest)) if stamp.len() >= 20 && stamp.ends_with('Z') && stamp.contains('T') => {
+            (Some(stamp.to_string()), rest)
+        }
+        _ => (None, line),
+    }
 }
 
 fn parse_health(status_text: &str) -> Option<String> {
@@ -155,6 +232,7 @@ impl RuntimeAdapter for BollardAdapter {
                 working_dir: labels.get(COMPOSE_WORKING_DIR_LABEL).cloned(),
                 state: c.state.map(|s| s.to_string().to_ascii_lowercase()).unwrap_or_default(),
                 health: parse_health(&status_text),
+                exit_code: parse_exit_code(&status_text),
                 config_hash: labels.get(COMPOSE_CONFIG_HASH_LABEL).cloned(),
             });
         }
@@ -206,6 +284,68 @@ impl RuntimeAdapter for BollardAdapter {
             .boxed();
         Ok(stream)
     }
+
+    async fn container_log_tail(
+        &self,
+        container_id: &str,
+        since_unix: i64,
+        max_lines: u32,
+    ) -> Result<Vec<CapturedLine>, DockerError> {
+        let options = bollard::query_parameters::LogsOptionsBuilder::default()
+            .follow(false)
+            .stdout(true)
+            .stderr(true)
+            .timestamps(true)
+            .since(since_unix as i32)
+            .tail(&max_lines.to_string())
+            .build();
+        let mut stream = self.docker.logs(container_id, Some(options));
+        let mut lines = Vec::new();
+        while let Some(item) = stream.next().await {
+            // A capture is best-effort: half a post-mortem beats none, so a
+            // mid-stream API error keeps what was already read.
+            let Ok(output) = item else { break };
+            let stderr = matches!(output, bollard::container::LogOutput::StdErr { .. });
+            let raw = String::from_utf8_lossy(&output.into_bytes()).into_owned();
+            let (at, message) = split_timestamp(raw.trim_end_matches(['\r', '\n']));
+            lines.push(CapturedLine { at, message: message.to_string(), stderr });
+        }
+        Ok(lines)
+    }
+
+    async fn container_stats(&self, container_id: &str) -> Result<StatsSample, DockerError> {
+        let options = bollard::query_parameters::StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+        let response = self
+            .docker
+            .stats(container_id, Some(options))
+            .next()
+            .await
+            .ok_or_else(|| DockerError::Api("stats stream produced nothing".into()))?
+            .map_err(|e| DockerError::Api(e.to_string()))?;
+
+        let cpu = response.cpu_stats.unwrap_or_default();
+        let memory = response.memory_stats.unwrap_or_default();
+        let memory_stats = memory.stats.unwrap_or_default();
+        Ok(StatsSample {
+            cpu_total_ns: cpu.cpu_usage.and_then(|u| u.total_usage).unwrap_or(0),
+            system_cpu_ns: cpu.system_cpu_usage.unwrap_or(0),
+            online_cpus: cpu.online_cpus.unwrap_or(0),
+            memory_usage: memory.usage.unwrap_or(0),
+            // cgroups v2 calls it `inactive_file`, v1 `cache`. Both name the
+            // reclaimable page cache that `docker stats` subtracts before
+            // showing a number — without this a mysql container reads as
+            // gigabytes of "usage" that the kernel would hand back on demand.
+            memory_cache: memory_stats
+                .get("inactive_file")
+                .or_else(|| memory_stats.get("cache"))
+                .copied()
+                .unwrap_or(0),
+            memory_limit: memory.limit.unwrap_or(0),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +358,30 @@ mod tests {
         assert_eq!(parse_health("Up 2 minutes (unhealthy)"), Some("unhealthy".into()));
         assert_eq!(parse_health("Up 1 second (health: starting)"), Some("starting".into()));
         assert_eq!(parse_health("Exited (0) 3 minutes ago"), None);
+    }
+
+    #[test]
+    fn exit_code_parses_from_status_text() {
+        assert_eq!(parse_exit_code("Exited (0) 3 minutes ago"), Some(0));
+        assert_eq!(parse_exit_code("Exited (137) 2 seconds ago"), Some(137));
+        assert_eq!(parse_exit_code("Up 5 seconds (healthy)"), None);
+        assert_eq!(parse_exit_code("Created"), None);
+    }
+
+    #[test]
+    fn timestamps_split_off_without_eating_message_text() {
+        let (at, message) = split_timestamp("2026-08-12T14:22:03.123456789Z FATAL: role missing");
+        assert_eq!(at.as_deref(), Some("2026-08-12T14:22:03.123456789Z"));
+        assert_eq!(message, "FATAL: role missing");
+
+        // A line Docker handed us without a stamp keeps every byte.
+        let (at, message) = split_timestamp("plain line with spaces");
+        assert_eq!(at, None);
+        assert_eq!(message, "plain line with spaces");
+
+        // A leading word that merely looks date-ish is not a stamp.
+        let (at, message) = split_timestamp("2026-08-12 something happened");
+        assert_eq!(at, None);
+        assert_eq!(message, "2026-08-12 something happened");
     }
 }

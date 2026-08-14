@@ -592,6 +592,111 @@ pub struct HistoryEntry {
     pub output: Vec<String>,
 }
 
+// ---------- log captures (M10) ----------
+//
+// Live log streams are bound to one container id and end when that container
+// goes away, taking the output that explains the failure with them. A capture
+// is the post-mortem: the tail of a container's output, read at the moment it
+// went down and written to disk so it survives both the recreate and the app.
+//
+// Like history (ADR-0004 §3) captures get their own channel rather than the
+// patch stream — they are events with a body, not state, and a client that
+// resynchronizes must not silently lose one.
+
+/// Why a capture was taken. The reason is the whole diagnostic frame: the same
+/// forty lines mean something different before a user-requested restart than
+/// they do after a container fell over on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum CaptureReason {
+    /// Mast is about to stop/restart/rebuild this container. Taken *before*
+    /// the command, because a recreate removes the container and its log.
+    Teardown { verb: String },
+    /// Observed to have exited without Mast asking. `status` is `None` when
+    /// the daemon did not report a code.
+    Exited { status: Option<i32> },
+    /// Observed to have gone unhealthy.
+    Unhealthy,
+    /// A workspace start gave up waiting for this service to become ready.
+    ReadyTimeout,
+    /// The user asked for it from the service menu.
+    Manual,
+}
+
+/// One captured line. Carries Docker's own timestamp rather than an arrival
+/// order, because a capture is read after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCaptureLine {
+    /// Docker's RFC3339 stamp, verbatim; `None` if the line had none.
+    pub at: Option<String>,
+    pub message: String,
+    pub stderr: bool,
+}
+
+/// A container's last words. Persisted, therefore redacted at write time —
+/// unlike a live log stream, which is transient and is not (see `redact.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCapture {
+    /// Row id, ascending. Clients upsert by it.
+    pub id: u64,
+    pub at_unix_ms: u64,
+    pub project: ProjectId,
+    /// Denormalized so a capture stays readable after the project is removed.
+    pub project_name: String,
+    pub service: String,
+    pub container_id: String,
+    pub reason: CaptureReason,
+    /// How far back the read reached, in seconds.
+    pub window_secs: u32,
+    pub lines: Vec<LogCaptureLine>,
+    /// The window held more lines than the cap; the oldest were dropped.
+    pub truncated: bool,
+}
+
+// ---------- resource usage (M11) ----------
+//
+// What each container costs, sampled live. Like logs, history and captures
+// this gets its own channel rather than the patch stream: a sample every
+// couple of seconds would evict real state patches from the replay window
+// (ADR-0004 §3), and unlike state, a sample is worthless a minute later.
+//
+// Nothing here is persisted and nothing is redacted — these are numbers, and
+// they carry none of the developer's own content.
+
+/// One service's share of the machine, over one sampling interval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUsage {
+    pub project: ProjectId,
+    pub service: String,
+    /// Cores consumed over the interval: `1.0` is one saturated core. Cores
+    /// rather than a percentage because Docker's percentage is of *all* cores
+    /// — 800% is reachable on an 8-core box, so a 0–100 reading misleads.
+    pub cpu_cores: f64,
+    /// Working set: page cache excluded, as `docker stats` reports it. Raw
+    /// cgroup usage counts reclaimable cache and overstates badly.
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: u64,
+    /// Whether `memory_limit_bytes` is a real cgroup limit rather than just
+    /// host RAM. This is the difference between "using a third of this
+    /// machine" and "a third of the way to being OOM-killed".
+    pub memory_limited: bool,
+}
+
+/// One tick: every running service Mast knows about, measured together so the
+/// numbers can be summed and compared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSample {
+    pub at_unix_ms: u64,
+    /// Cores the host has, so a client can say "2.3 of 8" rather than "2.3".
+    pub host_cores: u32,
+    pub host_memory_bytes: u64,
+    pub services: Vec<ServiceUsage>,
+}
+
 /// One minimal typed state change. `seq` values are contiguous per engine;
 /// a gap observed by a client means it must resynchronize via snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -712,6 +817,10 @@ pub enum Action {
     RunProjectCommand { id: ProjectId, name: String },
     /// Trigger an immediate discovery + observation reconcile.
     RefreshNow,
+    /// Capture a service's recent output now, without stopping anything.
+    CaptureServiceLogs { id: ProjectId, service: String },
+    /// Delete every stored log capture.
+    ClearLogCaptures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1028,8 +1137,55 @@ mod tests {
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },
             Action::RefreshNow,
+            Action::CaptureServiceLogs { id: ProjectId("p1".into()), service: "queue".into() },
+            Action::ClearLogCaptures,
         ] {
             roundtrip(&action);
+        }
+        roundtrip(&UsageSample {
+            at_unix_ms: 1_700_000_000_000,
+            host_cores: 8,
+            host_memory_bytes: 16 * 1024 * 1024 * 1024,
+            services: vec![ServiceUsage {
+                project: ProjectId("p1".into()),
+                service: "mysql".into(),
+                cpu_cores: 1.8125,
+                memory_bytes: 240 * 1024 * 1024,
+                memory_limit_bytes: 512 * 1024 * 1024,
+                memory_limited: true,
+            }],
+        });
+        for reason in [
+            CaptureReason::Teardown { verb: "restart".into() },
+            CaptureReason::Exited { status: Some(137) },
+            CaptureReason::Exited { status: None },
+            CaptureReason::Unhealthy,
+            CaptureReason::ReadyTimeout,
+            CaptureReason::Manual,
+        ] {
+            roundtrip(&LogCapture {
+                id: 12,
+                at_unix_ms: 1_700_000_000_000,
+                project: ProjectId("p1".into()),
+                project_name: "acme".into(),
+                service: "queue".into(),
+                container_id: "abc123".into(),
+                reason,
+                window_secs: 60,
+                lines: vec![
+                    LogCaptureLine {
+                        at: Some("2026-08-12T14:22:03.123456789Z".into()),
+                        message: "Processing jobs".into(),
+                        stderr: false,
+                    },
+                    LogCaptureLine {
+                        at: None,
+                        message: "connection refused".into(),
+                        stderr: true,
+                    },
+                ],
+                truncated: true,
+            });
         }
         for kind in [
             OperationEventKind::Started,

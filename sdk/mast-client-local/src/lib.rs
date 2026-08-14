@@ -61,6 +61,21 @@ impl MastClient for LocalClient {
         Ok(self.engine.subscribe_history())
     }
 
+    async fn log_captures(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<mast_contract::LogCapture>, ClientError> {
+        self.engine.log_captures(limit).await.map_err(ClientError::from)
+    }
+
+    async fn subscribe_log_captures(&self) -> Result<mast_client::CaptureStream, ClientError> {
+        Ok(self.engine.subscribe_log_captures())
+    }
+
+    async fn subscribe_usage(&self) -> Result<mast_client::UsageStream, ClientError> {
+        Ok(self.engine.subscribe_usage())
+    }
+
     async fn network_attach_preview(
         &self,
         workspace: mast_contract::WorkspaceId,
@@ -196,6 +211,20 @@ mod tests {
             _tail: u32,
         ) -> Result<BoxStream<'static, mast_docker::LogChunk>, DockerError> {
             Ok(futures::stream::empty().boxed())
+        }
+        async fn container_log_tail(
+            &self,
+            _container_id: &str,
+            _since_unix: i64,
+            _max_lines: u32,
+        ) -> Result<Vec<mast_docker::CapturedLine>, DockerError> {
+            Ok(vec![])
+        }
+        async fn container_stats(
+            &self,
+            _container_id: &str,
+        ) -> Result<mast_docker::StatsSample, DockerError> {
+            Ok(mast_docker::StatsSample::default())
         }
     }
 

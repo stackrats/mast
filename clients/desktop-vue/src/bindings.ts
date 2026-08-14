@@ -185,6 +185,55 @@ async startHistoryStream(onEntry: TAURI_CHANNEL<HistoryEntry>) : Promise<Result<
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Stored log captures (M10), newest first: what each container was saying
+ * just before it went down. Read from disk, so this survives an app restart.
+ */
+async logCaptures(limit: number) : Promise<Result<LogCapture[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("log_captures", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Follow log captures. Append-only — the frontend prepends. Replaces any
+ * earlier subscription.
+ */
+async startCaptureStream(onCapture: TAURI_CHANNEL<LogCapture>) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_capture_stream", { onCapture }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Follow live CPU/memory usage (M11). **Calling this is what starts the
+ * engine sampling** — it makes no docker calls while nobody is subscribed, so
+ * the frontend stops the stream whenever the window is hidden. Replaces any
+ * earlier subscription.
+ */
+async startUsageStream(onSample: TAURI_CHANNEL<UsageSample>) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_usage_stream", { onSample }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop the usage subscription, which stops the engine sampling.
+ */
+async stopUsageStream() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_usage_stream") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -352,7 +401,43 @@ export type Action =
 /**
  * Trigger an immediate discovery + observation reconcile.
  */
-{ type: "refreshNow" }
+{ type: "refreshNow" } | 
+/**
+ * Capture a service's recent output now, without stopping anything.
+ */
+{ type: "captureServiceLogs"; id: ProjectId; service: string } | 
+/**
+ * Delete every stored log capture.
+ */
+{ type: "clearLogCaptures" }
+/**
+ * Why a capture was taken. The reason is the whole diagnostic frame: the same
+ * forty lines mean something different before a user-requested restart than
+ * they do after a container fell over on its own.
+ */
+export type CaptureReason = 
+/**
+ * Mast is about to stop/restart/rebuild this container. Taken *before*
+ * the command, because a recreate removes the container and its log.
+ */
+{ type: "teardown"; verb: string } | 
+/**
+ * Observed to have exited without Mast asking. `status` is `None` when
+ * the daemon did not report a code.
+ */
+{ type: "exited"; status: number | null } | 
+/**
+ * Observed to have gone unhealthy.
+ */
+{ type: "unhealthy" } | 
+/**
+ * A workspace start gave up waiting for this service to become ready.
+ */
+{ type: "readyTimeout" } | 
+/**
+ * The user asked for it from the service menu.
+ */
+{ type: "manual" }
 /**
  * One installable companion service (Redis, Mailpit, …). `installed` means
  * the project already runs this software (matched by service key OR image,
@@ -537,6 +622,36 @@ editor: string | null;
  */
 autoPortRemap?: boolean }
 /**
+ * A container's last words. Persisted, therefore redacted at write time —
+ * unlike a live log stream, which is transient and is not (see `redact.rs`).
+ */
+export type LogCapture = { 
+/**
+ * Row id, ascending. Clients upsert by it.
+ */
+id: number; atUnixMs: number; project: ProjectId; 
+/**
+ * Denormalized so a capture stays readable after the project is removed.
+ */
+projectName: string; service: string; containerId: string; reason: CaptureReason; 
+/**
+ * How far back the read reached, in seconds.
+ */
+windowSecs: number; lines: LogCaptureLine[]; 
+/**
+ * The window held more lines than the cap; the oldest were dropped.
+ */
+truncated: boolean }
+/**
+ * One captured line. Carries Docker's own timestamp rather than an arrival
+ * order, because a capture is read after the fact.
+ */
+export type LogCaptureLine = { 
+/**
+ * Docker's RFC3339 stamp, verbatim; `None` if the line had none.
+ */
+at: string | null; message: string; stderr: boolean }
+/**
  * One line of a container log stream (delivered over a dedicated channel,
  * never through the patch store — plan §3 transport split).
  */
@@ -650,6 +765,27 @@ export type ServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy"
  * observed as a container. `container_id == None` means declared-but-absent.
  */
 export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth }
+/**
+ * One service's share of the machine, over one sampling interval.
+ */
+export type ServiceUsage = { project: ProjectId; service: string; 
+/**
+ * Cores consumed over the interval: `1.0` is one saturated core. Cores
+ * rather than a percentage because Docker's percentage is of *all* cores
+ * — 800% is reachable on an 8-core box, so a 0–100 reading misleads.
+ */
+cpuCores: number; 
+/**
+ * Working set: page cache excluded, as `docker stats` reports it. Raw
+ * cgroup usage counts reclaimable cache and overstates badly.
+ */
+memoryBytes: number; memoryLimitBytes: number; 
+/**
+ * Whether `memory_limit_bytes` is a real cgroup limit rather than just
+ * host RAM. This is the difference between "using a third of this
+ * machine" and "a third of the way to being OOM-killed".
+ */
+memoryLimited: boolean }
 export type SnapshotDelta = { projectName: string; changes: string[] }
 export type SnapshotFileHash = { path: string; sha256: string }
 export type SnapshotMemberState = { project: ProjectId; projectName: string; gitBranch: string | null; gitCommit: string | null; gitDirty: boolean | null; 
@@ -672,6 +808,15 @@ deltas: SnapshotDelta[]; clean: boolean }
  * A lagged subscriber is told to resync — never silently dropped patches.
  */
 export type SubscriptionItem = { type: "patch"; patch: EnginePatch } | { type: "resyncRequired" }
+/**
+ * One tick: every running service Mast knows about, measured together so the
+ * numbers can be summed and compared.
+ */
+export type UsageSample = { atUnixMs: number; 
+/**
+ * Cores the host has, so a client can say "2.3 of 8" rather than "2.3".
+ */
+hostCores: number; hostMemoryBytes: number; services: ServiceUsage[] }
 export type WorkspaceId = string
 export type WorkspaceMember = { project: ProjectId; 
 /**
