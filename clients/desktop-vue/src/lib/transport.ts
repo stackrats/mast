@@ -1,6 +1,7 @@
 // The only file that touches Tauri APIs directly. Everything above it
 // (EngineSync, stores, components) is transport-agnostic.
 
+import { getVersion } from "@tauri-apps/api/app";
 import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -164,4 +165,10 @@ export async function startUsageStream(onSample: (sample: UsageSample) => void):
 /** Drop the usage subscription, which stops the engine sampling. */
 export async function stopUsageStream(): Promise<void> {
   unwrap(await commands.stopUsageStream());
+}
+
+/** The running app's version. Read from the bundle rather than baked into the
+ * frontend, so it can never drift from what was actually shipped. */
+export async function appVersion(): Promise<string> {
+  return getVersion();
 }

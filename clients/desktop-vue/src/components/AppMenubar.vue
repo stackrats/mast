@@ -19,6 +19,7 @@ const emit = defineEmits<{
   newWorkspace: [];
   openDiagnostics: [];
   newProject: [];
+  openAbout: [];
 }>();
 const store = useEngineStore();
 
@@ -72,6 +73,7 @@ async function closeToTray() {
             Diagnostics…
           </MenubarItem>
           <MenubarSeparator :class="menuSeparatorClass" />
+          <MenubarItem :class="itemClass" @select="emit('openAbout')">About Mast</MenubarItem>
           <MenubarItem :class="itemClass" @select="closeToTray">Close to tray</MenubarItem>
         </MenubarContent>
       </MenubarPortal>
