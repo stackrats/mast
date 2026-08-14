@@ -3,8 +3,14 @@
 //! resolution errors, or persistence. The redactor is rebuilt from `.env` on
 //! every reconcile, so newly added secrets are covered without restart.
 //!
-//! Container log streams are NOT redacted: they render the developer's own
-//! application output transiently and are never persisted by Mast.
+//! Live container log streams are NOT redacted: they render the developer's
+//! own application output transiently and are never persisted by Mast.
+//!
+//! Log **captures** are the exception to that exception (ADR-0005). A capture
+//! of the same output is written to `captures.db` and rendered with a copy
+//! button, so neither half of the exemption above survives — every captured
+//! line is redacted at write time, with the union redactor, exactly as history
+//! is. See `captures.rs`.
 
 use std::path::Path;
 

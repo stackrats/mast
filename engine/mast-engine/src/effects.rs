@@ -343,7 +343,14 @@ async fn reconcile(engine: &Engine) {
     }
 
     // ---- fold everything into state, emitting minimal patches ----
-    engine.with_state(|st, events| {
+    // The fold also notices services that died since the last pass. It runs
+    // under the state lock and so cannot await, so it only *decides*: the
+    // reads happen after, off the lock.
+    let capture_requests = engine.with_state(|st, events| {
+        let mut capture_requests: Vec<crate::captures::CaptureRequest> = Vec::new();
+        // A project Mast is currently operating on had its capture taken by
+        // the teardown itself, with the container still alive.
+        let busy = engine.inner.busy_projects.lock().unwrap().clone();
         let imported: Vec<PathBuf> =
             st.projects.values().map(|e| e.record.path.clone()).collect();
         let discovered: Vec<DiscoveredProject> = candidates
@@ -453,7 +460,18 @@ async fn reconcile(engine: &Engine) {
                             && observation_belongs_to(o, &project_dir)
                     })
                     .collect();
-                summary.services = build_services(entry.model.as_ref(), &matched);
+                let services = build_services(entry.model.as_ref(), &matched);
+                if !busy.contains(&id) {
+                    collect_deaths(
+                        &id,
+                        &summary.name,
+                        &entry.summary.services,
+                        &services,
+                        &matched,
+                        &mut capture_requests,
+                    );
+                }
+                summary.services = services;
                 summary.status = derive_status(&summary.services);
             }
 
@@ -469,7 +487,80 @@ async fn reconcile(engine: &Engine) {
                 workspaces: crate::workspace_summaries(st),
             });
         }
+        capture_requests
     });
+    // Off the lock: read each dead container's tail before anything removes
+    // it. Detached, because a reconcile must not wait on docker logs.
+    //
+    // Only the instance that owns mutation writes them. Observation converges
+    // across instances (plan §1), so a second Mast reconciles the same deaths
+    // and would file the same captures into the same shared database.
+    if !engine.read_only() {
+        engine.spawn_captures(capture_requests);
+    }
+}
+
+/// Diff one project's services across a reconcile and record which deaths are
+/// worth a post-mortem.
+///
+/// A changed container id means the container was replaced without Mast asking
+/// — its log went with it, so there is nothing to read and nothing to record.
+///
+/// A service with no previous observation is the interesting case rather than
+/// the boring one: it is what a container that died while Mast was closed
+/// looks like on the first reconcile after it opens. Treating "unseen" as
+/// "was alive" makes that a death like any other. It cannot spam, because the
+/// capture window bounds what can be read — a container that died last week
+/// yields no lines, and a capture with no lines is not recorded.
+fn collect_deaths(
+    project_id: &str,
+    project_name: &str,
+    previous: &[ServiceState],
+    current: &[ServiceState],
+    observed: &[&ContainerObservation],
+    out: &mut Vec<crate::captures::CaptureRequest>,
+) {
+    use mast_contract::{ContainerState, ServiceHealth};
+
+    for new in current {
+        let Some(container_id) = new.container_id.clone() else {
+            continue;
+        };
+        // Only a previous observation *of this same container* says anything
+        // about how it got here. A service declared by the model but not yet
+        // observed carries `container_id: None`, which is a first sighting,
+        // not a replacement — and a different id is a replacement, whose log
+        // is already gone.
+        let old = previous
+            .iter()
+            .find(|s| s.name == new.name)
+            .filter(|s| s.container_id.is_some());
+        if let Some(old) = old
+            && old.container_id.as_deref() != Some(container_id.as_str())
+        {
+            continue;
+        }
+        let exit_code = observed.iter().find(|o| o.id == container_id).and_then(|o| o.exit_code);
+        // Never seen alive: assume it was, so whatever state it is in now
+        // reads as the transition into it.
+        let was_running = old.map(|o| o.state == Some(ContainerState::Running)).unwrap_or(true);
+        let previous_health = old.map(|o| o.health).unwrap_or(ServiceHealth::Unknown);
+        if let Some(reason) = crate::captures::death_reason(
+            was_running,
+            new.state.as_ref(),
+            previous_health,
+            new.health,
+            exit_code,
+        ) {
+            out.push(crate::captures::CaptureRequest {
+                project: mast_contract::ProjectId(project_id.to_string()),
+                project_name: project_name.to_string(),
+                service: new.name.clone(),
+                container_id,
+                reason,
+            });
+        }
+    }
 }
 
 /// Branch + dirty via shell git (plan risk §4: gix stays display-only behind

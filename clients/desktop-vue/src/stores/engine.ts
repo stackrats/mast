@@ -8,6 +8,7 @@ import type {
   DockerStatus,
   HistoryEntry,
   IntegrationSettings,
+  LogCapture,
   LogLine,
   OperationId,
   ProjectId,
@@ -16,7 +17,13 @@ import type {
 } from "../bindings";
 import { EngineSync, type SyncPhase } from "../lib/engineSync";
 import { notify } from "../lib/notify";
-import { loadLogsOpen, recordWorkspaceStart, saveLogsOpen } from "../lib/prefs";
+import {
+  loadCapturesSeen,
+  loadLogsOpen,
+  recordWorkspaceStart,
+  saveCapturesSeen,
+  saveLogsOpen,
+} from "../lib/prefs";
 import { applyPatchEvent } from "../lib/projects";
 import { pushBounded } from "../lib/ring";
 import {
@@ -24,7 +31,9 @@ import {
   dispatchAction,
   envReport,
   historyRecent,
+  logCaptures,
   onPatchStreamItem,
+  startCaptureStream,
   startHistoryStream,
   streamServiceLogs,
   stopLogStream,
@@ -37,7 +46,9 @@ const ACTIVITY_CAP = 2000;
 /** Matches the engine's own ring, so the panel never shows more than the
  * engine still remembers. */
 const HISTORY_CAP = 300;
-
+/** Captures held in memory. The engine keeps more on disk; this is what the
+ * tab shows without asking for more, and each one carries up to 200 lines. */
+const CAPTURES_CAP = 50;
 /** One line in the global activity feed (the bottom logs panel). */
 export interface ActivityLine {
   n: number;
@@ -108,7 +119,12 @@ export const useEngineStore = defineStore("engine", {
     historyShowBackground: false,
     /** Entry id to scroll to and highlight — set when jumping from a failure. */
     historyFocus: null as number | null,
-    logsTab: "output" as "output" | "history",
+    /** Log captures, newest first — the logs panel's Captures tab. */
+    captures: [] as LogCapture[],
+    /** Highest capture id the user has actually looked at, so the tab can
+     * badge what arrived while they were elsewhere. */
+    capturesSeen: loadCapturesSeen(),
+    logsTab: "output" as "output" | "history" | "captures",
     logsOpen: loadLogsOpen(),
     logs: null as LogView | null,
     selection: { kind: "home" } as Selection,
@@ -140,6 +156,12 @@ export const useEngineStore = defineStore("engine", {
 
     backgroundHistoryCount(state): number {
       return state.history.filter((entry) => entry.origin === "background").length;
+    },
+
+    /** Captures the user has not looked at yet. A container dying is worth
+     * noticing even when the panel is closed, which is what the badge is for. */
+    unseenCaptureCount(state): number {
+      return state.captures.filter((capture) => capture.id > state.capturesSeen).length;
     },
   },
 
@@ -229,6 +251,7 @@ export const useEngineStore = defineStore("engine", {
         this.error = e instanceof Error ? e.message : String(e);
       }
       await this.connectHistory();
+      await this.connectCaptures();
     },
 
     /** History rides its own channel, not the patch stream — its volume would
@@ -258,6 +281,61 @@ export const useEngineStore = defineStore("engine", {
       if (this.history.length > HISTORY_CAP) {
         this.history.splice(0, this.history.length - HISTORY_CAP);
       }
+    },
+
+    /** Captures ride their own channel for the same reason history does.
+     * Subscribe before fetching the backlog so a capture taken during startup
+     * is not lost between the two calls. */
+    async connectCaptures() {
+      try {
+        await startCaptureStream((capture) => this.addCapture(capture));
+        for (const capture of await logCaptures(CAPTURES_CAP)) this.addCapture(capture);
+      } catch (e) {
+        // Same rule as history: a diagnostic aid must not break the app.
+        console.warn("log captures unavailable", e);
+      }
+    },
+
+    /** Newest first. Captures are append-only — the engine never revises one
+     * after writing it — but the backlog and the live stream can overlap, so
+     * this still guards against a duplicate id. */
+    addCapture(capture: LogCapture) {
+      if (this.captures.some((existing) => existing.id === capture.id)) return;
+      const before = this.captures.findIndex((existing) => existing.id < capture.id);
+      if (before >= 0) this.captures.splice(before, 0, capture);
+      else this.captures.push(capture);
+      if (this.captures.length > CAPTURES_CAP) {
+        this.captures.splice(CAPTURES_CAP, this.captures.length - CAPTURES_CAP);
+      }
+    },
+
+    /** Mark everything currently listed as seen, clearing the tab badge. */
+    markCapturesSeen() {
+      const newest = this.captures[0]?.id ?? 0;
+      if (newest <= this.capturesSeen) return;
+      this.capturesSeen = newest;
+      saveCapturesSeen(newest);
+    },
+
+    /** Open the Captures tab — the path out of "my container vanished". */
+    showCaptures() {
+      this.setLogsOpen(true);
+      this.logsTab = "captures";
+      this.markCapturesSeen();
+    },
+
+    /** Capture a service's recent output now, without stopping anything, and
+     * show the result. */
+    async captureServiceLogs(project: ProjectId, service: string) {
+      await this.run({ type: "captureServiceLogs", id: project, service });
+      this.showCaptures();
+    },
+
+    /** Drop every stored capture. They are on disk, so this is a real delete
+     * rather than clearing a view. */
+    async clearCaptures() {
+      this.captures = [];
+      await this.run({ type: "clearLogCaptures" });
     },
 
     /** Open the History tab on the command behind an operation, preferring the

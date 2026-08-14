@@ -237,6 +237,15 @@ async fn handle_request(
             pump(tx.clone(), stream_id, engine.subscribe_history());
             ok(json!({}))
         }
+        "logCaptures" => {
+            let limit: u32 = param(&params, "limit")?;
+            ok(engine.log_captures(limit).await?)
+        }
+        "subscribeLogCaptures" => {
+            let stream_id: u64 = param(&params, "stream")?;
+            pump(tx.clone(), stream_id, engine.subscribe_log_captures());
+            ok(json!({}))
+        }
         "networkAttachPreview" => {
             let workspace: WorkspaceId = param(&params, "workspace")?;
             let project: ProjectId = param(&params, "project")?;

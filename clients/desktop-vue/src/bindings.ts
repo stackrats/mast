@@ -185,6 +185,30 @@ async startHistoryStream(onEntry: TAURI_CHANNEL<HistoryEntry>) : Promise<Result<
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Stored log captures (M10), newest first: what each container was saying
+ * just before it went down. Read from disk, so this survives an app restart.
+ */
+async logCaptures(limit: number) : Promise<Result<LogCapture[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("log_captures", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Follow log captures. Append-only — the frontend prepends. Replaces any
+ * earlier subscription.
+ */
+async startCaptureStream(onCapture: TAURI_CHANNEL<LogCapture>) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_capture_stream", { onCapture }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -352,7 +376,43 @@ export type Action =
 /**
  * Trigger an immediate discovery + observation reconcile.
  */
-{ type: "refreshNow" }
+{ type: "refreshNow" } | 
+/**
+ * Capture a service's recent output now, without stopping anything.
+ */
+{ type: "captureServiceLogs"; id: ProjectId; service: string } | 
+/**
+ * Delete every stored log capture.
+ */
+{ type: "clearLogCaptures" }
+/**
+ * Why a capture was taken. The reason is the whole diagnostic frame: the same
+ * forty lines mean something different before a user-requested restart than
+ * they do after a container fell over on its own.
+ */
+export type CaptureReason = 
+/**
+ * Mast is about to stop/restart/rebuild this container. Taken *before*
+ * the command, because a recreate removes the container and its log.
+ */
+{ type: "teardown"; verb: string } | 
+/**
+ * Observed to have exited without Mast asking. `status` is `None` when
+ * the daemon did not report a code.
+ */
+{ type: "exited"; status: number | null } | 
+/**
+ * Observed to have gone unhealthy.
+ */
+{ type: "unhealthy" } | 
+/**
+ * A workspace start gave up waiting for this service to become ready.
+ */
+{ type: "readyTimeout" } | 
+/**
+ * The user asked for it from the service menu.
+ */
+{ type: "manual" }
 /**
  * One installable companion service (Redis, Mailpit, …). `installed` means
  * the project already runs this software (matched by service key OR image,
@@ -536,6 +596,36 @@ editor: string | null;
  * holds it, instead of letting `up` fail on the bind. Defaults on.
  */
 autoPortRemap?: boolean }
+/**
+ * A container's last words. Persisted, therefore redacted at write time —
+ * unlike a live log stream, which is transient and is not (see `redact.rs`).
+ */
+export type LogCapture = { 
+/**
+ * Row id, ascending. Clients upsert by it.
+ */
+id: number; atUnixMs: number; project: ProjectId; 
+/**
+ * Denormalized so a capture stays readable after the project is removed.
+ */
+projectName: string; service: string; containerId: string; reason: CaptureReason; 
+/**
+ * How far back the read reached, in seconds.
+ */
+windowSecs: number; lines: LogCaptureLine[]; 
+/**
+ * The window held more lines than the cap; the oldest were dropped.
+ */
+truncated: boolean }
+/**
+ * One captured line. Carries Docker's own timestamp rather than an arrival
+ * order, because a capture is read after the fact.
+ */
+export type LogCaptureLine = { 
+/**
+ * Docker's RFC3339 stamp, verbatim; `None` if the line had none.
+ */
+at: string | null; message: string; stderr: boolean }
 /**
  * One line of a container log stream (delivered over a dedicated channel,
  * never through the patch store — plan §3 transport split).

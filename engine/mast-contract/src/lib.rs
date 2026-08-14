@@ -592,6 +592,69 @@ pub struct HistoryEntry {
     pub output: Vec<String>,
 }
 
+// ---------- log captures (M10) ----------
+//
+// Live log streams are bound to one container id and end when that container
+// goes away, taking the output that explains the failure with them. A capture
+// is the post-mortem: the tail of a container's output, read at the moment it
+// went down and written to disk so it survives both the recreate and the app.
+//
+// Like history (ADR-0004 §3) captures get their own channel rather than the
+// patch stream — they are events with a body, not state, and a client that
+// resynchronizes must not silently lose one.
+
+/// Why a capture was taken. The reason is the whole diagnostic frame: the same
+/// forty lines mean something different before a user-requested restart than
+/// they do after a container fell over on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum CaptureReason {
+    /// Mast is about to stop/restart/rebuild this container. Taken *before*
+    /// the command, because a recreate removes the container and its log.
+    Teardown { verb: String },
+    /// Observed to have exited without Mast asking. `status` is `None` when
+    /// the daemon did not report a code.
+    Exited { status: Option<i32> },
+    /// Observed to have gone unhealthy.
+    Unhealthy,
+    /// A workspace start gave up waiting for this service to become ready.
+    ReadyTimeout,
+    /// The user asked for it from the service menu.
+    Manual,
+}
+
+/// One captured line. Carries Docker's own timestamp rather than an arrival
+/// order, because a capture is read after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCaptureLine {
+    /// Docker's RFC3339 stamp, verbatim; `None` if the line had none.
+    pub at: Option<String>,
+    pub message: String,
+    pub stderr: bool,
+}
+
+/// A container's last words. Persisted, therefore redacted at write time —
+/// unlike a live log stream, which is transient and is not (see `redact.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCapture {
+    /// Row id, ascending. Clients upsert by it.
+    pub id: u64,
+    pub at_unix_ms: u64,
+    pub project: ProjectId,
+    /// Denormalized so a capture stays readable after the project is removed.
+    pub project_name: String,
+    pub service: String,
+    pub container_id: String,
+    pub reason: CaptureReason,
+    /// How far back the read reached, in seconds.
+    pub window_secs: u32,
+    pub lines: Vec<LogCaptureLine>,
+    /// The window held more lines than the cap; the oldest were dropped.
+    pub truncated: bool,
+}
+
 /// One minimal typed state change. `seq` values are contiguous per engine;
 /// a gap observed by a client means it must resynchronize via snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -712,6 +775,10 @@ pub enum Action {
     RunProjectCommand { id: ProjectId, name: String },
     /// Trigger an immediate discovery + observation reconcile.
     RefreshNow,
+    /// Capture a service's recent output now, without stopping anything.
+    CaptureServiceLogs { id: ProjectId, service: String },
+    /// Delete every stored log capture.
+    ClearLogCaptures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1028,8 +1095,42 @@ mod tests {
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },
             Action::RefreshNow,
+            Action::CaptureServiceLogs { id: ProjectId("p1".into()), service: "queue".into() },
+            Action::ClearLogCaptures,
         ] {
             roundtrip(&action);
+        }
+        for reason in [
+            CaptureReason::Teardown { verb: "restart".into() },
+            CaptureReason::Exited { status: Some(137) },
+            CaptureReason::Exited { status: None },
+            CaptureReason::Unhealthy,
+            CaptureReason::ReadyTimeout,
+            CaptureReason::Manual,
+        ] {
+            roundtrip(&LogCapture {
+                id: 12,
+                at_unix_ms: 1_700_000_000_000,
+                project: ProjectId("p1".into()),
+                project_name: "acme".into(),
+                service: "queue".into(),
+                container_id: "abc123".into(),
+                reason,
+                window_secs: 60,
+                lines: vec![
+                    LogCaptureLine {
+                        at: Some("2026-08-12T14:22:03.123456789Z".into()),
+                        message: "Processing jobs".into(),
+                        stderr: false,
+                    },
+                    LogCaptureLine {
+                        at: None,
+                        message: "connection refused".into(),
+                        stderr: true,
+                    },
+                ],
+                truncated: true,
+            });
         }
         for kind in [
             OperationEventKind::Started,

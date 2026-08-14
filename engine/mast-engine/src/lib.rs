@@ -4,6 +4,7 @@
 //! The snapshot/subscribe protocol, replay buffer, lagged-subscriber policy,
 //! and cancellable-operation machinery carry over from M1 unchanged.
 
+pub mod captures;
 mod diagnostics;
 mod effects;
 mod history;
@@ -162,6 +163,12 @@ pub(crate) struct Inner {
     pub(crate) next_history: AtomicU64,
     /// Start instants for in-flight commands, keyed by history id.
     pub(crate) history_started: Mutex<HashMap<u64, std::time::Instant>>,
+    /// Live feed of log captures (M10). Like history this is deliberately not
+    /// state: a capture is an event with a body, and the database — not the
+    /// replay window — is its record.
+    pub(crate) captures_tx: broadcast::Sender<mast_contract::LogCapture>,
+    /// When each container was last captured, for repeat suppression.
+    pub(crate) captures_seen: Mutex<HashMap<String, u64>>,
     /// Context for an operation's commands, keyed by operation id. Set when
     /// the action is dispatched, consumed by the task that runs it.
     pub(crate) op_contexts: Mutex<HashMap<u64, history::CommandContext>>,
@@ -267,6 +274,7 @@ impl Engine {
             .collect();
         let (patches_tx, _) = broadcast::channel(config.patch_channel_capacity.max(1));
         let (history_tx, _) = broadcast::channel(256);
+        let (captures_tx, _) = broadcast::channel(64);
         let engine = Self {
             inner: Arc::new(Inner {
                 config,
@@ -297,6 +305,8 @@ impl Engine {
                 history_tx,
                 next_history: AtomicU64::new(0),
                 history_started: Mutex::new(HashMap::new()),
+                captures_tx,
+                captures_seen: Mutex::new(HashMap::new()),
                 op_contexts: Mutex::new(HashMap::new()),
                 command_observer: Mutex::new(None),
             }),
@@ -599,6 +609,28 @@ impl Engine {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
                     engine.hint();
+                    Ok(())
+                });
+            }
+            Action::CaptureServiceLogs { id: project_id, service } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let request = engine
+                        .capture_request(&project_id, &service, mast_contract::CaptureReason::Manual)
+                        .ok_or_else(|| ErrorInfo::NotFound {
+                            what: format!("no container for service {service}"),
+                        })?;
+                    // A manual capture is the one case where the user is
+                    // watching for the result, so bypass repeat suppression:
+                    // asking twice means they want a second look.
+                    engine.run_capture_forced(request).await;
+                    Ok(())
+                });
+            }
+            Action::ClearLogCaptures => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.clear_log_captures().await?;
                     Ok(())
                 });
             }
