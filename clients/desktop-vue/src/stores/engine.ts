@@ -13,6 +13,7 @@ import type {
   OperationId,
   ProjectId,
   ProjectSummary,
+  UsageSample,
   WorkspaceSummary,
 } from "../bindings";
 import { EngineSync, type SyncPhase } from "../lib/engineSync";
@@ -35,6 +36,8 @@ import {
   onPatchStreamItem,
   startCaptureStream,
   startHistoryStream,
+  startUsageStream,
+  stopUsageStream,
   streamServiceLogs,
   stopLogStream,
   tauriPatchTransport,
@@ -49,6 +52,10 @@ const HISTORY_CAP = 300;
 /** Captures held in memory. The engine keeps more on disk; this is what the
  * tab shows without asking for more, and each one carries up to 200 lines. */
 const CAPTURES_CAP = 50;
+/** Usage samples kept for the sparklines — 60 at the engine's 2s cadence is
+ * about two minutes, which is long enough to tell a spike from a climb. */
+const USAGE_CAP = 60;
+
 /** One line in the global activity feed (the bottom logs panel). */
 export interface ActivityLine {
   n: number;
@@ -124,7 +131,13 @@ export const useEngineStore = defineStore("engine", {
     /** Highest capture id the user has actually looked at, so the tab can
      * badge what arrived while they were elsewhere. */
     capturesSeen: loadCapturesSeen(),
-    logsTab: "output" as "output" | "history" | "captures",
+    /** Recent usage samples, oldest first. One ring: every readout in the UI
+     * derives from it, so there is no per-project bookkeeping to keep in sync. */
+    usage: [] as UsageSample[],
+    /** Whether the usage subscription is open. Tracked so the visibility
+     * handler is idempotent — it fires on every focus change. */
+    usageConnected: false,
+    logsTab: "output" as "output" | "history" | "captures" | "resources",
     logsOpen: loadLogsOpen(),
     logs: null as LogView | null,
     selection: { kind: "home" } as Selection,
@@ -162,6 +175,11 @@ export const useEngineStore = defineStore("engine", {
      * noticing even when the panel is closed, which is what the badge is for. */
     unseenCaptureCount(state): number {
       return state.captures.filter((capture) => capture.id > state.capturesSeen).length;
+    },
+
+    /** The newest sample, or null before the first one lands. */
+    latestUsage(state): UsageSample | null {
+      return state.usage.at(-1) ?? null;
     },
   },
 
@@ -252,6 +270,7 @@ export const useEngineStore = defineStore("engine", {
       }
       await this.connectHistory();
       await this.connectCaptures();
+      await this.connectUsage();
     },
 
     /** History rides its own channel, not the patch stream — its volume would
@@ -315,6 +334,41 @@ export const useEngineStore = defineStore("engine", {
       if (newest <= this.capturesSeen) return;
       this.capturesSeen = newest;
       saveCapturesSeen(newest);
+    },
+
+    /** Subscribing is what makes the engine sample — it does no work while
+     * nobody is listening — so this is called when the window becomes visible
+     * and `disconnectUsage` when it is hidden. Measuring the machine while
+     * nobody is looking at the answer is pure cost. */
+    async connectUsage() {
+      if (this.usageConnected) return;
+      this.usageConnected = true;
+      try {
+        await startUsageStream((sample) => {
+          pushBounded(this.usage, sample, USAGE_CAP);
+        });
+      } catch (e) {
+        this.usageConnected = false;
+        // Same rule as history and captures: a readout must not break the app.
+        console.warn("usage unavailable", e);
+      }
+    },
+
+    async disconnectUsage() {
+      if (!this.usageConnected) return;
+      this.usageConnected = false;
+      try {
+        await stopUsageStream();
+      } catch {
+        // Best-effort: the engine stops sampling when the receiver drops
+        // regardless of whether this call was acknowledged.
+      }
+    },
+
+    /** Open the Resources tab — the path out of "why is my fan on". */
+    showResources() {
+      this.setLogsOpen(true);
+      this.logsTab = "resources";
     },
 
     /** Open the Captures tab — the path out of "my container vanished". */

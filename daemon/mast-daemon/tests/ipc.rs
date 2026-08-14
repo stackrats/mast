@@ -110,6 +110,7 @@ async fn client_suite(client: &dyn MastClient, watch_dir: &str) {
     let _history: mast_client::HistoryStream = client.subscribe_history().await.unwrap();
     assert!(client.log_captures(10).await.unwrap().is_empty());
     let _captures: mast_client::CaptureStream = client.subscribe_log_captures().await.unwrap();
+    let _usage: mast_client::UsageStream = client.subscribe_usage().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

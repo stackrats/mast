@@ -17,6 +17,7 @@ import {
   type ProjectId,
   type Result,
   type SubscriptionItem,
+  type UsageSample,
 } from "../bindings";
 import type { PatchTransport } from "./engineSync";
 
@@ -149,4 +150,18 @@ export async function startCaptureStream(onCapture: (capture: LogCapture) => voi
   const channel = new Channel<LogCapture>();
   channel.onmessage = onCapture;
   unwrap(await commands.startCaptureStream(channel));
+}
+
+/** Follow live CPU/memory usage. Calling this is what makes the engine start
+ * sampling — it does no work while nobody is subscribed — so the caller is
+ * expected to stop the stream whenever the numbers are not being looked at. */
+export async function startUsageStream(onSample: (sample: UsageSample) => void): Promise<void> {
+  const channel = new Channel<UsageSample>();
+  channel.onmessage = onSample;
+  unwrap(await commands.startUsageStream(channel));
+}
+
+/** Drop the usage subscription, which stops the engine sampling. */
+export async function stopUsageStream(): Promise<void> {
+  unwrap(await commands.stopUsageStream());
 }

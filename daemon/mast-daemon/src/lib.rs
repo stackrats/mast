@@ -246,6 +246,11 @@ async fn handle_request(
             pump(tx.clone(), stream_id, engine.subscribe_log_captures());
             ok(json!({}))
         }
+        "subscribeUsage" => {
+            let stream_id: u64 = param(&params, "stream")?;
+            pump(tx.clone(), stream_id, engine.subscribe_usage());
+            ok(json!({}))
+        }
         "networkAttachPreview" => {
             let workspace: WorkspaceId = param(&params, "workspace")?;
             let project: ProjectId = param(&params, "project")?;

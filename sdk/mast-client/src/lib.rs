@@ -8,7 +8,8 @@ use futures::stream::BoxStream;
 use mast_contract::{
     Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
-    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, WorkspaceId, WorkspaceSnapshot,
+    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
+    WorkspaceSnapshot,
 };
 
 pub type PatchStream = BoxStream<'static, SubscriptionItem>;
@@ -16,6 +17,7 @@ pub type OperationStream = BoxStream<'static, OperationEvent>;
 pub type LogStream = BoxStream<'static, LogLine>;
 pub type HistoryStream = BoxStream<'static, HistoryEntry>;
 pub type CaptureStream = BoxStream<'static, LogCapture>;
+pub type UsageStream = BoxStream<'static, UsageSample>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -80,6 +82,12 @@ pub trait MastClient: Send + Sync {
     /// Live log captures. Append-only — a capture is never revised after it is
     /// written, so consumers only prepend.
     async fn subscribe_log_captures(&self) -> Result<CaptureStream, ClientError>;
+
+    /// Live CPU and memory per running service. **Subscribing is what starts
+    /// the engine sampling** — it makes no docker calls while nobody is
+    /// listening, so a client that stops caring should drop the stream.
+    /// There is no backlog method: a sample is worthless a minute later.
+    async fn subscribe_usage(&self) -> Result<UsageStream, ClientError>;
 
     /// Preview attaching a workspace member to the shared network (apply via
     /// `Action::AttachNetwork`).

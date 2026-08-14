@@ -10,6 +10,7 @@ pub mod observer;
 
 pub use adapter::{
     BollardAdapter, CapturedLine, ContainerObservation, LogChunk, RuntimeAdapter, RuntimeEvent,
+    StatsSample,
 };
 pub use command::{
     CommandError, CommandOutcome, CommandOutput, OutputLine, run_command, run_streaming,

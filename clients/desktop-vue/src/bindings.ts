@@ -209,6 +209,31 @@ async startCaptureStream(onCapture: TAURI_CHANNEL<LogCapture>) : Promise<Result<
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Follow live CPU/memory usage (M11). **Calling this is what starts the
+ * engine sampling** — it makes no docker calls while nobody is subscribed, so
+ * the frontend stops the stream whenever the window is hidden. Replaces any
+ * earlier subscription.
+ */
+async startUsageStream(onSample: TAURI_CHANNEL<UsageSample>) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_usage_stream", { onSample }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop the usage subscription, which stops the engine sampling.
+ */
+async stopUsageStream() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_usage_stream") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -740,6 +765,27 @@ export type ServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy"
  * observed as a container. `container_id == None` means declared-but-absent.
  */
 export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth }
+/**
+ * One service's share of the machine, over one sampling interval.
+ */
+export type ServiceUsage = { project: ProjectId; service: string; 
+/**
+ * Cores consumed over the interval: `1.0` is one saturated core. Cores
+ * rather than a percentage because Docker's percentage is of *all* cores
+ * — 800% is reachable on an 8-core box, so a 0–100 reading misleads.
+ */
+cpuCores: number; 
+/**
+ * Working set: page cache excluded, as `docker stats` reports it. Raw
+ * cgroup usage counts reclaimable cache and overstates badly.
+ */
+memoryBytes: number; memoryLimitBytes: number; 
+/**
+ * Whether `memory_limit_bytes` is a real cgroup limit rather than just
+ * host RAM. This is the difference between "using a third of this
+ * machine" and "a third of the way to being OOM-killed".
+ */
+memoryLimited: boolean }
 export type SnapshotDelta = { projectName: string; changes: string[] }
 export type SnapshotFileHash = { path: string; sha256: string }
 export type SnapshotMemberState = { project: ProjectId; projectName: string; gitBranch: string | null; gitCommit: string | null; gitDirty: boolean | null; 
@@ -762,6 +808,15 @@ deltas: SnapshotDelta[]; clean: boolean }
  * A lagged subscriber is told to resync — never silently dropped patches.
  */
 export type SubscriptionItem = { type: "patch"; patch: EnginePatch } | { type: "resyncRequired" }
+/**
+ * One tick: every running service Mast knows about, measured together so the
+ * numbers can be summed and compared.
+ */
+export type UsageSample = { atUnixMs: number; 
+/**
+ * Cores the host has, so a client can say "2.3 of 8" rather than "2.3".
+ */
+hostCores: number; hostMemoryBytes: number; services: ServiceUsage[] }
 export type WorkspaceId = string
 export type WorkspaceMember = { project: ProjectId; 
 /**

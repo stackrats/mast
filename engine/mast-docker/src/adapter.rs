@@ -63,6 +63,28 @@ pub struct CapturedLine {
     pub stderr: bool,
 }
 
+/// One raw stats reading for a container: counters as the daemon reports
+/// them, with no arithmetic applied.
+///
+/// CPU is cumulative-since-start, so a single reading says nothing on its own
+/// — usage is the *delta* between two readings over a known interval. Keeping
+/// the raw counters here rather than a computed percentage puts that
+/// subtraction where the previous reading lives, in the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatsSample {
+    /// Total CPU time consumed by the container since it started, in ns.
+    pub cpu_total_ns: u64,
+    /// Total CPU time available on the host over the same period, in ns.
+    pub system_cpu_ns: u64,
+    pub online_cpus: u32,
+    /// Includes page cache; subtract [`StatsSample::memory_cache`] for the
+    /// working set, which is what `docker stats` shows.
+    pub memory_usage: u64,
+    pub memory_cache: u64,
+    /// The cgroup limit — host RAM when the container has no limit of its own.
+    pub memory_limit: u64,
+}
+
 #[async_trait::async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn ping(&self) -> Result<(), DockerError>;
@@ -89,6 +111,12 @@ pub trait RuntimeAdapter: Send + Sync {
         since_unix: i64,
         max_lines: u32,
     ) -> Result<Vec<CapturedLine>, DockerError>;
+    /// One immediate stats reading. Uses Docker's `one-shot` mode, which
+    /// returns straight away instead of blocking ~1s while the daemon
+    /// collects two cycles to compute its own delta. The caller holds the
+    /// previous reading and takes the delta over its own interval, which is
+    /// both cheaper and steadier than the daemon's one-second window.
+    async fn container_stats(&self, container_id: &str) -> Result<StatsSample, DockerError>;
 }
 
 pub struct BollardAdapter {
@@ -283,6 +311,40 @@ impl RuntimeAdapter for BollardAdapter {
             lines.push(CapturedLine { at, message: message.to_string(), stderr });
         }
         Ok(lines)
+    }
+
+    async fn container_stats(&self, container_id: &str) -> Result<StatsSample, DockerError> {
+        let options = bollard::query_parameters::StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+        let response = self
+            .docker
+            .stats(container_id, Some(options))
+            .next()
+            .await
+            .ok_or_else(|| DockerError::Api("stats stream produced nothing".into()))?
+            .map_err(|e| DockerError::Api(e.to_string()))?;
+
+        let cpu = response.cpu_stats.unwrap_or_default();
+        let memory = response.memory_stats.unwrap_or_default();
+        let memory_stats = memory.stats.unwrap_or_default();
+        Ok(StatsSample {
+            cpu_total_ns: cpu.cpu_usage.and_then(|u| u.total_usage).unwrap_or(0),
+            system_cpu_ns: cpu.system_cpu_usage.unwrap_or(0),
+            online_cpus: cpu.online_cpus.unwrap_or(0),
+            memory_usage: memory.usage.unwrap_or(0),
+            // cgroups v2 calls it `inactive_file`, v1 `cache`. Both name the
+            // reclaimable page cache that `docker stats` subtracts before
+            // showing a number — without this a mysql container reads as
+            // gigabytes of "usage" that the kernel would hand back on demand.
+            memory_cache: memory_stats
+                .get("inactive_file")
+                .or_else(|| memory_stats.get("cache"))
+                .copied()
+                .unwrap_or(0),
+            memory_limit: memory.limit.unwrap_or(0),
+        })
     }
 }
 
