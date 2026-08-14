@@ -8,6 +8,7 @@ const SIDEBAR_KEY = "mast.sidebarWidth";
 const LOGS_HEIGHT_KEY = "mast.logsHeight";
 const LOGS_WRAP_KEY = "mast.logsWrap";
 const LOGS_OPEN_KEY = "mast.logsOpen";
+const CAPTURES_SEEN_KEY = "mast.capturesSeen";
 
 // Guarded like `media` below. The engine store reads a preference while its
 // state is being built, and the store's unit tests run without a DOM — with no
@@ -128,4 +129,16 @@ export function loadLogsOpen(): boolean {
 
 export function saveLogsOpen(open: boolean): void {
   local?.setItem(LOGS_OPEN_KEY, String(open));
+}
+
+/** Highest log-capture id the user has looked at. Persisted because captures
+ * outlive the process: without it, every restart would re-badge captures the
+ * user already read. */
+export function loadCapturesSeen(): number {
+  const raw = Number(local?.getItem(CAPTURES_SEEN_KEY));
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+export function saveCapturesSeen(id: number): void {
+  local?.setItem(CAPTURES_SEEN_KEY, String(id));
 }

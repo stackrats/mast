@@ -9,8 +9,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use mast_compose::ComposeInvocation;
 use mast_contract::{
-    EnvEntryView, EnvFinding, EnvReport, ErrorInfo, FindingSeverity, LogLine, OperationEventKind,
-    OperationId, PatchEvent, ProjectId, ProjectStatus,
+    CaptureReason, EnvEntryView, EnvFinding, EnvReport, ErrorInfo, FindingSeverity, LogLine,
+    OperationEventKind, OperationId, PatchEvent, ProjectId, ProjectStatus,
 };
 use tokio::sync::mpsc;
 
@@ -648,6 +648,24 @@ impl Engine {
                     }
                 });
                 engine.preflight_ports(&handle, id, &project, "").await;
+            }
+
+            // Capture before the command, not after: `restart` reuses the
+            // container but `rebuild` recreates it, and a removed container
+            // takes its log with it. `Up` is excluded — there is nothing to
+            // post-mortem about a container that is about to start.
+            if matches!(verb, LifecycleVerb::Stop | LifecycleVerb::Restart | LifecycleVerb::Rebuild)
+            {
+                let reason = CaptureReason::Teardown { verb: verb.label().to_string() };
+                let requests = match &service {
+                    Some(service) => {
+                        engine.capture_request(&project, service, reason).into_iter().collect()
+                    }
+                    None => engine.capture_requests_for_project(&project, reason),
+                };
+                for request in requests {
+                    engine.run_capture(request).await;
+                }
             }
 
             let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);

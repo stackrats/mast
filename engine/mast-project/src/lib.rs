@@ -370,6 +370,14 @@ impl MetadataStore {
         self.dir.join("diagnostics.db")
     }
 
+    /// Where captured container output lives (rusqlite, owned by
+    /// `mast-engine::captures`). Separate from the diagnostics db: captures
+    /// hold the developer's own application output and have their own
+    /// retention, so they are worth being able to delete on their own.
+    pub fn captures_db_path(&self) -> PathBuf {
+        self.dir.join("captures.db")
+    }
+
     pub fn backups_dir(&self) -> PathBuf {
         self.dir.join("backups")
     }

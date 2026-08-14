@@ -101,6 +101,16 @@ async fn client_suite(client: &dyn MastClient, watch_dir: &str) {
             break;
         }
     }
+
+    // The side channels: a request/response and a subscription each. There is
+    // no docker here, so the interesting assertion is that both round-trip at
+    // all — a mistyped method name on the wire compiles perfectly and fails
+    // only here.
+    assert!(client.history_recent().await.unwrap().iter().all(|e| e.id > 0));
+    let _history: mast_client::HistoryStream = client.subscribe_history().await.unwrap();
+    assert!(client.log_captures(10).await.unwrap().is_empty());
+    let _captures: mast_client::CaptureStream = client.subscribe_log_captures().await.unwrap();
+    let _usage: mast_client::UsageStream = client.subscribe_usage().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
