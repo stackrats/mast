@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 
 import type { WorkspaceSummary } from "./bindings";
+import AboutDialog from "./components/AboutDialog.vue";
 import AppMenubar from "./components/AppMenubar.vue";
 import DiagnosticsDialog from "./components/DiagnosticsDialog.vue";
 import LogsDialog from "./components/LogsDialog.vue";
@@ -26,6 +27,7 @@ const store = useEngineStore();
 const settingsOpen = ref(false);
 const diagnosticsOpen = ref(false);
 const newProjectOpen = ref(false);
+const aboutOpen = ref(false);
 const workspaceDialogOpen = ref(false);
 const editingWorkspace = ref<WorkspaceSummary | null>(null);
 
@@ -81,6 +83,7 @@ function editWorkspace(ws: WorkspaceSummary) {
         @new-workspace="newWorkspace"
         @open-diagnostics="diagnosticsOpen = true"
         @new-project="newProjectOpen = true"
+        @open-about="aboutOpen = true"
       />
 
       <div class="flex min-h-0 flex-1">
@@ -131,6 +134,7 @@ function editWorkspace(ws: WorkspaceSummary) {
       <DiagnosticsDialog v-model:open="diagnosticsOpen" />
       <NewProjectDialog v-model:open="newProjectOpen" />
       <WorkspaceDialog v-model:open="workspaceDialogOpen" :editing="editingWorkspace" />
+      <AboutDialog v-model:open="aboutOpen" />
       <LogsDialog />
     </div>
   </TooltipProvider>

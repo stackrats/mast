@@ -34,6 +34,7 @@ vi.mock("../lib/transport", () => ({
   startHistoryStream: vi.fn(async () => {}),
   logCaptures: vi.fn(async () => []),
   startCaptureStream: vi.fn(async () => {}),
+  appVersion: vi.fn(async () => "0.2.0"),
   startUsageStream: vi.fn(async () => {}),
   stopUsageStream: vi.fn(async () => {}),
 }));
