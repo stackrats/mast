@@ -127,7 +127,7 @@ Mast automatically discovers Laravel Sail and Docker Compose projects from the d
 
 Every project shows its services, application processes, saved commands, and live container state.
 
-<img src="docs/media/project.png" alt="Project pane showing service, process, and command chips for a running Sail project" width="900">
+<img src="docs/media/project.png" alt="Project pane showing live CPU and memory alongside service, process, and command chips for a running Sail project" width="900">
 
 ### Project & service controls
 
@@ -179,6 +179,8 @@ Captures are written to disk, so they survive both the container being replaced 
 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
 
+<img src="docs/media/captures.png" alt="Captures tab listing three containers that went down, the newest expanded to show its final log lines" width="900">
+
 ---
 
 ## Resource usage
@@ -194,6 +196,8 @@ Where a container has a memory limit, Mast shows how close it is to it, which is
 The Resources tab ranks every running service across every project, so the answer to "what do I stop" is the top row. Sort by service, CPU, or memory by clicking a column.
 
 Short histories are kept alongside each reading, because one CPU number cannot tell a momentary spike apart from a steady climb.
+
+<img src="docs/media/resources.png" alt="Resources tab ranking every running service by CPU, busiest first, with memory and a stop control per row" width="900">
 
 Sampling only runs while the Mast window is visible. Measuring the machine costs CPU, and a minimised Mast should not be part of the problem it reports on.
 

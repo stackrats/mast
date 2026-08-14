@@ -682,7 +682,7 @@ watch(
                         : 'text-slate-400'
                     "
                   >
-                    {{ formatPercent(memoryShare(usage)) }}
+                    {{ usage.memoryLimited ? formatPercent(memoryShare(usage)) : "" }}
                   </span>
                 </div>
               </Tooltip>

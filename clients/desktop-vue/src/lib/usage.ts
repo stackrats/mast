@@ -72,7 +72,7 @@ export function formatBytes(bytes: number): string {
  * `0.01`, not `0.0`, and a busy one is `2.3`, not `2.31667`.
  */
 export function formatCores(cores: number): string {
-  if (!Number.isFinite(cores) || cores <= 0) return "0";
+  if (!Number.isFinite(cores) || cores <= 0) return "0.00";
   if (cores < 0.1) return cores.toFixed(2);
   return cores.toFixed(1);
 }

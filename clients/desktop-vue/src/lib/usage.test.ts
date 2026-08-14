@@ -63,7 +63,8 @@ describe("formatCores", () => {
     // An idle container is not zero, and saying so would be a lie.
     expect(formatCores(0.04)).toBe("0.04");
     expect(formatCores(2.31667)).toBe("2.3");
-    expect(formatCores(0)).toBe("0");
+    // Constant width down a column: "0" beside "0.06" reads as ragged.
+    expect(formatCores(0)).toBe("0.00");
   });
 });
 

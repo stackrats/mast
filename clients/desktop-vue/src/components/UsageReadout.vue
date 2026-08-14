@@ -55,9 +55,12 @@ const idle = computed(() => latest.value === null || latest.value.services.lengt
         <span class="flex items-center gap-1.5">
           <span class="tabular-nums">{{ formatCores(total.cpuCores) }}</span>
           <span class="text-slate-400">/ {{ hostCores }} cores</span>
-          <!-- Scaled to the machine, not to the window: a self-scaling strip
-             would make an idle container look as busy as a saturated one. -->
-          <Sparkline :values="cpuHistory" :max="hostCores || undefined" />
+          <!-- Floored rather than pinned to the host's core count. A dev
+             machine idles at a fraction of a core, and against a 14-core
+             ceiling that draws a flat dotted rule with no shape in it. The
+             cores figure beside it carries the absolute scale; the strip is
+             here to show movement. -->
+          <Sparkline :values="cpuHistory" :floor="1" />
         </span>
         <span class="flex items-center gap-1.5">
           <span class="tabular-nums">{{ formatBytes(total.memoryBytes) }}</span>
