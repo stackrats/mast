@@ -54,6 +54,14 @@ async envReport(project: ProjectId) : Promise<Result<EnvReport, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async laravelLog(project: ProjectId) : Promise<Result<LaravelLogReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("laravel_log", { project }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async networkAttachPreview(workspace: WorkspaceId, project: ProjectId) : Promise<Result<FileEditPreview, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("network_attach_preview", { workspace, project }) };
@@ -658,6 +666,39 @@ editor: string | null;
  * holds it, instead of letting `up` fail on the bind. Defaults on.
  */
 autoPortRemap?: boolean }
+/**
+ * One grouped entry from `storage/logs/laravel.log`: the Monolog header
+ * split into fields, with the stack trace (when one follows) kept attached
+ * instead of scattered across raw lines.
+ */
+export type LaravelLogEntry = { timestamp: string; environment: string; 
+/**
+ * Monolog level, uppercase (`ERROR`, `WARNING`, …).
+ */
+level: string; message: string; 
+/**
+ * Continuation lines — stack trace, previous exceptions — when any.
+ */
+detail: string | null }
+/**
+ * The tail of the application log, parsed. On demand only, like
+ * [`EnvReport`]: log bodies routinely carry user data.
+ */
+export type LaravelLogReport = { 
+/**
+ * False when `storage/logs/laravel.log` does not exist (fresh app, or
+ * LOG_CHANNEL points elsewhere).
+ */
+exists: boolean; 
+/**
+ * Newest first.
+ */
+entries: LaravelLogEntry[]; 
+/**
+ * True when the file outgrew the read window and older entries were
+ * left behind.
+ */
+truncated: boolean }
 /**
  * A container's last words. Persisted, therefore redacted at write time —
  * unlike a live log stream, which is transient and is not (see `redact.rs`).

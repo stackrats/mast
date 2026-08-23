@@ -212,6 +212,13 @@ impl MastClient for IpcClient {
         self.call("envReport", json!({"project": project})).await
     }
 
+    async fn laravel_log(
+        &self,
+        project: ProjectId,
+    ) -> Result<mast_contract::LaravelLogReport, ClientError> {
+        self.call("laravelLog", json!({"project": project})).await
+    }
+
     async fn history_recent(&self) -> Result<Vec<mast_contract::HistoryEntry>, ClientError> {
         self.call("historyRecent", json!({})).await
     }

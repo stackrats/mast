@@ -36,11 +36,11 @@ import {
   DropdownMenuTrigger,
 } from "reka-ui";
 
-import type { ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
+import type { LaravelLogReport, ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
-import { envReport } from "../lib/transport";
+import { envReport, laravelLog } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -220,6 +220,60 @@ function setDomain(domain: string | null) {
     domain ? `Enable https://${domain}` : "Disable local domain",
     { type: "setLocalDomain", id: project.id, domain },
   );
+}
+
+// --- laravel.log viewer: the app's own log, parsed — an error and its
+// stack trace read as one entry, not two hundred raw lines ---
+const appLogOpen = ref(false);
+const appLog = ref<LaravelLogReport | null>(null);
+const appLogError = ref<string | null>(null);
+const appLogFilter = ref<"all" | "warnings" | "errors">("all");
+const appLogFilters = [
+  { id: "all", label: "All" },
+  { id: "warnings", label: "Warnings+" },
+  { id: "errors", label: "Errors" },
+] as const;
+const appLogExpanded = ref<Set<number>>(new Set());
+async function loadAppLog() {
+  appLogError.value = null;
+  try {
+    appLog.value = await laravelLog(project.id);
+  } catch (e) {
+    appLog.value = null;
+    appLogError.value = String(e);
+  }
+}
+watch(appLogOpen, (open) => {
+  if (!open) return;
+  appLog.value = null;
+  appLogExpanded.value = new Set();
+  void loadAppLog();
+});
+const ERROR_LEVELS = ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"];
+const appLogEntries = computed(() => {
+  const entries = appLog.value?.entries ?? [];
+  if (appLogFilter.value === "errors") {
+    return entries.filter((e) => ERROR_LEVELS.includes(e.level));
+  }
+  if (appLogFilter.value === "warnings") {
+    return entries.filter((e) => ERROR_LEVELS.includes(e.level) || e.level === "WARNING");
+  }
+  return entries;
+});
+function levelBadge(level: string): string {
+  if (ERROR_LEVELS.includes(level)) {
+    return "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300";
+  }
+  if (level === "WARNING" || level === "NOTICE") {
+    return "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300";
+  }
+  return "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300";
+}
+function toggleAppLogRow(i: number) {
+  const next = new Set(appLogExpanded.value);
+  if (next.has(i)) next.delete(i);
+  else next.add(i);
+  appLogExpanded.value = next;
 }
 
 // --- DB connection card: host/port from the resolved model, credentials
@@ -513,6 +567,13 @@ async function addCommand() {
         <Button variant="ghost" size="sm" @click="httpsOpen = true">
           <Lock class="h-3.5 w-3.5" /> HTTPS
           <span v-if="project.localDomain" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        </Button>
+      </Tooltip>
+      <Tooltip
+        text="storage/logs/laravel.log, parsed — each error with its stack trace as one entry."
+      >
+        <Button variant="ghost" size="sm" @click="appLogOpen = true">
+          <ScrollText class="h-3.5 w-3.5" /> App log
         </Button>
       </Tooltip>
     </div>
@@ -1025,6 +1086,89 @@ async function addCommand() {
           :project="f.project"
           @applied="store.dismissOperation(shareKey(project.id))"
         />
+      </div>
+    </Modal>
+
+    <!-- The application's own log, container logs' missing half: parsed
+         Monolog entries with levels and grouped stack traces, filterable,
+         newest first — instead of scrolling raw laravel.log in an editor. -->
+    <Modal v-model:open="appLogOpen" title="Application log" wide>
+      <div class="space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <Button
+            v-for="f in appLogFilters"
+            :key="f.id"
+            :variant="appLogFilter === f.id ? undefined : 'outline'"
+            size="sm"
+            @click="appLogFilter = f.id"
+          >
+            {{ f.label }}
+          </Button>
+          <div class="ml-auto">
+            <Button variant="outline" size="sm" @click="loadAppLog">
+              <RotateCw class="h-3.5 w-3.5" /> Refresh
+            </Button>
+          </div>
+        </div>
+        <p v-if="appLogError" class="text-xs text-red-700 dark:text-red-300">
+          Could not read the log: {{ appLogError }}
+        </p>
+        <p v-else-if="appLog == null" class="text-sm text-slate-500 dark:text-slate-400">
+          Reading storage/logs/laravel.log…
+        </p>
+        <p v-else-if="!appLog.exists" class="text-sm text-slate-500 dark:text-slate-400">
+          No <span class="font-mono">storage/logs/laravel.log</span> — the app has not logged
+          anything yet, or <span class="font-mono">LOG_CHANNEL</span> sends logs elsewhere (stderr
+          output shows under the service chip's Logs).
+        </p>
+        <p
+          v-else-if="appLogEntries.length === 0"
+          class="text-sm text-slate-500 dark:text-slate-400"
+        >
+          No entries match this filter.
+        </p>
+        <div v-else class="max-h-[55vh] space-y-1 overflow-y-auto">
+          <div
+            v-for="(entry, i) in appLogEntries"
+            :key="i"
+            class="rounded-md border border-slate-200 dark:border-slate-800"
+          >
+            <button
+              class="flex w-full items-baseline gap-2 px-2 py-1.5 text-left"
+              :class="
+                entry.detail
+                  ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50'
+                  : 'cursor-default'
+              "
+              @click="entry.detail && toggleAppLogRow(i)"
+            >
+              <span
+                class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                :class="levelBadge(entry.level)"
+              >
+                {{ entry.level }}
+              </span>
+              <span class="shrink-0 font-mono text-[11px] text-slate-400">
+                {{ entry.timestamp }}
+              </span>
+              <span class="min-w-0 flex-1 truncate text-xs text-slate-700 dark:text-slate-200">
+                {{ entry.message }}
+              </span>
+              <ChevronDown
+                v-if="entry.detail"
+                class="h-3 w-3 shrink-0 self-center text-slate-400 transition-transform"
+                :class="appLogExpanded.has(i) ? 'rotate-180' : ''"
+              />
+            </button>
+            <pre
+              v-if="entry.detail && appLogExpanded.has(i)"
+              class="overflow-x-auto border-t border-slate-200 bg-slate-50 p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-slate-600 dark:border-slate-800 dark:bg-neutral-900 dark:text-slate-300"
+              >{{ `${entry.message}\n\n${entry.detail}` }}</pre>
+          </div>
+        </div>
+        <p v-if="appLog?.truncated" class="text-xs text-slate-400">
+          Showing the newest entries — the file is longer than the read window.
+        </p>
       </div>
     </Modal>
 
