@@ -438,6 +438,7 @@ mod tests {
             git_dirty: None,
             app_url: None,
             php: None,
+            share_url: None,
         }
     }
 

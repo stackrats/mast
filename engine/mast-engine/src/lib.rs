@@ -17,6 +17,7 @@ mod ops;
 mod php;
 mod ports;
 mod project_ops;
+mod share;
 mod snapshot_ops;
 mod workspace_ops;
 mod redact;
@@ -228,6 +229,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         git_dirty: None,
         app_url: None,
         php: None,
+        share_url: None,
     }
 }
 
@@ -513,6 +515,9 @@ impl Engine {
             }
             Action::SetPhpVersion { id, service, series } => {
                 return self.dispatch_php_switch(id.clone(), service.clone(), series.clone());
+            }
+            Action::ShareProject { id } => {
+                return self.dispatch_share(id.clone());
             }
             _ => {}
         }
@@ -1079,7 +1084,8 @@ impl Engine {
             | Action::StopService { .. }
             | Action::RestartService { .. }
             | Action::RebuildService { .. }
-            | Action::SetPhpVersion { .. } => unreachable!("handled above"),
+            | Action::SetPhpVersion { .. }
+            | Action::ShareProject { .. } => unreachable!("handled above"),
         }
         Ok(id)
     }

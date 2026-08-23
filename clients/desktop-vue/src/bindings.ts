@@ -381,6 +381,14 @@ export type Action =
  */
 { type: "setPhpVersion"; id: ProjectId; service: string; series: string } | 
 /**
+ * Publish the running app through Sail's expose tunnel (`sail share`,
+ * same image, flags and `.env` knobs). Long-running: the operation
+ * stays live while the tunnel is up, cancelling it stops the share.
+ * The public URL lands on [`ProjectSummary::share_url`] once the
+ * tunnel reports it.
+ */
+{ type: "shareProject"; id: ProjectId } | 
+/**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
  * sail:install --php=…` — each run in the official composer image inside
@@ -756,6 +764,11 @@ appUrl?: string | null;
  * builds from a Sail runtime shape.
  */
 php?: PhpVersionInfo | null; 
+/**
+ * Public URL of the live share tunnel ([`Action::ShareProject`]);
+ * None while not sharing.
+ */
+shareUrl?: string | null; 
 /**
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …

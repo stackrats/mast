@@ -16,7 +16,7 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
-    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -271,6 +271,13 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             None
         },
         drifted_services: Vec::new(),
+        vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
+            .ok()
+            .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
+            .map(|hot| mast_diagnostics::ViteHotFacts {
+                dev_server_listening: dev_server_listening(&hot),
+                url: hot.url,
+            }),
     };
     (facts, db_target)
 }
@@ -354,6 +361,24 @@ async fn config_hashes(
                 Some((cols.next()?.to_string(), cols.next()?.to_string()))
             })
             .collect(),
+    )
+}
+
+/// Does anything answer at the hot file's address? `None` when the host is
+/// not loopback — a remote dev server is not ours to judge from here.
+pub(crate) fn dev_server_listening(hot: &mast_laravel::vite::HotFile) -> Option<bool> {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    if !hot.loopback {
+        return None;
+    }
+    let host = hot.host.trim_start_matches('[').trim_end_matches(']');
+    // Wildcard binds answer on the loopback address.
+    let host = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
+    let addrs: Vec<SocketAddr> = (host, hot.port).to_socket_addrs().ok()?.collect();
+    Some(
+        addrs
+            .iter()
+            .any(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(250)).is_ok()),
     )
 }
 
@@ -926,6 +951,31 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_REMOVE_HOT => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let hot_path = path.join("public/hot");
+                    let hot = std::fs::read_to_string(&hot_path)
+                        .ok()
+                        .and_then(|c| mast_laravel::vite::parse_hot_file(&c));
+                    let no_op = !hot_path.exists();
+                    let summary = match &hot {
+                        _ if no_op => vec!["public/hot is already gone — nothing to do".into()],
+                        Some(hot) if dev_server_listening(hot) == Some(true) => vec![
+                            format!("a dev server IS listening at {} — applying will refuse", hot.url),
+                            "stop the dev server first, or leave the file alone".into(),
+                        ],
+                        Some(hot) => vec![
+                            format!("delete public/hot (points at {})", hot.url),
+                            "Blade serves built assets again immediately".into(),
+                        ],
+                        None => vec!["delete public/hot".into()],
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_CONFIG_CLEAR => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -1225,6 +1275,48 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_REMOVE_HOT => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let removed = tokio::task::spawn_blocking(move || -> Result<bool, ErrorInfo> {
+                    let hot_path = path.join("public/hot");
+                    // Re-probe at click time: a dev server that has started
+                    // meanwhile OWNS this file — deleting it would desync a
+                    // healthy dev setup.
+                    if let Ok(contents) = std::fs::read_to_string(&hot_path)
+                        && let Some(hot) = mast_laravel::vite::parse_hot_file(&contents)
+                        && dev_server_listening(&hot) == Some(true)
+                    {
+                        return Err(ErrorInfo::Conflict {
+                            message: format!(
+                                "a Vite dev server is now listening at {} — its hot file is \
+                                 not stale any more",
+                                hot.url
+                            ),
+                        });
+                    }
+                    match std::fs::remove_file(&hot_path) {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(e) => Err(crate::internal_err(e)),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if removed {
+                            "removed public/hot — built assets are served again".into()
+                        } else {
+                            "public/hot was already gone".into()
+                        },
                         stderr: false,
                     },
                 );
