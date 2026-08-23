@@ -50,6 +50,7 @@ pub const REPAIR_CHOWN_STORAGE: &str = "chown-storage";
 pub const REPAIR_REMOVE_HOT: &str = "remove-hot-file";
 pub const REPAIR_NORMALIZE_ENV_EOL: &str = "normalize-env-eol";
 pub const REPAIR_ADD_HOST_GATEWAY: &str = "add-host-gateway";
+pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -227,6 +228,9 @@ pub struct ProjectFacts {
     pub env_crlf: bool,
     /// Xdebug facts, when `.env` requests a mode other than `off`.
     pub xdebug: Option<XdebugFacts>,
+    /// (service, image) for every image-based service in the resolved model
+    /// — what the stub-drift check reads.
+    pub service_images: Vec<(String, String)>,
 }
 
 /// Everything the Xdebug doctor needs, per project. Gathered only when
@@ -414,6 +418,20 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           service through the compose write transaction — what Sail's \
                           current stub ships and files published before it lack. Without \
                           it, Xdebug's default client_host resolves to nothing on Linux."
+                .into(),
+            arg: arg.map(String::from),
+        }),
+        REPAIR_MIGRATE_MAILPIT => Some(RepairSpec {
+            id: REPAIR_MIGRATE_MAILPIT,
+            title: match arg {
+                Some(service) => format!("Replace \"{service}\" with Mailpit"),
+                None => "Replace MailHog with Mailpit".into(),
+            },
+            risk: RiskTier::Caution,
+            description: "Removes the MailHog service exactly as it stands and adds Sail's \
+                          current Mailpit in the same compose transaction, updating MAIL_* \
+                          in `.env`. Mail data is not migrated (both are catch-and-discard \
+                          dev mailboxes)."
                 .into(),
             arg: arg.map(String::from),
         }),

@@ -2384,6 +2384,69 @@ async fn xdebug_doctor_finds_missing_wiring_and_repairs_host_gateway() {
     );
 }
 
+/// Stub drift: a pre-2023 compose file still running MailHog migrates to
+/// Mailpit in one repair — compose transaction plus the .env updates.
+#[tokio::test(flavor = "multi_thread")]
+async fn mailhog_migrates_to_mailpit_in_one_repair() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("mailapp");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n  mailhog:\n    image: 'mailhog/mailhog:latest'\n    ports:\n      - '1025:1025'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "MAIL_MAILER=smtp\nMAIL_HOST=mailhog\nMAIL_PORT=1025\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+
+    // The scan reads the resolved model; poll until the finding lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let repair = loop {
+        let report = engine.run_diagnostics().await.unwrap();
+        if let Some(f) = report.findings.iter().find(|f| f.check == "stub-drift") {
+            break f.repair.clone().expect("mailhog drift must offer the migration");
+        }
+        assert!(std::time::Instant::now() < deadline, "stub-drift never surfaced");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(repair.id, "migrate-mailpit");
+    assert_eq!(repair.arg.as_deref(), Some("mailhog"));
+
+    let plan = engine.repair_preview("migrate-mailpit", Some("mailhog"), Some(&pid)).await.unwrap();
+    let preview = plan.file_preview.expect("migration must show the file diff");
+    assert!(preview.after.contains("mailpit"), "{}", preview.after);
+    assert!(!preview.after.contains("mailhog"), "{}", preview.after);
+
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "migrate-mailpit".into(),
+            arg: Some("mailhog".into()),
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    let compose = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(compose.contains("axllent/mailpit"), "{compose}");
+    assert!(!compose.contains("mailhog"), "{compose}");
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("MAIL_HOST=mailpit"), "{env}");
+}
+
 /// Sharing tunnels the RUNNING app; a stopped project is refused up front
 /// with the reason, not a dead tunnel.
 #[tokio::test(flavor = "multi_thread")]
