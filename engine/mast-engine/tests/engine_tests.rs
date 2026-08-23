@@ -1548,12 +1548,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         mast_contract::ProjectCommand {
             name: "touch".into(),
             command: "touch marker.txt".into(),
-            auto_start: true,
+            auto_start: true, cwd: None,
         },
         mast_contract::ProjectCommand {
             name: "dev".into(),
             command: "sail npm run dev".into(),
-            auto_start: false,
+            auto_start: false, cwd: None,
         },
     ];
     run_action(
@@ -1613,12 +1613,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "true".into(),
-                    auto_start: false,
+                    auto_start: false, cwd: None,
                 },
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "false".into(),
-                    auto_start: false,
+                    auto_start: false, cwd: None,
                 },
             ],
         })
@@ -1633,6 +1633,80 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         }
     }
     assert!(saw_dup);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "backend");
+    // The sibling repo the command should actually run in.
+    let sibling = tmp.path().join("frontend");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![
+                mast_contract::ProjectCommand {
+                    name: "mark".into(),
+                    command: "touch here.txt".into(),
+                    auto_start: false,
+                    cwd: Some("../frontend".into()),
+                },
+                mast_contract::ProjectCommand {
+                    name: "gone".into(),
+                    command: "touch nowhere.txt".into(),
+                    auto_start: false,
+                    cwd: Some("../does-not-exist".into()),
+                },
+                mast_contract::ProjectCommand {
+                    name: "dev".into(),
+                    command: "sail npm run dev".into(),
+                    auto_start: false,
+                    cwd: Some("../frontend".into()),
+                },
+            ],
+        },
+    )
+    .await;
+
+    // Relative cwd resolves against the project and the command runs THERE.
+    run_action(&engine, Action::RunProjectCommand { id: pid.clone(), name: "mark".into() }).await;
+    assert!(sibling.join("here.txt").is_file());
+    assert!(!project.join("here.txt").exists());
+
+    let failure = |name: &str| {
+        let engine = engine.clone();
+        let pid = pid.clone();
+        let name = name.to_string();
+        async move {
+            let id = engine
+                .dispatch(Action::RunProjectCommand { id: pid, name })
+                .unwrap();
+            let mut events = engine.operation_events(id).unwrap();
+            while let Some(event) = events.next().await {
+                match event.kind {
+                    OperationEventKind::Failed { error } => return error,
+                    OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+                    _ => {}
+                }
+            }
+            panic!("expected a failure");
+        }
+    };
+    // A missing directory names itself instead of running somewhere else.
+    let error = failure("gone").await;
+    assert!(error.contains("does not exist"), "{error}");
+    // sail only works from the project root; the combination is refused.
+    let error = failure("dev").await;
+    assert!(error.contains("project root"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2048,7 +2122,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "build".into(),
                 command: "./fail-like-a-gpg-outage.sh".into(),
-                auto_start: false,
+                auto_start: false, cwd: None,
             }],
         },
     )
@@ -2103,7 +2177,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "clash".into(),
                 command: "./fail-like-a-port-clash.sh".into(),
-                auto_start: false,
+                auto_start: false, cwd: None,
             }],
         },
     )

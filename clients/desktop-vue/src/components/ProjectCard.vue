@@ -17,6 +17,7 @@ import {
   MemoryStick,
   Pencil,
   Play,
+  Puzzle,
   RotateCw,
   ScrollText,
   Share2,
@@ -46,7 +47,7 @@ import type {
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
-import { envReport, laravelLog, proxyCa } from "../lib/transport";
+import { envReport, laravelLog, phpExtensions, proxyCa } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -429,6 +430,7 @@ const catalogOpen = ref(false);
 const newName = ref("");
 const newCommand = ref("");
 const newAuto = ref(false);
+const newCwd = ref("");
 
 function commandOp(name: string) {
   return store.operations[commandKey(project.id, name)];
@@ -454,13 +456,47 @@ async function addCommand() {
   const name = newName.value.trim();
   const command = newCommand.value.trim();
   if (!name || !command) return;
-  await saveCommands([...commands.value, { name, command, autoStart: newAuto.value }]);
+  await saveCommands([
+    ...commands.value,
+    { name, command, autoStart: newAuto.value, cwd: newCwd.value.trim() || null },
+  ]);
   if (!store.error) {
     addCommandOpen.value = false;
     newName.value = "";
     newCommand.value = "";
     newAuto.value = false;
+    newCwd.value = "";
   }
+}
+
+// --- PHP extensions viewer: php -m from the LIVE container, because what
+// the runtime loaded beats what any Dockerfile promises ---
+const extOpen = ref(false);
+const extList = ref<string[] | null>(null);
+const extError = ref<string | null>(null);
+watch(extOpen, async (open) => {
+  if (!open) return;
+  extList.value = null;
+  extError.value = null;
+  try {
+    extList.value = await phpExtensions(project.id);
+  } catch (e) {
+    extError.value = String(e);
+  }
+});
+
+// Two-step clear for the app log: first click arms, second truncates —
+// destructive enough for a pause, not enough for a whole modal.
+const appLogClearArmed = ref(false);
+async function clearAppLog() {
+  if (!appLogClearArmed.value) {
+    appLogClearArmed.value = true;
+    setTimeout(() => (appLogClearArmed.value = false), 3000);
+    return;
+  }
+  appLogClearArmed.value = false;
+  await store.run({ type: "clearLaravelLog", id: project.id });
+  setTimeout(() => void loadAppLog(), 300);
 }
 </script>
 
@@ -793,7 +829,7 @@ async function addCommand() {
         />
       </div>
       <div class="mt-1.5 flex flex-wrap gap-2">
-        <DropdownMenuRoot v-if="phpChoices.length > 0 && !store.readOnly && !opRunning">
+        <DropdownMenuRoot>
           <DropdownMenuTrigger as-child>
             <Chip>
               PHP {{ project.php.current }}
@@ -802,26 +838,23 @@ async function addCommand() {
           </DropdownMenuTrigger>
           <DropdownMenuPortal>
             <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
-              <DropdownMenuItem
-                v-for="s in phpChoices"
-                :key="s"
-                :class="menuItemClass"
-                @select="pendingPhp = s"
-              >
-                Switch to PHP {{ s }}
+              <template v-if="phpChoices.length > 0 && !store.readOnly && !opRunning">
+                <DropdownMenuItem
+                  v-for="s in phpChoices"
+                  :key="s"
+                  :class="menuItemClass"
+                  @select="pendingPhp = s"
+                >
+                  Switch to PHP {{ s }}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator :class="menuSeparatorClass" />
+              </template>
+              <DropdownMenuItem :class="menuItemClass" @select="extOpen = true">
+                <Puzzle class="h-3.5 w-3.5 text-slate-400" /> Extensions
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>
-        <Chip
-          v-else
-          :interactive="false"
-          :tip="
-            runtimeLockReason(phpChoices.length, 'No other PHP runtimes are vendored to switch to.')
-          "
-        >
-          PHP {{ project.php.current }}
-        </Chip>
         <template v-if="project.php.node">
           <DropdownMenuRoot v-if="nodeChoices.length > 0 && !store.readOnly && !opRunning">
             <DropdownMenuTrigger as-child>
@@ -918,7 +951,11 @@ async function addCommand() {
           <DropdownMenuTrigger as-child>
             <Chip
               :dot="commandRunning(cmd.name) ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'"
-              :tip="cmd.command + (cmd.autoStart ? ' · runs automatically on start' : '')"
+              :tip="
+                cmd.command +
+                (cmd.cwd ? ` · in ${cmd.cwd}` : '') +
+                (cmd.autoStart ? ' · runs automatically on start' : '')
+              "
             >
               {{ cmd.name }}
               <span v-if="cmd.autoStart" class="text-[10px] text-slate-400">auto</span>
@@ -1142,7 +1179,19 @@ async function addCommand() {
           >
             {{ f.label }}
           </Button>
-          <div class="ml-auto">
+          <div class="ml-auto flex gap-2">
+            <Tooltip text="Truncate storage/logs/laravel.log — the file stays, its history goes.">
+              <Button
+                variant="outline"
+                size="sm"
+                :disabled="store.readOnly || !appLog?.exists"
+                :class="appLogClearArmed ? 'text-red-700 dark:text-red-300' : ''"
+                @click="clearAppLog"
+              >
+                <Trash2 class="h-3.5 w-3.5" />
+                {{ appLogClearArmed ? "Really clear?" : "Clear" }}
+              </Button>
+            </Tooltip>
             <Button variant="outline" size="sm" @click="loadAppLog">
               <RotateCw class="h-3.5 w-3.5" /> Refresh
             </Button>
@@ -1208,6 +1257,39 @@ async function addCommand() {
           Showing the newest entries — the file is longer than the read window.
         </p>
       </div>
+    </Modal>
+
+    <!-- What php -m says inside the LIVE app container — the truth about
+         loaded extensions, as opposed to what a Dockerfile intends. -->
+    <Modal v-model:open="extOpen" title="PHP extensions">
+      <p v-if="extError" class="text-sm text-slate-500 dark:text-slate-400">
+        {{ extError }}
+      </p>
+      <p v-else-if="extList == null" class="text-sm text-slate-500 dark:text-slate-400">
+        Running php -m in the app container…
+      </p>
+      <template v-else>
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          {{ extList.length }} extensions loaded in the running
+          <span class="font-mono">{{ project.php?.service ?? "app" }}</span> container:
+        </p>
+        <div class="mt-2 grid max-h-[45vh] grid-cols-3 gap-x-3 gap-y-1 overflow-y-auto">
+          <span
+            v-for="ext in extList"
+            :key="ext"
+            class="truncate font-mono text-xs text-slate-700 dark:text-slate-200"
+          >
+            {{ ext }}
+          </span>
+        </div>
+        <p class="mt-3 text-xs text-slate-400">
+          The set is baked into the
+          <span class="font-mono">sail-{{ project.php?.current }}/app</span> image when it builds.
+          To add one, edit the vendored runtime's Dockerfile (<span class="font-mono"
+            >docker/{{ project.php?.current }}/Dockerfile</span
+          >) and rebuild from the Runtimes row — a one-click installer is on the roadmap.
+        </p>
+      </template>
     </Modal>
 
     <!-- The HTTPS differentiator: claim a .test domain, watch the proxy
@@ -1447,6 +1529,15 @@ async function addCommand() {
           Command
           <Input v-model="newCommand" placeholder="sail npm run dev" mono class="mt-1" />
         </label>
+        <label class="block text-xs text-slate-600 dark:text-slate-300">
+          Working directory <span class="text-slate-400">(optional)</span>
+          <Input v-model="newCwd" placeholder="../frontend or /an/absolute/path" class="mt-1" />
+        </label>
+        <p v-if="newCwd.trim()" class="text-xs text-slate-400">
+          Relative paths start at this project — so a sibling repo's dev server is
+          <span class="font-mono">../frontend</span> + <span class="font-mono">npm run dev</span>.
+          <span class="font-mono">sail</span> commands only work from the project root.
+        </p>
         <Checkbox v-model="newAuto" label="Run automatically when the project starts" />
         <div class="flex justify-end gap-2">
           <Button variant="outline" @click="addCommandOpen = false">Cancel</Button>

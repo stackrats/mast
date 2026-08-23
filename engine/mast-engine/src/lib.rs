@@ -212,6 +212,7 @@ fn commands_to_contract(record: &ProjectRecord) -> Vec<mast_contract::ProjectCom
             name: c.name.clone(),
             command: c.command.clone(),
             auto_start: c.auto_start,
+            cwd: c.cwd.clone(),
         })
         .collect()
 }
@@ -482,6 +483,7 @@ impl Engine {
                 | Action::OpenInBrowser { .. }
                 | Action::OpenUrl { .. }
                 | Action::OpenHostsFile
+                | Action::RevealPath { .. }
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -935,6 +937,7 @@ impl Engine {
                             name: c.name.clone(),
                             command: c.command.clone(),
                             auto_start: c.auto_start,
+                            cwd: c.cwd.clone().filter(|w| !w.trim().is_empty()),
                         })
                         .collect();
                     let all = engine.with_state(|st, events| {
@@ -1039,6 +1042,67 @@ impl Engine {
                 self.spawn_operation(id, handle, async move {
                     integrations::open_path(std::path::Path::new(proxy::hosts_file_path()))
                         .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::RevealPath { path } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let candidate = PathBuf::from(&path);
+                    let known = {
+                        let st = engine.inner.state.lock().unwrap();
+                        st.watched_directories.contains(&candidate)
+                            || st.projects.values().any(|e| e.record.path == candidate)
+                    };
+                    if !known {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!(
+                                "{path} is not a watched directory or project — nothing to open"
+                            ),
+                        });
+                    }
+                    integrations::open_path(&candidate)
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::ClearLaravelLog { id: project } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    let path = {
+                        let st = engine.inner.state.lock().unwrap();
+                        st.projects
+                            .get(&project.0)
+                            .ok_or(ErrorInfo::NotFound {
+                                what: format!("project {}", project.0),
+                            })?
+                            .record
+                            .path
+                            .join("storage/logs/laravel.log")
+                    };
+                    let cleared = tokio::task::spawn_blocking(move || {
+                        if !path.is_file() {
+                            return Ok(false);
+                        }
+                        // Truncate in place: running PHP workers keep their
+                        // open handle and append to the same (now empty) file.
+                        std::fs::write(&path, "").map(|()| true)
+                    })
+                    .await
+                    .map_err(internal_err)?
+                    .map_err(internal_err)?;
+                    engine.emit_op(
+                        &h,
+                        id,
+                        OperationEventKind::Output {
+                            line: if cleared {
+                                "laravel.log cleared".into()
+                            } else {
+                                "no laravel.log to clear".into()
+                            },
+                            stderr: false,
+                        },
+                    );
+                    Ok(())
                 });
             }
             Action::SetEnvVar { id: project, key: env_key, value } => {

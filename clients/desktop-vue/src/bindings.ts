@@ -70,6 +70,14 @@ async proxyCa() : Promise<Result<ProxyCa | null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async phpExtensions(project: ProjectId) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("php_extensions", { project }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async networkAttachPreview(workspace: WorkspaceId, project: ProjectId) : Promise<Result<FileEditPreview, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("network_attach_preview", { workspace, project }) };
@@ -432,6 +440,18 @@ export type Action =
  * shows the exact line to add.
  */
 { type: "openHostsFile" } | 
+/**
+ * Truncate `storage/logs/laravel.log` — a fresh slate for the App log
+ * viewer. The file is kept (empty), so running processes keep their
+ * open handle and Laravel appends as before.
+ */
+{ type: "clearLaravelLog"; id: ProjectId } | 
+/**
+ * Open a directory in the file manager. Restricted to paths Mast
+ * already knows — a watched directory or an imported project's root —
+ * so the surface stays as narrow as the buttons that use it.
+ */
+{ type: "revealPath"; path: string } | 
 /**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
@@ -817,7 +837,14 @@ export type ProjectCommand = { name: string; command: string;
 /**
  * Run automatically once the project reaches Running.
  */
-autoStart: boolean }
+autoStart: boolean; 
+/**
+ * Working directory: relative to the project (`../frontend`) or
+ * absolute. None = the project directory. Lets a Sail project drive a
+ * sibling repo's dev server; `sail …` commands refuse it, since the
+ * wrapper only works from the project root.
+ */
+cwd?: string | null }
 export type ProjectId = string
 export type ProjectStatus = "stopped" | "starting" | "running" | "degraded" | "failed"
 export type ProjectSummary = { id: ProjectId; name: string; 

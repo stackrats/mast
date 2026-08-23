@@ -606,7 +606,7 @@ impl Engine {
         project: &ProjectId,
         name: &str,
     ) -> Result<(), ErrorInfo> {
-        let (path, redactor, command) = {
+        let (path, redactor, command, cwd) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -618,13 +618,46 @@ impl Engine {
                 .iter()
                 .find(|c| c.name == name)
                 .ok_or(ErrorInfo::NotFound { what: format!("command \"{name}\"") })?;
-            (entry.record.path.clone(), entry.redactor.clone(), cmd.command.clone())
+            (
+                entry.record.path.clone(),
+                entry.redactor.clone(),
+                cmd.command.clone(),
+                cmd.cwd.clone(),
+            )
         };
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
         }
+        // A relative override walks from the project; absolute stands alone.
+        // Resolved at run time, not save time — the sibling repo may be
+        // cloned after the command is.
+        let run_dir = match &cwd {
+            Some(dir) => {
+                let resolved = path.join(dir);
+                let resolved = resolved.canonicalize().map_err(|_| ErrorInfo::InvalidInput {
+                    message: format!(
+                        "working directory {} does not exist (from \"{dir}\")",
+                        resolved.display()
+                    ),
+                })?;
+                if !resolved.is_dir() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: format!("{} is not a directory", resolved.display()),
+                    });
+                }
+                resolved
+            }
+            None => path.clone(),
+        };
         if argv[0] == "sail" {
+            if cwd.is_some() {
+                return Err(ErrorInfo::InvalidInput {
+                    message: "sail commands only work from the project root — leave the \
+                              working directory empty"
+                        .into(),
+                });
+            }
             let script = path.join("vendor/bin/sail");
             if !script.is_file() {
                 return Err(ErrorInfo::InvalidInput {
@@ -638,10 +671,17 @@ impl Engine {
         self.emit_op(
             handle,
             op,
-            OperationEventKind::Output { line: format!("$ {command}"), stderr: false },
+            OperationEventKind::Output {
+                line: if run_dir == path {
+                    format!("$ {command}")
+                } else {
+                    format!("$ {command}  (in {})", run_dir.display())
+                },
+                stderr: false,
+            },
         );
         // A week ≈ unbounded: dev servers run until the user stops them.
-        self.run_streamed_command(handle, op, &argv, Some(&path), &redactor, Duration::from_secs(7 * 24 * 3600))
+        self.run_streamed_command(handle, op, &argv, Some(&run_dir), &redactor, Duration::from_secs(7 * 24 * 3600))
             .await
     }
 
@@ -851,6 +891,56 @@ fn capitalize(word: &str) -> String {
 
 /// Sail's own app-service selector: `.env` `APP_SERVICE`, default
 /// `laravel.test`.
+impl crate::Engine {
+    /// `php -m` inside the running app container: the extensions the runtime
+    /// actually loaded, not what a Dockerfile promises. On demand from the
+    /// PHP chip; fails plainly when nothing is running to ask.
+    pub async fn php_extensions(&self, project: &ProjectId) -> Result<Vec<String>, ErrorInfo> {
+        let (path, container) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            (entry.record.path.clone(), entry.summary.services.clone())
+        };
+        let app = app_service_of(&path);
+        let container = container
+            .iter()
+            .find(|s| s.name == app && s.state == Some(mast_contract::ContainerState::Running))
+            .and_then(|s| s.container_id.clone())
+            .ok_or_else(|| ErrorInfo::InvalidInput {
+                message: format!("{app} is not running — start the project first"),
+            })?;
+        let argv: Vec<String> =
+            ["docker", "exec", container.as_str(), "php", "-m"].map(String::from).into();
+        let out = mast_docker::run_command(
+            &argv,
+            None,
+            &[],
+            crate::diagnostics::PROBE_TIMEOUT,
+            crate::diagnostics::PROBE_CAP,
+        )
+            .await
+            .map_err(crate::internal_err)?;
+        if !out.success() {
+            return Err(ErrorInfo::Internal {
+                message: format!("php -m failed: {}", out.stderr.trim()),
+            });
+        }
+        let mut extensions: Vec<String> = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('['))
+            .map(str::to_string)
+            .collect();
+        extensions.sort_by_key(|e| e.to_ascii_lowercase());
+        extensions.dedup();
+        Ok(extensions)
+    }
+}
+
 pub(crate) fn app_service_of(dir: &Path) -> String {
     mast_compose::parse_env_file(&dir.join(".env"))
         .get("APP_SERVICE")
