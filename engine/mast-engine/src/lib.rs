@@ -179,6 +179,9 @@ pub(crate) struct Inner {
     /// state: a capture is an event with a body, and the database — not the
     /// replay window — is its record.
     pub(crate) captures_tx: broadcast::Sender<mast_contract::LogCapture>,
+    /// Container names of share tunnels this engine is currently running —
+    /// what the orphan sweep must NOT touch.
+    pub(crate) live_shares: Mutex<HashSet<String>>,
     /// When each container was last captured, for repeat suppression.
     pub(crate) captures_seen: Mutex<HashMap<String, u64>>,
     /// Live resource usage (M11). Subscribing to this is what starts the
@@ -328,6 +331,7 @@ impl Engine {
                 next_history: AtomicU64::new(0),
                 history_started: Mutex::new(HashMap::new()),
                 captures_tx,
+                live_shares: Mutex::new(HashSet::new()),
                 captures_seen: Mutex::new(HashMap::new()),
                 usage_tx,
                 usage_prev: Mutex::new(HashMap::new()),

@@ -57,6 +57,10 @@ async fn docker_loop(engine: Engine) {
                 *engine.inner.adapter.lock().unwrap() = Some(adapter.clone());
                 engine.update_docker_status(status);
                 engine.hint();
+                // First contact with the daemon: sweep share tunnels a
+                // previous engine left publishing. A tunnel with no live
+                // operation is unmanaged and invisible — and still public.
+                engine.cleanup_orphan_shares().await;
                 match adapter.events().await {
                     Ok(mut events) => {
                         while events.next().await.is_some() {

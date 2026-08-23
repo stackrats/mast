@@ -51,6 +51,7 @@ impl Engine {
         tokio::spawn(async move {
             engine.emit_op(&handle, id, OperationEventKind::Started);
             let container = share_container_name(&project.0);
+            engine.inner.live_shares.lock().unwrap().insert(container.clone());
             let work = crate::history::with_context(
                 crate::history::CommandContext {
                     label: format!("Share {name}"),
@@ -66,6 +67,7 @@ impl Engine {
             let rm: Vec<String> =
                 ["docker", "rm", "-f", container.as_str()].map(String::from).into();
             let _ = run_command(&rm, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+            engine.inner.live_shares.lock().unwrap().remove(&container);
             engine.set_share_url(&project.0, None);
             engine.set_share_dashboard(&project.0, None);
             let kind = match result {
@@ -90,6 +92,50 @@ impl Engine {
             engine.hint();
         });
         Ok(id)
+    }
+
+    /// Remove `mast-share-*` tunnel containers no live operation owns — the
+    /// leftovers of an engine that died mid-share. A crashed docker client
+    /// does not stop its container, so without this sweep the tunnel keeps
+    /// publishing the machine with nothing tracking it. Never runs read-only
+    /// (a viewer must not kill the controlling instance's tunnels), and
+    /// never touches a container a running share op here owns.
+    pub(crate) async fn cleanup_orphan_shares(&self) {
+        if self.read_only() {
+            return;
+        }
+        let ls: Vec<String> =
+            ["docker", "ps", "--filter", "name=mast-share-", "--format", "{{.Names}}"]
+                .map(String::from)
+                .into();
+        let Ok(out) = run_command(&ls, None, &[], PROBE_TIMEOUT, PROBE_CAP).await else {
+            return;
+        };
+        if !out.success() {
+            return;
+        }
+        // Scoped strictly to THIS engine's projects: an orphan is a tunnel
+        // named for a project this store knows, with no live op here. A
+        // broader name-prefix sweep would let one engine (or a test run
+        // with its own temp store) kill tunnels belonging to another.
+        let orphans: Vec<String> = {
+            let st = self.inner.state.lock().unwrap();
+            let live = self.inner.live_shares.lock().unwrap();
+            out.stdout
+                .lines()
+                .map(str::trim)
+                .filter(|name| {
+                    st.projects.keys().any(|id| *name == share_container_name(id))
+                        && !live.contains(*name)
+                })
+                .map(String::from)
+                .collect()
+        };
+        for name in orphans {
+            tracing::warn!("removing orphaned share tunnel {name}");
+            let rm: Vec<String> = ["docker", "rm", "-f", name.as_str()].map(String::from).into();
+            let _ = run_command(&rm, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+        }
     }
 
     fn set_share_url(&self, project: &str, url: Option<String>) {

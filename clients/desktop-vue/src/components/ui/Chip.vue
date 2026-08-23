@@ -13,6 +13,7 @@ const {
   dot,
   dashed = false,
   active = false,
+  interactive = true,
   tip,
 } = defineProps<{
   /** Status dot color class (e.g. "bg-emerald-500"); omitted = no dot. */
@@ -21,23 +22,35 @@ const {
   dashed?: boolean;
   /** Selected state (toggle pills). */
   active?: boolean;
+  /** False for purely informational chips: no pointer cursor, no hover
+   * state — a chip that looks clickable must be clickable. */
+  interactive?: boolean;
   /** Hover tooltip text. */
   tip?: string;
 }>();
 
 const base =
-  "inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-xs whitespace-nowrap outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 disabled:cursor-default disabled:opacity-50";
+  "inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-xs whitespace-nowrap outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 disabled:cursor-default disabled:opacity-50";
 
 const variants = {
   active:
-    "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+    "cursor-pointer border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
   dashed:
-    "border-dashed border-slate-300 text-slate-500 hover:border-slate-400 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-400 dark:hover:bg-slate-800",
+    "cursor-pointer border-dashed border-slate-300 text-slate-500 hover:border-slate-400 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-400 dark:hover:bg-slate-800",
   default:
-    "border-slate-200 text-slate-700 hover:bg-slate-50 data-[state=open]:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 dark:data-[state=open]:bg-slate-800",
+    "cursor-pointer border-slate-200 text-slate-700 hover:bg-slate-50 data-[state=open]:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 dark:data-[state=open]:bg-slate-800",
+  static:
+    "cursor-default border-slate-200 text-slate-700 dark:border-slate-700 dark:text-slate-300",
 };
 
-const variant = () => (active ? variants.active : dashed ? variants.dashed : variants.default);
+const variant = () =>
+  !interactive
+    ? variants.static
+    : active
+      ? variants.active
+      : dashed
+        ? variants.dashed
+        : variants.default;
 </script>
 
 <template>

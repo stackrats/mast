@@ -223,6 +223,15 @@ function switchPhp() {
   });
 }
 
+/** Why a runtime picker is unavailable right now — the fallback chip's
+ * tooltip must state the real reason, not a guess. */
+function runtimeLockReason(choices: number, noneMessage: string): string {
+  if (store.readOnly) return "Read-only — the controlling Mast window can switch versions.";
+  if (opRunning.value) return "Unavailable while an operation is running on this project.";
+  if (choices === 0) return noneMessage;
+  return noneMessage;
+}
+
 // --- Node switch: same verified rebuild as PHP, pinning build.args ---
 const nodeChoices = computed(() =>
   (project.php?.nodeAvailable ?? []).filter((m) => m !== project.php?.node),
@@ -576,7 +585,7 @@ async function addCommand() {
       <div class="flex items-center gap-1.5">
         <p :class="rowLabelClass">Runtimes</p>
         <Hint
-          text="The PHP runtime the app builds from (vendor/laravel/sail/runtimes). Picking another series rewrites the build context and image tag together, rebuilds without cache, and verifies php -v — the four steps that go wrong when done by hand."
+          text="What the app container is built from: the Sail PHP runtime and the Node it installs. Picking another version rewrites the compose file, rebuilds without cache, recreates the container, and verifies the switch inside it — the steps that go wrong when done by hand."
         />
       </div>
       <div class="mt-1.5 flex flex-wrap gap-2">
@@ -600,7 +609,13 @@ async function addCommand() {
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>
-        <Chip v-else tip="No other PHP runtimes are vendored to switch to.">
+        <Chip
+          v-else
+          :interactive="false"
+          :tip="
+            runtimeLockReason(phpChoices.length, 'No other PHP runtimes are vendored to switch to.')
+          "
+        >
           PHP {{ project.php.current }}
         </Chip>
         <template v-if="project.php.node">
@@ -626,7 +641,13 @@ async function addCommand() {
           </DropdownMenuRoot>
           <Chip
             v-else
-            tip="Node inside the app container — pinned by the Sail runtime's Dockerfile (ARG NODE_VERSION)."
+            :interactive="false"
+            :tip="
+              runtimeLockReason(
+                nodeChoices.length,
+                'Node inside the app container, pinned by the Sail runtime — this build shape cannot take an override.',
+              )
+            "
           >
             Node {{ project.php.node }}
           </Chip>
@@ -771,16 +792,24 @@ async function addCommand() {
               >
               <span class="ml-auto font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
             </div>
-            <p class="mt-1 text-[11px] text-slate-400">
-              Change these via the <span class="font-mono">SAIL_SHARE_*</span> keys in the Env
-              panel.
-            </p>
+            <button
+              class="mt-1 cursor-pointer text-[11px] text-slate-400 underline decoration-slate-300 underline-offset-2 hover:text-slate-600 dark:decoration-slate-600 dark:hover:text-slate-200"
+              @click="
+                shareOpen = false;
+                showEnv = true;
+              "
+            >
+              Change these in the Env panel
+            </button>
           </div>
           <p
             v-if="project.status === 'stopped' || project.status === 'failed'"
             class="text-xs text-amber-700 dark:text-amber-300"
           >
             The tunnel forwards the running app — start the project first.
+          </p>
+          <p v-if="store.readOnly" class="text-xs text-amber-700 dark:text-amber-300">
+            Read-only — the controlling Mast window can start a share.
           </p>
           <div class="flex justify-end">
             <Button

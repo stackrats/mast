@@ -369,6 +369,13 @@ impl Engine {
         service: String,
         major: String,
     ) -> Result<OperationId, ErrorInfo> {
+        // Same up-front validation as the PHP switch: garbage input must be
+        // refused before the project's op lock is ever taken.
+        if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!("\"{major}\" is not a Node major like 22"),
+            });
+        }
         let (invocation, file) = self.catalog_context(&project)?;
         let (path, redactor, running) = {
             let st = self.inner.state.lock().unwrap();
