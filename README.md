@@ -44,6 +44,8 @@ Mast gives your existing Sail projects a single control center.
 - See what each project costs in CPU and memory, and what to stop.
 - Run Horizon, Reverb, queue workers, and project commands automatically.
 - Diagnose and repair common local environment problems.
+- Share your running app at a temporary public URL — QR code included.
+- Switch PHP versions as a single, verified operation.
 - Manage services and environment variables without leaving Mast.
 
 ### Mast doesn't replace Sail
@@ -162,6 +164,16 @@ These processes remain attached to the project they belong to rather than disapp
 
 ---
 
+## Share your site publicly
+
+`sail share` as a button: publish the running app at a temporary public URL through Sail's own expose tunnel.
+
+The URL arrives with a QR code for opening it on a phone, and the tunnel's output stays visible in the dialog — the place where share problems actually explain themselves.
+
+Before the link goes out, Mast warns if a Vite dev server (or its leftover `public/hot` file) would break the shared page's assets — the classic "CORS errors through the tunnel" mystery. A busy dashboard port is skipped automatically instead of killing the share, and stopping the share reliably stops the tunnel container.
+
+---
+
 ## Logs & captures
 
 Follow any service's logs from inside Mast, without keeping a terminal tab open for each one.
@@ -221,6 +233,18 @@ Mast checks for common problems and presents each finding with a guided repair.
 
 Every repair has a risk tier and a preview of what Mast intends to change before anything is written.
 
+The checks reach the places Sail's own issue tracker says people actually get stuck:
+
+- **Database credentials that stopped matching the volume** — the "Access denied for user 'sail'" trap, where editing `.env` changes nothing because the database only reads it on first creation. Mast reconciles the live server as an administrator without touching data, or recreates the volume with explicit consent.
+- **A database image bumped past its data.** Retagging a database is refused when the container would crash-loop on its existing volume, and warned when the data will upgrade in place.
+- **Containers running an older configuration than your files** — the ".env edits do nothing until a recreate" trap, detected per service through compose's own config hash.
+- **A stale Vite `public/hot` file** — pages load without CSS/JS and `npm run build` changes nothing until it's gone.
+- **Xdebug that never connects**, with the actual broken rung named: a compose file that never passes the mode through, the missing `host.docker.internal` mapping on Linux (one-click fix), a runtime without the extension, or simply no IDE listening.
+- **MailHog left over** from before Sail switched to Mailpit — migrated in one transaction, `.env` included.
+- Storage files owned by root, CRLF line endings in `.env`, a missing `APP_KEY`, an unlinked public disk, cached configuration, known-bad Docker/Compose versions, and more.
+
+When an operation fails, its output runs through the same knowledge: known failure shapes end with a plain-language _likely cause / fix_, and where a one-click repair applies, the failure carries its own **Fix** button — previewed before anything changes.
+
 <img src="docs/media/diagnostics.png" alt="Diagnostics dialog listing errors with repair actions" width="900">
 
 ---
@@ -232,6 +256,14 @@ Add common development services without manually rebuilding Compose configuratio
 Mast matches services against your existing Compose file and can expose available registry versions where applicable.
 
 <img src="docs/media/services.png" alt="Services catalog showing installed and available services with version selectors" width="900">
+
+---
+
+## Switch PHP versions
+
+Pick another vendored PHP runtime from the project header and Mast runs the whole switch as one operation: the build context and the `sail-X.Y/app` image tag move together, the image rebuilds without cache, the container is recreated if it was running — and `php -v` inside the container has the last word.
+
+A series that isn't vendored is refused up front, naming the ones that are.
 
 ---
 
