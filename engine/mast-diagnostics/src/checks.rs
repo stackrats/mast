@@ -6,8 +6,9 @@ use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
     REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE,
     REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
-    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT,
-    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_NORMALIZE_ENV_EOL,
+    REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -645,6 +646,65 @@ impl Check for ConfigCache {
     }
 }
 
+/// CRLF line endings in `.env`. Compose tolerates them for interpolation,
+/// but the sail script `source`s the file with bash, so every value grows an
+/// invisible `\r` — the "service \"laravel.test\r\" is not running" class of
+/// error, usually from a Windows editor or `core.autocrlf=true` checkout.
+struct EnvLineEndings;
+impl Check for EnvLineEndings {
+    fn id(&self) -> &'static str {
+        "env-line-endings"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.env_crlf)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.env_crlf)
+            .map(|p| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: .env has Windows (CRLF) line endings", p.name),
+                    "Sail sources .env with bash, so every value carries an invisible \\r — \
+                     the classic symptom is compose reporting a service name with a stray \
+                     `\\r` as not running. Usually a Windows editor or a \
+                     core.autocrlf=true checkout.",
+                );
+                f.repair = repair_spec(REPAIR_NORMALIZE_ENV_EOL, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// Docker Desktop on Linux: the daemon lives in a VM whose file sharing maps
+/// uids differently than native docker-engine, which silently defeats the
+/// WWWUSER scheme Sail's permissions depend on — the community's accepted
+/// fix is switching to docker-ce (laravel/sail#548, #459).
+struct DockerDesktopLinux;
+impl Check for DockerDesktopLinux {
+    fn id(&self) -> &'static str {
+        "docker-desktop-linux"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.system.linux
+            && ctx.system.context_name.as_deref() == Some("desktop-linux")
+    }
+    fn run(&self, _ctx: &DiagCtx) -> Vec<Finding> {
+        vec![finding(
+            self.id(),
+            Severity::Warning,
+            "Docker Desktop for Linux is the active context",
+            "Its daemon runs in a VM whose file sharing maps ownership differently than \
+             native Docker Engine, so WWWUSER/WWWGROUP parity silently stops working and \
+             storage/ permission errors follow. Native docker-engine (docker-ce) with \
+             `docker context use default` is the reliable setup on Linux.",
+        )]
+    }
+}
+
 /// A `public/hot` file pointing at a Vite dev server that is not running.
 /// Left behind when the dev server is killed abruptly; while it exists,
 /// Blade renders dev-server asset URLs, pages load without CSS/JS, and —
@@ -1151,6 +1211,8 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(StorageOwnership),
         Box::new(ConfigDrift),
         Box::new(ViteHotStale),
+        Box::new(EnvLineEndings),
+        Box::new(DockerDesktopLinux),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1190,6 +1252,7 @@ mod tests {
             docker_host_env: false,
             compose_version: Some("2.29.0".into()),
             docker_server_version: Some("29.7.2".into()),
+            linux: true,
             socket: None,
             rootless: Some(false),
             snap_docker: false,
@@ -1232,6 +1295,7 @@ mod tests {
             foreign_owned: None,
             drifted_services: Vec::new(),
             vite_hot: None,
+            env_crlf: false,
         }
     }
 
@@ -1435,6 +1499,33 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn crlf_env_warns_with_the_normalize_repair() {
+        let mut p = sail_project("a");
+        p.env_crlf = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "env-line-endings").unwrap();
+        assert!(f.detail.contains("sources .env with bash"), "{}", f.detail);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_NORMALIZE_ENV_EOL);
+        assert_eq!(f.repair.as_ref().unwrap().risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn docker_desktop_on_linux_warns_and_only_there() {
+        let mut c = ctx(vec![]);
+        c.system.context_name = Some("desktop-linux".into());
+        let (_, findings) = run_all(&c);
+        let f = findings.iter().find(|f| f.check == "docker-desktop-linux").unwrap();
+        assert!(f.detail.contains("WWWUSER"), "{}", f.detail);
+
+        // Same context on a non-Linux host (macOS ships it too): silence.
+        let mut c = ctx(vec![]);
+        c.system.context_name = Some("desktop-linux".into());
+        c.system.linux = false;
+        let (_, findings) = run_all(&c);
+        assert!(!findings.iter().any(|f| f.check == "docker-desktop-linux"));
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub const REPAIR_DB_RECREATE: &str = "db-recreate-volume";
 pub const REPAIR_CONFIG_CLEAR: &str = "config-clear";
 pub const REPAIR_CHOWN_STORAGE: &str = "chown-storage";
 pub const REPAIR_REMOVE_HOT: &str = "remove-hot-file";
+pub const REPAIR_NORMALIZE_ENV_EOL: &str = "normalize-env-eol";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -92,6 +93,8 @@ pub struct SystemFacts {
     pub compose_version: Option<String>,
     /// Daemon version from `docker info` (`{{.ServerVersion}}`).
     pub docker_server_version: Option<String>,
+    /// Mast itself runs on Linux (some findings only make sense there).
+    pub linux: bool,
     pub socket: Option<SocketFacts>,
     pub rootless: Option<bool>,
     pub snap_docker: bool,
@@ -218,6 +221,9 @@ pub struct ProjectFacts {
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
     pub vite_hot: Option<ViteHotFacts>,
+    /// `.env` has CRLF line endings — sail sources it with bash, so every
+    /// value grows an invisible `\r`.
+    pub env_crlf: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +365,16 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Deletes `public/hot` so Blade serves built assets again. Refuses \
                           if a Vite dev server has meanwhile started listening (a running \
                           dev server owns that file)."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_NORMALIZE_ENV_EOL => Some(RepairSpec {
+            id: REPAIR_NORMALIZE_ENV_EOL,
+            title: "Convert .env to Unix line endings".into(),
+            risk: RiskTier::Safe,
+            description: "Rewrites CRLF line endings to LF (backup kept, values untouched). \
+                          Sail sources `.env` with bash, so CRLF appends an invisible \\r to \
+                          every value."
                 .into(),
             arg: None,
         }),

@@ -16,7 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
-    REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -278,6 +279,10 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
                 dev_server_listening: dev_server_listening(&hot),
                 url: hot.url,
             }),
+        env_crlf: env_present
+            && std::fs::read(&env_path)
+                .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
+                .unwrap_or(false),
     };
     (facts, db_target)
 }
@@ -610,6 +615,7 @@ impl Engine {
                 docker_host_env,
                 compose_version,
                 docker_server_version,
+                linux: cfg!(target_os = "linux"),
                 socket,
                 rootless,
                 snap_docker,
@@ -951,6 +957,27 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_NORMALIZE_ENV_EOL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let crlf = std::fs::read(&env_path)
+                        .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
+                        .unwrap_or(false);
+                    let no_op = !crlf;
+                    let summary = if no_op {
+                        vec![".env already has Unix line endings — nothing to do".into()]
+                    } else {
+                        vec![
+                            "rewrite every CRLF line ending in .env to LF".into(),
+                            "values are untouched; a timestamped backup is kept".into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_REMOVE_HOT => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -1275,6 +1302,30 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_NORMALIZE_ENV_EOL => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                let normalized = tokio::task::spawn_blocking(move || {
+                    mast_laravel::env_write::normalize_env_line_endings(&path, Some(&backups))
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::env_write_error)?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if normalized.is_some() {
+                            ".env converted to Unix line endings (backup kept)".into()
+                        } else {
+                            ".env already had Unix line endings".into()
+                        },
                         stderr: false,
                     },
                 );
