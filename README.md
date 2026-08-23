@@ -164,6 +164,8 @@ Mast can automatically start:
 
 These processes remain attached to the project they belong to rather than disappearing into another terminal window.
 
+Saved commands can also run somewhere else: give one a working directory like `../frontend` and your separate frontend's dev server lives on the same card — streamed, stoppable, and startable together with the backend it belongs to.
+
 ---
 
 ## Share your site publicly
@@ -182,7 +184,9 @@ Stop typing `localhost:8082`. Give a project a `.test` domain and Mast serves it
 
 That unlocks the parts of development that plain `http://localhost` quietly breaks: secure cookies, service workers, camera and clipboard APIs, and OAuth callbacks that insist on HTTPS. The address also never changes when ports move.
 
-Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before a polkit prompt runs it.
+Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before an elevation prompt runs it.
+
+Prefer doing it yourself? The dialog shows the exact hosts line and the certificate — path and PEM, each copyable — with a button that opens your hosts file.
 
 <img src="docs/media/https.png" alt="Local HTTPS dialog with storefront.test enabled, the proxy's output, and Fix buttons for the /etc/hosts entry and certificate trust" width="460">
 
@@ -205,7 +209,7 @@ Captures are written to disk, so they survive both the container being replaced 
 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
 
-And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab.
+And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab. When the history outlives its usefulness, one button clears the file in place.
 
 <img src="docs/media/app-log.png" alt="Application log dialog with level badges and an expanded SQL error showing its grouped stack trace" width="704">
 
@@ -283,6 +287,8 @@ Pick another PHP runtime from the project's Runtimes row and Mast runs the whole
 Node gets the same treatment: pick a major, Mast pins the build argument, rebuilds, and `node -v` confirms it.
 
 A version that can't work is refused up front, naming the ones that can.
+
+The PHP chip also answers what the runtime actually is: the classic limits (`memory_limit`, upload sizes, execution time) and every loaded extension, read live from the running container. Buttons open the runtime's `php.ini` or `Dockerfile` in your editor, and **Rebuild to apply** makes the edit real — no hunting for which file feeds the image.
 
 ---
 
