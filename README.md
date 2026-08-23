@@ -137,6 +137,8 @@ Start, stop, or restart an entire project or an individual service.
 
 Mast reads the real Docker state rather than maintaining a separate idea of what should be running.
 
+A service's chip also knows what the service is for. Mailpit, Meilisearch, or the MinIO console open in your browser from the chip — on whatever port they actually publish, so nobody memorises that Mailpit lives on 8025. A database chip offers **Connection info**: host, port, database, username, and password read fresh from `.env`, each with a copy button, plus a ready-made connection URL for TablePlus or DBeaver.
+
 ### Workspaces
 
 Group related projects into workspaces and start them together.
@@ -174,6 +176,16 @@ Mast shows exactly what will be shared before anything starts, warns when a Vite
 
 ---
 
+## Trusted HTTPS at https://myapp.test
+
+Stop typing `localhost:8082`. Give a project a `.test` domain and Mast serves it over HTTPS through one shared local proxy — with a certificate your browser trusts, from an authority that exists only on your machine.
+
+That unlocks the parts of development that plain `http://localhost` quietly breaks: secure cookies, service workers, camera and clipboard APIs, and OAuth callbacks that insist on HTTPS. The address also never changes when ports move.
+
+Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before a polkit prompt runs it.
+
+---
+
 ## Logs & captures
 
 Follow any service's logs from inside Mast, without keeping a terminal tab open for each one.
@@ -190,6 +202,8 @@ So Mast keeps the last minute of a container's output whenever it goes down:
 Captures are written to disk, so they survive both the container being replaced and Mast being restarted. Each one records why it was taken, and is listed newest first with a copy button.
 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
+
+And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab.
 
 <img src="docs/media/captures.png" alt="Captures tab listing three containers that went down, the newest expanded to show its final log lines" width="900">
 
