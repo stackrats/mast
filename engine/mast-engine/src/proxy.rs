@@ -238,17 +238,16 @@ impl Engine {
             ));
         }
 
-        let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap_or_default();
+        let hosts_path = hosts_file_path();
+        let hosts = tokio::fs::read_to_string(hosts_path).await.unwrap_or_default();
         if !hosts_resolves(&hosts, &domain) {
             out(format!(
-                "/etc/hosts does not resolve {domain} yet — the browser cannot find \
+                "{hosts_path} does not resolve {domain} yet — the browser cannot find \
                  the proxy until it does"
             ));
             self.offer_fix(handle, id, project, REPAIR_HOSTS_ENTRY, Some(&domain));
         }
-        let trusted = std::path::Path::new("/usr/local/share/ca-certificates/mast-proxy.crt")
-            .exists()
-            || std::path::Path::new("/etc/pki/ca-trust/source/anchors/mast-proxy.crt").exists();
+        let trusted = self.proxy_ca_trusted().await;
         if !trusted {
             out("the proxy's certificate authority is not trusted yet — browsers will \
                  warn until it is (one-time step, shared by every local domain)"
@@ -259,6 +258,29 @@ impl Engine {
             out(format!("open https://{domain} — everything is in place"));
         }
         Ok(())
+    }
+
+    /// Is the proxy CA already trusted on this machine? Linux answers from
+    /// the file the trust repair installs; macOS asks the keychain to verify
+    /// the exported root (`security verify-cert`), because there is no
+    /// marker file to look for.
+    pub(crate) async fn proxy_ca_trusted(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            let crt = self.inner.deps.store.proxy_dir().join("root.crt");
+            if !crt.is_file() {
+                return false;
+            }
+            let argv: Vec<String> =
+                ["security", "verify-cert", "-c", &crt.to_string_lossy()]
+                    .map(String::from)
+                    .into();
+            return run_command(&argv, None, &[], Duration::from_secs(10), OUTPUT_CAP)
+                .await
+                .ok()
+                .is_some_and(|o| o.success());
+        }
+        std::path::Path::new("/usr/local/share/ca-certificates/mast-proxy.crt").exists()
+            || std::path::Path::new("/etc/pki/ca-trust/source/anchors/mast-proxy.crt").exists()
     }
 
     /// Export the proxy CA's root certificate to the data dir and return it

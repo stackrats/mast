@@ -102,6 +102,20 @@ impl Check for SocketAccess {
         if socket.writable {
             return Vec::new();
         }
+        if !ctx.system.linux {
+            // The docker group is a Linux concept; on macOS the Desktop VM
+            // owns the socket and `usermod` would be nonsense advice.
+            return vec![finding(
+                self.id(),
+                Severity::Error,
+                "No permission on the docker socket",
+                format!(
+                    "{} exists but is not writable by your user — restart Docker \
+                     Desktop, and check its Advanced settings for the socket location.",
+                    socket.path
+                ),
+            )];
+        }
         let mut f = finding(
             self.id(),
             Severity::Error,
@@ -1730,6 +1744,23 @@ mod tests {
         let repair = socket.repair.as_ref().unwrap();
         assert_eq!(repair.id, REPAIR_DOCKER_GROUP);
         assert_eq!(repair.risk, RiskTier::HighRisk);
+    }
+
+    #[test]
+    fn socket_permission_on_macos_gets_desktop_advice_not_usermod() {
+        let mut c = ctx(vec![]);
+        c.system.docker_connected = false;
+        c.system.linux = false;
+        c.system.socket = Some(SocketFacts {
+            path: "/Users/x/.docker/run/docker.sock".into(),
+            exists: true,
+            writable: false,
+        });
+        let (_, findings) = run_all(&c);
+        let socket = findings.iter().find(|f| f.check == "docker-socket").unwrap();
+        // The docker group is a Linux concept — no repair, no usermod talk.
+        assert!(socket.repair.is_none());
+        assert!(socket.detail.contains("Docker Desktop"), "{}", socket.detail);
     }
 
     #[test]

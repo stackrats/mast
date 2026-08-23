@@ -1323,14 +1323,7 @@ impl Engine {
                 .map_err(crate::internal_err)?
             }
             REPAIR_TRUST_PROXY_CA => {
-                let no_op = tokio::task::spawn_blocking(|| {
-                    std::path::Path::new("/usr/local/share/ca-certificates/mast-proxy.crt")
-                        .exists()
-                        || std::path::Path::new("/etc/pki/ca-trust/source/anchors/mast-proxy.crt")
-                            .exists()
-                })
-                .await
-                .map_err(crate::internal_err)?;
+                let no_op = self.proxy_ca_trusted().await;
                 let exported = self.inner.deps.store.proxy_dir().join("root.crt");
                 let summary = if no_op {
                     vec!["the proxy CA is already in the system trust store — nothing to do"
