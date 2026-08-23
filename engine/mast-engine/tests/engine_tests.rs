@@ -1344,11 +1344,14 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let project = make_project(tmp.path(), "clinic");
     std::fs::write(
         project.join("composer.json"),
-        r#"{"require": {"php": "^8.2"}, "require-dev": {"laravel/sail": "^1.41"}}"#,
+        r#"{"require": {"php": "^8.2", "laravel/framework": "^12.0"}, "require-dev": {"laravel/sail": "^1.41"}}"#,
     )
     .unwrap();
     std::fs::write(project.join(".env.example"), "APP_NAME=clinic\nWWWUSER=\nWWWGROUP=\n")
         .unwrap();
+    // A public disk with no public/storage link — the post-clone state.
+    std::fs::create_dir_all(project.join("storage/app/public")).unwrap();
+    std::fs::create_dir_all(project.join("public")).unwrap();
 
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -1399,14 +1402,45 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     assert!(project.join(".env").is_file());
 
     // With .env in place the WWWUSER parity check engages (empty != uid) and
-    // its repair rewrites .env through the transactional writer.
+    // its repair rewrites .env through the transactional writer. The copied
+    // .env has no APP_KEY, and the public disk is unlinked — both surface too.
     let report = engine.run_diagnostics().await.unwrap();
     assert!(report.findings.iter().any(|f| f.check == "wwwuser-parity"));
+    let app_key = report
+        .findings
+        .iter()
+        .find(|f| f.check == "app-key-missing")
+        .expect("empty APP_KEY must be found");
+    assert_eq!(app_key.repair.as_ref().unwrap().id, "generate-app-key");
+    let storage = report
+        .findings
+        .iter()
+        .find(|f| f.check == "storage-link")
+        .expect("unlinked public disk must be found");
+    assert_eq!(storage.repair.as_ref().unwrap().id, "storage-link");
     run_action(
         &engine,
         Action::ApplyRepair { repair: "set-wwwuser".into(), arg: None, project: Some(pid.clone()) },
     )
     .await;
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "generate-app-key".into(),
+            arg: None,
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "storage-link".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("APP_KEY=base64:"), "{env}");
+    let link = std::fs::read_link(project.join("public/storage")).unwrap();
+    assert_eq!(link, std::path::PathBuf::from("../storage/app/public"));
     let uid = String::from_utf8(
         std::process::Command::new("id").arg("-u").output().unwrap().stdout,
     )
@@ -1416,13 +1450,15 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let env = std::fs::read_to_string(project.join(".env")).unwrap();
     assert!(env.contains(&format!("WWWUSER={uid}")), "{env}");
 
-    // Both repaired findings are gone on the next run.
+    // Every repaired finding is gone on the next run.
     let report = engine.run_diagnostics().await.unwrap();
     assert!(
-        !report
-            .findings
-            .iter()
-            .any(|f| f.check == "env-missing" || f.check == "wwwuser-parity"),
+        !report.findings.iter().any(|f| {
+            matches!(
+                f.check.as_str(),
+                "env-missing" | "wwwuser-parity" | "app-key-missing" | "storage-link"
+            )
+        }),
         "{:?}",
         report.findings
     );
@@ -1430,9 +1466,9 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     // Every run and repair is in the audit history, newest first.
     let history = engine.diagnostics_history().await.unwrap();
     assert_eq!(history.runs.len(), 3);
-    assert_eq!(history.repairs.len(), 2);
+    assert_eq!(history.repairs.len(), 4);
     assert!(history.repairs.iter().all(|r| r.outcome == "applied"));
-    assert_eq!(history.repairs[0].repair, "set-wwwuser");
+    assert_eq!(history.repairs[0].repair, "storage-link");
     assert_eq!(history.repairs[0].risk, "safe");
 }
 
@@ -1512,12 +1548,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         mast_contract::ProjectCommand {
             name: "touch".into(),
             command: "touch marker.txt".into(),
-            auto_start: true,
+            auto_start: true, cwd: None,
         },
         mast_contract::ProjectCommand {
             name: "dev".into(),
             command: "sail npm run dev".into(),
-            auto_start: false,
+            auto_start: false, cwd: None,
         },
     ];
     run_action(
@@ -1577,12 +1613,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "true".into(),
-                    auto_start: false,
+                    auto_start: false, cwd: None,
                 },
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "false".into(),
-                    auto_start: false,
+                    auto_start: false, cwd: None,
                 },
             ],
         })
@@ -1597,6 +1633,80 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         }
     }
     assert!(saw_dup);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "backend");
+    // The sibling repo the command should actually run in.
+    let sibling = tmp.path().join("frontend");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![
+                mast_contract::ProjectCommand {
+                    name: "mark".into(),
+                    command: "touch here.txt".into(),
+                    auto_start: false,
+                    cwd: Some("../frontend".into()),
+                },
+                mast_contract::ProjectCommand {
+                    name: "gone".into(),
+                    command: "touch nowhere.txt".into(),
+                    auto_start: false,
+                    cwd: Some("../does-not-exist".into()),
+                },
+                mast_contract::ProjectCommand {
+                    name: "dev".into(),
+                    command: "sail npm run dev".into(),
+                    auto_start: false,
+                    cwd: Some("../frontend".into()),
+                },
+            ],
+        },
+    )
+    .await;
+
+    // Relative cwd resolves against the project and the command runs THERE.
+    run_action(&engine, Action::RunProjectCommand { id: pid.clone(), name: "mark".into() }).await;
+    assert!(sibling.join("here.txt").is_file());
+    assert!(!project.join("here.txt").exists());
+
+    let failure = |name: &str| {
+        let engine = engine.clone();
+        let pid = pid.clone();
+        let name = name.to_string();
+        async move {
+            let id = engine
+                .dispatch(Action::RunProjectCommand { id: pid, name })
+                .unwrap();
+            let mut events = engine.operation_events(id).unwrap();
+            while let Some(event) = events.next().await {
+                match event.kind {
+                    OperationEventKind::Failed { error } => return error,
+                    OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+                    _ => {}
+                }
+            }
+            panic!("expected a failure");
+        }
+    };
+    // A missing directory names itself instead of running somewhere else.
+    let error = failure("gone").await;
+    assert!(error.contains("does not exist"), "{error}");
+    // sail only works from the project root; the combination is refused.
+    let error = failure("dev").await;
+    assert!(error.contains("project root"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1974,6 +2084,569 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
     run_action(&engine, Action::StartProject { id: project_id(&engine) }).await;
     assert_eq!(std::fs::read_to_string(project.join(".env")).unwrap(), before);
     drop(squatter2);
+}
+
+/// A failing operation whose output carries a known error signature ends
+/// with a plain-language explanation before the Failed event — the GPG/PPA
+/// build-failure wave, port squatters, and version-locked volumes read as
+/// sentences instead of scrollback.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_operations_explain_known_error_signatures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "sigapp");
+    std::fs::write(
+        project.join("fail-like-a-gpg-outage.sh"),
+        "#!/bin/sh\necho 'gpg: keyserver receive failed: Server indicated a failure' >&2\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project.join("fail-like-a-gpg-outage.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "build".into(),
+                command: "./fail-like-a-gpg-outage.sh".into(),
+                auto_start: false, cwd: None,
+            }],
+        },
+    )
+    .await;
+
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "build".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed = false;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Output { line, .. } => lines.push(line),
+            OperationEventKind::Failed { .. } => {
+                failed = true;
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "the command must fail");
+    let cause = lines
+        .iter()
+        .position(|l| l.starts_with("likely cause:") && l.contains("GPG keyserver"))
+        .unwrap_or_else(|| panic!("no explanation in {lines:?}"));
+    assert!(
+        lines[cause + 1].starts_with("  fix:"),
+        "advice must follow the cause: {lines:?}"
+    );
+
+    // A signature that maps to a repair also emits a FixAvailable event —
+    // the failure carries its own Fix button, offer and project attached.
+    std::fs::write(
+        project.join("fail-like-a-port-clash.sh"),
+        "#!/bin/sh\necho 'Error starting userland proxy: bind: address already in use' >&2\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project.join("fail-like-a-port-clash.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "clash".into(),
+                command: "./fail-like-a-port-clash.sh".into(),
+                auto_start: false, cwd: None,
+            }],
+        },
+    )
+    .await;
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "clash".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut fix = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::FixAvailable { repair, project } => fix = Some((repair, project)),
+            OperationEventKind::Failed { .. } => break,
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let (repair, fix_project) = fix.expect("port clash must carry a fix offer");
+    assert_eq!(repair.id, "reassign-ports");
+    assert_eq!(fix_project, pid);
+}
+
+/// The PHP switch: refuses series that are not vendored, rewrites build
+/// context and image tag TOGETHER through the write transaction, and only
+/// then rebuilds — so a failed build leaves a coherent file that `up` or a
+/// rebuild can still make good on, never a context/tag mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn php_switch_rewrites_context_and_tag_together_before_building() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("phpapp");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.3'\n      dockerfile: Dockerfile\n    image: 'sail-8.3/app'\n",
+    )
+    .unwrap();
+    // Two vendored runtimes, deliberately WITHOUT Dockerfiles: the build step
+    // must fail, proving the compose edit lands first and stays coherent.
+    for series in ["8.3", "8.4"] {
+        std::fs::create_dir_all(project.join("vendor/laravel/sail/runtimes").join(series))
+            .unwrap();
+    }
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    // The picker's data arrives on the summary via reconcile.
+    let snap = wait_until(&engine, "php info on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.is_some() && p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let php = snap.projects[0].php.as_ref().unwrap();
+    assert_eq!(php.service, "laravel.test");
+    assert_eq!(php.current, "8.3");
+    assert_eq!(php.available, vec!["8.3", "8.4"]);
+
+    // A series that is not vendored is refused before anything is touched.
+    let id = engine
+        .dispatch(Action::SetPhpVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            series: "9.9".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut error = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { error: e } => {
+                error = Some(e);
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let error = error.expect("unvendored series must fail");
+    assert!(error.contains("not vendored"), "{error}");
+    let untouched = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(untouched.contains("runtimes/8.3"), "{untouched}");
+
+    // A vendored switch edits BOTH fields, then fails at the build (no
+    // Dockerfile here) — the file must already be coherent on 8.4.
+    let id = engine
+        .dispatch(Action::SetPhpVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            series: "8.4".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut failed = false;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { .. } => {
+                failed = true;
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "the Dockerfile-less build must fail");
+    let switched = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(switched.contains("context: './vendor/laravel/sail/runtimes/8.4'"), "{switched}");
+    assert!(switched.contains("image: 'sail-8.4/app'"), "{switched}");
+    assert!(!switched.contains("8.3"), "{switched}");
+}
+
+/// The Node switch pins `build.args.NODE_VERSION` (existing args intact)
+/// BEFORE the rebuild, refuses garbage majors without touching the file,
+/// and the summary's effective Node follows the override.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_switch_pins_the_build_arg_before_building() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("nodeapp");
+    std::fs::create_dir_all(project.join("vendor/laravel/sail/runtimes/8.3")).unwrap();
+    // No Dockerfile on purpose: the build step must fail, proving the compose
+    // edit lands first — and no real `sail-8.3/app` image ever gets clobbered.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.3'\n      dockerfile: Dockerfile\n      args:\n        WWWGROUP: '${WWWGROUP}'\n    image: 'sail-8.3/app'\n",
+    )
+    .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "php info on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.is_some() && p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let php = snap.projects[0].php.as_ref().unwrap();
+    assert_eq!(php.node, None, "no Dockerfile ARG and no override yet");
+    assert!(php.node_available.contains(&"20".to_string()), "{:?}", php.node_available);
+
+    // Garbage majors are refused at dispatch — before the op lock, before
+    // any operation exists, before anything is touched.
+    let denied = engine.dispatch(Action::SetNodeVersion {
+        id: pid.clone(),
+        service: "laravel.test".into(),
+        major: "v20".into(),
+    });
+    match denied {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("not a Node major"), "{message}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert!(
+        !std::fs::read_to_string(project.join("compose.yaml")).unwrap().contains("NODE_VERSION"),
+        "refusal must leave the file alone"
+    );
+
+    // The real switch: the arg lands (existing args intact), the Dockerfile-
+    // less build then fails — a coherent file a plain rebuild makes good on.
+    let id = engine
+        .dispatch(Action::SetNodeVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            major: "20".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    while let Some(event) = events.next().await {
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+    let edited = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(edited.contains("NODE_VERSION: '20'"), "{edited}");
+    assert!(edited.contains("WWWGROUP: '${WWWGROUP}'"), "{edited}");
+
+    // The effective Node on the summary follows the override.
+    wait_until(&engine, "node override on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.as_ref().is_some_and(|php| php.node.as_deref() == Some("20")))
+    })
+    .await;
+}
+
+/// The stale `public/hot` trap: a killed Vite dev server leaves the file
+/// behind, Blade keeps rendering dev-server URLs, and `npm run build`
+/// changes nothing. Diagnostics finds it, the repair deletes it — and
+/// refuses while a live dev server owns the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_vite_hot_file_is_found_and_removed_but_a_live_one_is_respected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "hotapp");
+    std::fs::create_dir_all(project.join("public")).unwrap();
+    // A port that was just free: bind, read it, drop the listener.
+    let stale_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    std::fs::write(project.join("public/hot"), format!("http://127.0.0.1:{stale_port}"))
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.check == "vite-hot-stale")
+        .expect("stale hot file must be found");
+    assert!(finding.detail.contains("changes nothing"), "{}", finding.detail);
+    assert_eq!(finding.repair.as_ref().unwrap().id, "remove-hot-file");
+
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "remove-hot-file".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    assert!(!project.join("public/hot").exists());
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(!report.findings.iter().any(|f| f.check == "vite-hot-stale"));
+
+    // A hot file whose dev server IS listening is not stale: no finding, and
+    // the repair refuses rather than desyncing a healthy dev setup.
+    let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_port = live.local_addr().unwrap().port();
+    std::fs::write(project.join("public/hot"), format!("http://127.0.0.1:{live_port}")).unwrap();
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(!report.findings.iter().any(|f| f.check == "vite-hot-stale"));
+    let id = engine
+        .dispatch(Action::ApplyRepair {
+            repair: "remove-hot-file".into(),
+            arg: None,
+            project: Some(pid.clone()),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut failed = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { error } => {
+                failed = Some(error);
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let error = failed.expect("removing a live hot file must refuse");
+    assert!(error.contains("not stale"), "{error}");
+    assert!(project.join("public/hot").exists(), "the live file must survive");
+    drop(live);
+}
+
+/// The Xdebug doctor: an old published compose file that never passes
+/// XDEBUG_MODE is the fatal first rung; once the mode flows, a missing
+/// host-gateway mapping on Linux is an Error with a one-click compose
+/// repair through the write transaction.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn xdebug_doctor_finds_missing_wiring_and_repairs_host_gateway() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("xdbg");
+    std::fs::create_dir_all(&project).unwrap();
+    // Sail-flavored via composer.json; compose file predates Xdebug wiring.
+    std::fs::write(
+        project.join("composer.json"),
+        r#"{"require-dev": {"laravel/sail": "^1.41"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "APP_SERVICE=laravel.test\nSAIL_XDEBUG_MODE=develop,debug\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "xdebug")
+        .expect("unwired XDEBUG_MODE must be found");
+    assert!(f.title.contains("never reaches the container"), "{}", f.title);
+
+    // The mode now flows, but the file still lacks the Linux host mapping.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n    environment:\n      XDEBUG_MODE: '${SAIL_XDEBUG_MODE:-off}'\n",
+    )
+    .unwrap();
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "xdebug" && f.title.contains("client_host"))
+        .expect("missing host-gateway must be found");
+    let repair = f.repair.as_ref().unwrap();
+    assert_eq!(repair.id, "add-host-gateway");
+    assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
+
+    // Preview shows the exact insertion; apply lands it via the transaction.
+    let plan = engine
+        .repair_preview("add-host-gateway", Some("laravel.test"), Some(&pid))
+        .await
+        .unwrap();
+    let preview = plan.file_preview.expect("compose repair must show the diff");
+    assert!(preview.after.contains("host.docker.internal:host-gateway"), "{}", preview.after);
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "add-host-gateway".into(),
+            arg: Some("laravel.test".into()),
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    let edited = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(edited.contains("extra_hosts:"), "{edited}");
+    assert!(edited.contains("host.docker.internal:host-gateway"), "{edited}");
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.check == "xdebug" && f.title.contains("client_host")),
+        "{:?}",
+        report.findings
+    );
+}
+
+/// Stub drift: a pre-2023 compose file still running MailHog migrates to
+/// Mailpit in one repair — compose transaction plus the .env updates.
+#[tokio::test(flavor = "multi_thread")]
+async fn mailhog_migrates_to_mailpit_in_one_repair() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("mailapp");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n  mailhog:\n    image: 'mailhog/mailhog:latest'\n    ports:\n      - '1025:1025'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "MAIL_MAILER=smtp\nMAIL_HOST=mailhog\nMAIL_PORT=1025\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+
+    // The scan reads the resolved model; poll until the finding lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let repair = loop {
+        let report = engine.run_diagnostics().await.unwrap();
+        if let Some(f) = report.findings.iter().find(|f| f.check == "stub-drift") {
+            break f.repair.clone().expect("mailhog drift must offer the migration");
+        }
+        assert!(std::time::Instant::now() < deadline, "stub-drift never surfaced");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(repair.id, "migrate-mailpit");
+    assert_eq!(repair.arg.as_deref(), Some("mailhog"));
+
+    let plan = engine.repair_preview("migrate-mailpit", Some("mailhog"), Some(&pid)).await.unwrap();
+    let preview = plan.file_preview.expect("migration must show the file diff");
+    assert!(preview.after.contains("mailpit"), "{}", preview.after);
+    assert!(!preview.after.contains("mailhog"), "{}", preview.after);
+
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "migrate-mailpit".into(),
+            arg: Some("mailhog".into()),
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    let compose = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(compose.contains("axllent/mailpit"), "{compose}");
+    assert!(!compose.contains("mailhog"), "{compose}");
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("MAIL_HOST=mailpit"), "{env}");
+}
+
+/// `OpenUrl` powers the share dialog's Open/Dashboard buttons — and must
+/// refuse anything that is not plain http(s), since the URL travels through
+/// the generic action pipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_url_refuses_non_http_schemes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    for url in ["javascript:alert(1)", "file:///etc/passwd", "ftp://x", "http://"] {
+        let id = engine.dispatch(Action::OpenUrl { url: url.into() }).unwrap();
+        let mut events = engine.operation_events(id).unwrap();
+        let mut failed = false;
+        while let Some(event) = events.next().await {
+            match event.kind {
+                OperationEventKind::Failed { .. } => {
+                    failed = true;
+                    break;
+                }
+                OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+                _ => {}
+            }
+        }
+        assert!(failed, "{url} must be refused");
+    }
+}
+
+/// Sharing tunnels the RUNNING app; a stopped project is refused up front
+/// with the reason, not a dead tunnel.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_refuses_a_stopped_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "shareapp");
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let denied = engine.dispatch(Action::ShareProject { id: snap.projects[0].id.clone() });
+    match denied {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("start the project"), "{message}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
 }
 
 /// `docker compose config` runs without a daemon, but the CLI still has to be

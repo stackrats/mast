@@ -14,7 +14,7 @@ use mast_client::MastClient;
 use mast_client_local::LocalClient;
 use mast_contract::{
     Action, CatalogEntry, CustomServiceSpec, DiagnosticReport, DiagnosticsHistory, EngineSnapshot,
-    EnvReport, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
+    EnvReport, LaravelLogReport, PhpRuntimeReport, ProxyCa, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
 };
@@ -119,6 +119,30 @@ async fn cancel_operation(state: State<'_, AppState>, id: OperationId) -> Result
 #[specta::specta]
 async fn env_report(state: State<'_, AppState>, project: ProjectId) -> Result<EnvReport, String> {
     state.client.env_report(project).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn laravel_log(
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<LaravelLogReport, String> {
+    state.client.laravel_log(project).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn proxy_ca(state: State<'_, AppState>) -> Result<Option<ProxyCa>, String> {
+    state.client.proxy_ca().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn php_runtime(
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<PhpRuntimeReport, String> {
+    state.client.php_runtime(project).await.map_err(|e| e.to_string())
 }
 
 /// The effect-history backlog (M9): what Mast has run and written, oldest
@@ -362,6 +386,9 @@ fn specta_builder() -> tauri_specta::Builder {
             dispatch_action,
             cancel_operation,
             env_report,
+            laravel_log,
+            proxy_ca,
+            php_runtime,
             network_attach_preview,
             list_snapshots,
             snapshot_report,

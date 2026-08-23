@@ -5,6 +5,7 @@
 //! and cancellable-operation machinery carry over from M1 unchanged.
 
 pub mod captures;
+mod db_repair;
 mod diagnostics;
 mod effects;
 mod history;
@@ -13,8 +14,11 @@ mod lifecycle;
 mod lock;
 mod catalog_ops;
 mod ops;
+mod php;
 mod ports;
+mod proxy;
 mod project_ops;
+mod share;
 mod snapshot_ops;
 mod workspace_ops;
 mod redact;
@@ -128,6 +132,10 @@ pub(crate) struct ProjectEntry {
     /// Host-side port-forward declarations from `.env` (key → port), for
     /// cross-project conflict detection inside workspaces.
     pub host_ports: Vec<(String, u16)>,
+    /// Hash of the compose files' bytes when `model` was last resolved. An
+    /// in-place edit (catalog add, retag, external editor) changes content
+    /// without changing the invocation — the model must refresh then too.
+    pub compose_fingerprint: Option<u64>,
 }
 
 pub(crate) struct EngineState {
@@ -172,6 +180,9 @@ pub(crate) struct Inner {
     /// state: a capture is an event with a body, and the database — not the
     /// replay window — is its record.
     pub(crate) captures_tx: broadcast::Sender<mast_contract::LogCapture>,
+    /// Container names of share tunnels this engine is currently running —
+    /// what the orphan sweep must NOT touch.
+    pub(crate) live_shares: Mutex<HashSet<String>>,
     /// When each container was last captured, for repeat suppression.
     pub(crate) captures_seen: Mutex<HashMap<String, u64>>,
     /// Live resource usage (M11). Subscribing to this is what starts the
@@ -201,6 +212,7 @@ fn commands_to_contract(record: &ProjectRecord) -> Vec<mast_contract::ProjectCom
             name: c.name.clone(),
             command: c.command.clone(),
             auto_start: c.auto_start,
+            cwd: c.cwd.clone(),
         })
         .collect()
 }
@@ -221,6 +233,10 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         git_branch: None,
         git_dirty: None,
         app_url: None,
+        php: None,
+        share_url: None,
+        share_dashboard_url: None,
+        local_domain: record.local_domain.clone(),
     }
 }
 
@@ -278,6 +294,7 @@ impl Engine {
                     redactor: Redactor::default(),
                     app_port: None,
                     host_ports: Vec::new(),
+                    compose_fingerprint: None,
                 };
                 (entry.record.id.clone(), entry)
             })
@@ -317,6 +334,7 @@ impl Engine {
                 next_history: AtomicU64::new(0),
                 history_started: Mutex::new(HashMap::new()),
                 captures_tx,
+                live_shares: Mutex::new(HashSet::new()),
                 captures_seen: Mutex::new(HashMap::new()),
                 usage_tx,
                 usage_prev: Mutex::new(HashMap::new()),
@@ -463,6 +481,10 @@ impl Engine {
                 | Action::OpenInEditor { .. }
                 | Action::RevealInFileManager { .. }
                 | Action::OpenInBrowser { .. }
+                | Action::OpenUrl { .. }
+                | Action::OpenHostsFile
+                | Action::RevealPath { .. }
+                | Action::OpenProjectFile { .. }
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -502,6 +524,18 @@ impl Engine {
                     LifecycleVerb::Rebuild,
                     Some(service.clone()),
                 );
+            }
+            Action::SetPhpVersion { id, service, series } => {
+                return self.dispatch_php_switch(id.clone(), service.clone(), series.clone());
+            }
+            Action::SetNodeVersion { id, service, major } => {
+                return self.dispatch_node_switch(id.clone(), service.clone(), major.clone());
+            }
+            Action::ShareProject { id } => {
+                return self.dispatch_share(id.clone());
+            }
+            Action::SetLocalDomain { id, domain } => {
+                return self.dispatch_set_local_domain(id.clone(), domain.clone());
             }
             _ => {}
         }
@@ -904,6 +938,7 @@ impl Engine {
                             name: c.name.clone(),
                             command: c.command.clone(),
                             auto_start: c.auto_start,
+                            cwd: c.cwd.clone().filter(|w| !w.trim().is_empty()),
                         })
                         .collect();
                     let all = engine.with_state(|st, events| {
@@ -998,6 +1033,104 @@ impl Engine {
                         .map_err(|message| ErrorInfo::Internal { message })
                 });
             }
+            Action::OpenUrl { url } => {
+                self.spawn_operation(id, handle, async move {
+                    integrations::open_in_browser(&url)
+                        .map_err(|message| ErrorInfo::InvalidInput { message })
+                });
+            }
+            Action::OpenHostsFile => {
+                self.spawn_operation(id, handle, async move {
+                    integrations::open_path(std::path::Path::new(proxy::hosts_file_path()))
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::OpenProjectFile { id: project, file } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let root = engine.project_path(&project)?;
+                    let relative = std::path::Path::new(&file);
+                    let escapes = relative.is_absolute()
+                        || relative
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir));
+                    if escapes {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!("{file} is not a path inside the project"),
+                        });
+                    }
+                    let target = root.join(relative);
+                    if !target.is_file() {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!("{} does not exist", target.display()),
+                        });
+                    }
+                    let editor = engine.inner.state.lock().unwrap().integrations.editor.clone();
+                    integrations::open_editor(editor.as_deref(), &target)
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::RevealPath { path } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let candidate = PathBuf::from(&path);
+                    let known = {
+                        let st = engine.inner.state.lock().unwrap();
+                        st.watched_directories.contains(&candidate)
+                            || st.projects.values().any(|e| e.record.path == candidate)
+                    };
+                    if !known {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!(
+                                "{path} is not a watched directory or project — nothing to open"
+                            ),
+                        });
+                    }
+                    integrations::open_path(&candidate)
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::ClearLaravelLog { id: project } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    let path = {
+                        let st = engine.inner.state.lock().unwrap();
+                        st.projects
+                            .get(&project.0)
+                            .ok_or(ErrorInfo::NotFound {
+                                what: format!("project {}", project.0),
+                            })?
+                            .record
+                            .path
+                            .join("storage/logs/laravel.log")
+                    };
+                    let cleared = tokio::task::spawn_blocking(move || {
+                        if !path.is_file() {
+                            return Ok(false);
+                        }
+                        // Truncate in place: running PHP workers keep their
+                        // open handle and append to the same (now empty) file.
+                        std::fs::write(&path, "").map(|()| true)
+                    })
+                    .await
+                    .map_err(internal_err)?
+                    .map_err(internal_err)?;
+                    engine.emit_op(
+                        &h,
+                        id,
+                        OperationEventKind::Output {
+                            line: if cleared {
+                                "laravel.log cleared".into()
+                            } else {
+                                "no laravel.log to clear".into()
+                            },
+                            stderr: false,
+                        },
+                    );
+                    Ok(())
+                });
+            }
             Action::SetEnvVar { id: project, key: env_key, value } => {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
@@ -1067,7 +1200,11 @@ impl Engine {
             | Action::StartService { .. }
             | Action::StopService { .. }
             | Action::RestartService { .. }
-            | Action::RebuildService { .. } => unreachable!("handled above"),
+            | Action::RebuildService { .. }
+            | Action::SetPhpVersion { .. }
+            | Action::SetNodeVersion { .. }
+            | Action::ShareProject { .. }
+            | Action::SetLocalDomain { .. } => unreachable!("handled above"),
         }
         Ok(id)
     }

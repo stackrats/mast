@@ -6,7 +6,7 @@
 
 use futures::stream::BoxStream;
 use mast_contract::{
-    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport,
+    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport, PhpRuntimeReport, ProxyCa,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
@@ -62,6 +62,20 @@ pub trait MastClient: Send + Sync {
     /// Env editor payload (entries, example diff, validation findings). On
     /// demand only — values may be secrets and stay out of the patch store.
     async fn env_report(&self, project: ProjectId) -> Result<EnvReport, ClientError>;
+
+    /// The tail of `storage/logs/laravel.log`, parsed and grouped (newest
+    /// first). On demand only — log bodies routinely carry user data.
+    async fn laravel_log(&self, project: ProjectId) -> Result<LaravelLogReport, ClientError>;
+
+    /// The PHP runtime as it actually is — extensions and common ini
+    /// limits from the running app container, plus where the vendored
+    /// runtime keeps the files that change them.
+    async fn php_runtime(&self, project: ProjectId) -> Result<PhpRuntimeReport, ClientError>;
+
+    /// The local HTTPS proxy's root certificate, exported for manual trust
+    /// (Firefox import, `curl --cacert`); None until a domain has been
+    /// enabled and the proxy has minted its CA.
+    async fn proxy_ca(&self) -> Result<Option<ProxyCa>, ClientError>;
 
     /// Recent effect history, oldest first: every command Mast spawned and
     /// every config file it wrote, with outcomes.

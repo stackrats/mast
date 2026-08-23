@@ -278,6 +278,13 @@ pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> 
 
 /// The target is a project directory, and both openers show a directory in
 /// the file manager (Finder, Nautilus, …) rather than opening its contents.
+/// Open a file with the desktop's default application (xdg-open/open) —
+/// the manual fallback for files Mast must not edit itself (/etc/hosts).
+pub fn open_path(path: &Path) -> Result<(), String> {
+    spawn_detached(&[OPENER.into(), path.to_string_lossy().into_owned()], None)
+        .map_err(|e| e.to_string())
+}
+
 pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     spawn_detached(&[OPENER.into(), path.to_string_lossy().into_owned()], None)
         .map_err(|e| e.to_string())

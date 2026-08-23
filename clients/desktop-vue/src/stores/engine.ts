@@ -13,6 +13,7 @@ import type {
   OperationId,
   ProjectId,
   ProjectSummary,
+  RepairOffer,
   UsageSample,
   WorkspaceSummary,
 } from "../bindings";
@@ -72,6 +73,12 @@ export interface OperationView {
   lines: { line: string; stderr: boolean }[];
   terminal: "completed" | "failed" | "cancelled" | null;
   error: string | null;
+  /** A one-click repair the engine matched to this operation's failure —
+   * rendered as a Fix button whose preview says what will change. */
+  /** Repairs the engine matched to this operation (a failure signature, or
+   * follow-up system steps a feature must not do silently) — each renders
+   * as its own Fix button. */
+  fixes: { repair: RepairOffer; project: ProjectId }[];
 }
 
 export interface LogView {
@@ -94,6 +101,19 @@ let nextActivity = 0;
 /** Operations-map key for a user-defined project command (M7.5). */
 export function commandKey(project: string, name: string): string {
   return `${project}:cmd:${name}`;
+}
+
+/** Share-tunnel operations get their own op slot: the tunnel runs
+ * indefinitely, and parking it on the project key would block the lifecycle
+ * buttons (and their Cancel semantics) the whole time. */
+export function shareKey(project: string): string {
+  return `${project}:share`;
+}
+
+/** Local-domain (HTTPS proxy) operations get their own slot for the same
+ * reason as shares: they must not block the lifecycle buttons. */
+export function domainKey(project: string): string {
+  return `${project}:domain`;
 }
 
 /** Operations-map key for a project being scaffolded — it has no id yet. */
@@ -448,7 +468,15 @@ export const useEngineStore = defineStore("engine", {
       const token = ++nextToken;
       // Registered BEFORE dispatch: channel events can beat the invoke reply.
       // Always re-read through the store (reactive proxy) and match by token.
-      this.operations[project] = { token, id: -1, label, lines: [], terminal: null, error: null };
+      this.operations[project] = {
+        token,
+        id: -1,
+        label,
+        lines: [],
+        terminal: null,
+        error: null,
+        fixes: [],
+      };
       // The panel is the user's to open. It used to force itself open on every
       // operation, which stole vertical space mid-task and undid a deliberate
       // close; output still accumulates while it is shut.
@@ -478,6 +506,14 @@ export const useEngineStore = defineStore("engine", {
                 false,
               );
               break;
+            case "fixAvailable": {
+              const repair = event.kind.repair;
+              // Re-emissions of the same repair (retries) collapse to one button.
+              if (!op.fixes.some((f) => f.repair.id === repair.id && f.repair.arg === repair.arg)) {
+                op.fixes.push({ repair, project: event.kind.project });
+              }
+              break;
+            }
             case "failed":
               op.terminal = "failed";
               op.error = event.kind.error;

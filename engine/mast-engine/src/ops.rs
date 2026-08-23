@@ -20,6 +20,13 @@ pub(crate) struct OpHandle {
     /// Full history so late subscribers replay from the first event.
     pub(crate) events: Mutex<Vec<OperationEvent>>,
     pub(crate) events_tx: broadcast::Sender<(usize, OperationEvent)>,
+    /// Error signatures spotted in this operation's output (first-seen
+    /// order, deduped), with the line that matched — some signatures carry
+    /// their repair argument in it (the missing network's name). A failing
+    /// operation ends with their explanations, so the known failure waves —
+    /// GPG outages, port squatters, version-locked volumes — read as
+    /// sentences instead of scrollback.
+    pub(crate) signatures: Mutex<Vec<(&'static mast_diagnostics::ErrorSignature, String)>>,
 }
 
 impl Engine {
@@ -30,12 +37,21 @@ impl Engine {
             cancel: CancellationToken::new(),
             events: Mutex::new(Vec::new()),
             events_tx,
+            signatures: Mutex::new(Vec::new()),
         });
         self.inner.ops.lock().unwrap().insert(id.0, handle.clone());
         (id, handle)
     }
 
     pub(crate) fn emit_op(&self, handle: &OpHandle, id: OperationId, kind: OperationEventKind) {
+        if let OperationEventKind::Output { line, .. } = &kind
+            && let Some(sig) = mast_diagnostics::classify_line(line)
+        {
+            let mut seen = handle.signatures.lock().unwrap();
+            if !seen.iter().any(|(s, _)| s.id == sig.id) {
+                seen.push((sig, line.clone()));
+            }
+        }
         let event = OperationEvent { operation: id, kind };
         // Push + broadcast under the history lock so index order is total.
         let mut events = handle.events.lock().unwrap();
@@ -54,6 +70,7 @@ impl Engine {
     {
         let engine = self.clone();
         let context = self.inner.op_contexts.lock().unwrap().remove(&id.0);
+        let project = context.as_ref().and_then(|c| c.project.clone());
         tokio::spawn(async move {
             engine.emit_op(&handle, id, OperationEventKind::Started);
             let work = async move {
@@ -71,10 +88,55 @@ impl Engine {
                     engine.emit_op(&handle, id, OperationEventKind::Cancelled)
                 }
                 Err(e) => {
+                    engine.flush_signature_explanations(&handle, id, project.as_ref());
                     engine.emit_op(&handle, id, OperationEventKind::Failed { error: e.to_string() })
                 }
             }
         });
+    }
+
+    /// Emit the explanations owed for this operation's matched error
+    /// signatures (see [`Self::emit_op`]) — called just before a Failed
+    /// terminal event, from every path that emits one. When a signature maps
+    /// to a repair and the operation belongs to a project, a FixAvailable
+    /// event follows, powering the failure's Fix button (the repair's
+    /// preview spells out exactly what would change before anything does).
+    pub(crate) fn flush_signature_explanations(
+        &self,
+        handle: &OpHandle,
+        id: OperationId,
+        project: Option<&mast_contract::ProjectId>,
+    ) {
+        let matched: Vec<_> =
+            handle.signatures.lock().unwrap().iter().take(3).cloned().collect();
+        for (sig, line) in matched {
+            self.emit_op(
+                handle,
+                id,
+                OperationEventKind::Output {
+                    line: format!("likely cause: {}", sig.explanation),
+                    stderr: false,
+                },
+            );
+            self.emit_op(
+                handle,
+                id,
+                OperationEventKind::Output { line: format!("  fix: {}", sig.advice), stderr: false },
+            );
+            if let (Some(project), Some(repair)) = (project, sig.repair) {
+                let arg = mast_diagnostics::signatures::extract_repair_arg(sig, &line);
+                if let Some(spec) = mast_diagnostics::repair_spec(repair, arg.as_deref()) {
+                    self.emit_op(
+                        handle,
+                        id,
+                        OperationEventKind::FixAvailable {
+                            repair: crate::diagnostics::offer_to_contract(spec),
+                            project: project.clone(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Progress/cancellation exerciser; touches no state.
@@ -178,6 +240,23 @@ impl Engine {
         redactor: &Redactor,
         timeout: Duration,
     ) -> Result<(), ErrorInfo> {
+        self.run_streamed_command_env(handle, op, argv, cwd, &[], redactor, timeout).await
+    }
+
+    /// [`Self::run_streamed_command`] with an env overlay on the child —
+    /// for invocations that need e.g. `SAIL_SKIP_CHECKS=1` without putting
+    /// it on the argv.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_streamed_command_env(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env_overlay: &[(String, String)],
+        redactor: &Redactor,
+        timeout: Duration,
+    ) -> Result<(), ErrorInfo> {
         let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
         let forwarder = {
             let engine = self.clone();
@@ -199,7 +278,7 @@ impl Engine {
         let result = mast_docker::run_streaming(
             argv,
             cwd,
-            &[],
+            env_overlay,
             line_tx,
             handle.cancel.clone(),
             timeout,

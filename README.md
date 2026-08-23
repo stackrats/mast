@@ -39,11 +39,16 @@ Mast gives your existing Sail projects a single control center.
 - See every project and its current state at a glance.
 - Start complete development workspaces in dependency order.
 - Start, stop, and restart individual projects or services.
+- Serve every project at a trusted `https://myapp.test` address — no more port juggling.
 - View live logs without hunting through terminal tabs.
 - Keep a container's last words when it dies, so the reason outlives the restart.
+- Read the application log parsed — each error with its stack trace as one entry.
 - See what each project costs in CPU and memory, and what to stop.
 - Run Horizon, Reverb, queue workers, and project commands automatically.
-- Diagnose and repair common local environment problems.
+- Diagnose and repair common local environment problems, with Fix buttons on failures.
+- Share your running app at a temporary public URL — QR code included.
+- Switch PHP and Node versions as single, verified operations.
+- Copy database credentials and open service dashboards straight from their chips.
 - Manage services and environment variables without leaving Mast.
 
 ### Mast doesn't replace Sail
@@ -135,6 +140,8 @@ Start, stop, or restart an entire project or an individual service.
 
 Mast reads the real Docker state rather than maintaining a separate idea of what should be running.
 
+A service's chip also knows what the service is for. Mailpit, Meilisearch, or the MinIO console open in your browser from the chip — on whatever port they actually publish, so nobody memorises that Mailpit lives on 8025. A database chip offers **Connection info**: host, port, database, username, and password read fresh from `.env`, each with a copy button, plus a ready-made connection URL for TablePlus or DBeaver.
+
 ### Workspaces
 
 Group related projects into workspaces and start them together.
@@ -160,6 +167,32 @@ Mast can automatically start:
 
 These processes remain attached to the project they belong to rather than disappearing into another terminal window.
 
+Saved commands can also run somewhere else: give one a working directory like `../frontend` and your separate frontend's dev server lives on the same card — streamed, stoppable, and startable together with the backend it belongs to.
+
+---
+
+## Share your site publicly
+
+`sail share`, as a button. Publish the running app at a temporary public URL, scan the QR code to open it on your phone, and keep the tunnel's own output in view — the place where share problems actually explain themselves.
+
+Mast shows exactly what will be shared before anything starts, warns when a Vite dev server would break the shared page's assets, picks a free dashboard port instead of dying on a busy one, and reliably stops the tunnel when you do.
+
+<img src="docs/media/share.png" alt="Share dialog with the public URL, a QR code, Open and Dashboard buttons, and the tunnel output" width="710">
+
+---
+
+## Trusted HTTPS at https://myapp.test
+
+Stop typing `localhost:8082`. Give a project a `.test` domain and Mast serves it over HTTPS through one shared local proxy — with a certificate your browser trusts, from an authority that exists only on your machine.
+
+That unlocks the parts of development that plain `http://localhost` quietly breaks: secure cookies, service workers, camera and clipboard APIs, and OAuth callbacks that insist on HTTPS. The address also never changes when ports move.
+
+Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before an elevation prompt runs it.
+
+Prefer doing it yourself? The dialog shows the exact hosts line and the certificate — path and PEM, each copyable — with a button that opens your hosts file.
+
+<img src="docs/media/https.png" alt="Local HTTPS dialog with storefront.test enabled, the proxy's output, and Fix buttons for the /etc/hosts entry and certificate trust" width="460">
+
 ---
 
 ## Logs & captures
@@ -178,6 +211,10 @@ So Mast keeps the last minute of a container's output whenever it goes down:
 Captures are written to disk, so they survive both the container being replaced and Mast being restarted. Each one records why it was taken, and is listed newest first with a copy button.
 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
+
+And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab. When the history outlives its usefulness, one button clears the file in place.
+
+<img src="docs/media/app-log.png" alt="Application log dialog with level badges and an expanded SQL error showing its grouped stack trace" width="704">
 
 <img src="docs/media/captures.png" alt="Captures tab listing three containers that went down, the newest expanded to show its final log lines" width="900">
 
@@ -221,6 +258,17 @@ Mast checks for common problems and presents each finding with a guided repair.
 
 Every repair has a risk tier and a preview of what Mast intends to change before anything is written.
 
+The checks go after the problems that actually eat afternoons:
+
+- Database says _Access denied_ after you changed `.env`? Mast fixes the live server without touching your data.
+- Bumped a database version its data can't follow? Mast refuses the change that would crash-loop, and explains the safe path.
+- Edited `.env` and nothing happened? Mast points at the cached config, or the exact containers that need recreating.
+- Breakpoints never hit? The Xdebug check names which link in the chain is broken — one of them is a one-click fix.
+- Pages suddenly have no CSS and rebuilding changes nothing? A leftover Vite dev-server file, deleted in one click.
+- Still on MailHog, or files in `storage/` owned by root? One step each.
+
+And when an operation fails, Mast reads the output for known failure shapes and says what likely went wrong and how to fix it — where a repair applies, the failure carries its own **Fix** button, previewed before anything changes.
+
 <img src="docs/media/diagnostics.png" alt="Diagnostics dialog listing errors with repair actions" width="900">
 
 ---
@@ -232,6 +280,18 @@ Add common development services without manually rebuilding Compose configuratio
 Mast matches services against your existing Compose file and can expose available registry versions where applicable.
 
 <img src="docs/media/services.png" alt="Services catalog showing installed and available services with version selectors" width="900">
+
+---
+
+## Switch PHP and Node versions
+
+Pick another PHP runtime from the project's Runtimes row and Mast runs the whole switch as one operation: the build context and the `sail-X.Y/app` image tag move together, the image rebuilds without cache, the container is recreated if it was running — and `php -v` inside the container has the last word.
+
+Node gets the same treatment: pick a major, Mast pins the build argument, rebuilds, and `node -v` confirms it.
+
+A version that can't work is refused up front, naming the ones that can.
+
+The PHP chip also answers what the runtime actually is: the classic limits (`memory_limit`, upload sizes, execution time) and every loaded extension, read live from the running container. Buttons open the runtime's `php.ini` or `Dockerfile` in your editor, and **Rebuild to apply** makes the edit real — no hunting for which file feeds the image.
 
 ---
 
