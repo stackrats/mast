@@ -8,7 +8,7 @@ use crate::{
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
     REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -656,6 +656,207 @@ fn image_stem_matches(image: &str, stem: &str) -> bool {
         _ => image,
     };
     name == stem || name.ends_with(&format!("/{stem}"))
+}
+
+/// Two projects sharing an identity: the same built image tag (every Sail
+/// app builds `sail-X.Y/app`, so builds overwrite each other — the theme
+/// where users defect to DDEV) or the same compose project name (containers
+/// and volumes collide outright).
+struct IdentityCollision;
+impl Check for IdentityCollision {
+    fn id(&self) -> &'static str {
+        "identity-collision"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.len() > 1
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        // Shared compose project names: catastrophic, containers merge.
+        let mut by_name: std::collections::BTreeMap<&str, Vec<&ProjectFacts>> = Default::default();
+        for p in &ctx.projects {
+            if let Some(name) = p.compose_name.as_deref() {
+                by_name.entry(name).or_default().push(p);
+            }
+        }
+        for (name, projects) in by_name {
+            if projects.len() > 1 {
+                let list =
+                    projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+                findings.push(finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("Compose project name \"{name}\" is shared"),
+                    format!(
+                        "{list} all resolve to the same compose project, so their \
+                         containers, networks and volumes collide — starting one adopts \
+                         or destroys the other's. Pin COMPOSE_PROJECT_NAME in each \
+                         project's .env."
+                    ),
+                ));
+            }
+        }
+        // Shared Sail image tags: whichever builds last wins.
+        let mut by_image: std::collections::BTreeMap<&str, Vec<&ProjectFacts>> = Default::default();
+        for p in &ctx.projects {
+            for (_, image) in &p.service_images {
+                if image.starts_with("sail-") && image.contains("/app") {
+                    by_image.entry(image.as_str()).or_default().push(p);
+                }
+            }
+        }
+        for (image, mut projects) in by_image {
+            projects.dedup_by(|a, b| a.id == b.id);
+            if projects.len() > 1 {
+                let list =
+                    projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+                findings.push(finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("Image \"{image}\" is built by more than one project"),
+                    format!(
+                        "{list} all build and run \"{image}\" — every build overwrites \
+                         the others' image (laravel/sail#649), which breaks projects with \
+                         customized runtimes. Give each project its own tag by editing \
+                         `image:` (e.g. \"myapp-8.4/app\")."
+                    ),
+                ));
+            }
+        }
+        findings
+    }
+}
+
+/// A compose project name derived from a directory whose basename carries
+/// characters compose versions keep tripping over (dots, spaces — the
+/// "Invalid name; only [a-zA-Z0-9_-]" wave, laravel/sail#481/#786).
+struct ProjectNameShape;
+impl Check for ProjectNameShape {
+    fn id(&self) -> &'static str {
+        "project-name"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.name_from_dir)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| {
+                p.name_from_dir
+                    && !p.dir_basename.is_empty()
+                    && !p
+                        .dir_basename
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .map(|p| {
+                let suggested = normalize_project_name(&p.dir_basename);
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: the directory name decides the compose project name", p.name),
+                    format!(
+                        "\"{}\" contains characters some Docker/compose releases reject \
+                         (\"Invalid name; only [a-zA-Z0-9_-] are allowed\") or normalize \
+                         differently across versions, silently changing which containers \
+                         belong to this project. Pin it explicitly.",
+                        p.dir_basename
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_SET_PROJECT_NAME, Some(&suggested));
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// Duplicate of `mast_compose::normalize_project_name` (this crate carries
+/// no compose dependency): lowercase, strip anything outside [a-z0-9_-],
+/// trim leading separators.
+fn normalize_project_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_')
+        .collect();
+    let trimmed = cleaned.trim_start_matches(['-', '_']).to_string();
+    if trimmed.is_empty() { "app".to_string() } else { trimmed }
+}
+
+/// PHP_CLI_SERVER_WORKERS is silently ignored under Sail since Laravel
+/// 11.45 (framework #56922): `serve` drops it when LARAVEL_SAIL is set, the
+/// dev server runs single-worker, and any request the app makes to itself
+/// deadlocks with no error anywhere.
+struct CliServerWorkers;
+impl Check for CliServerWorkers {
+    fn id(&self) -> &'static str {
+        "cli-server-workers"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.sail_flavored && p.cli_server_workers)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.sail_flavored && p.cli_server_workers)
+            .map(|p| {
+                for_project(
+                    finding(
+                        self.id(),
+                        Severity::Warning,
+                        format!("{}: PHP_CLI_SERVER_WORKERS does nothing under Sail", p.name),
+                        "Since Laravel 11.45 the serve path ignores this variable when \
+                         LARAVEL_SAIL is set (framework #56922), so the dev server runs a \
+                         single worker — an HTTP request the app makes to itself deadlocks \
+                         silently. Expect one worker, or serve through Octane.",
+                    ),
+                    p,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Redis-backed app whose container has no phpredis extension — every redis
+/// call throws "Please make sure the PHP Redis extension is installed"
+/// (laravel/sail#302). Laravel defaults REDIS_CLIENT to phpredis, so unset
+/// counts as phpredis.
+struct RedisExtension;
+impl Check for RedisExtension {
+    fn id(&self) -> &'static str {
+        "redis-extension"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.php_modules.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| {
+                let Some(modules) = &p.php_modules else { return false };
+                let wants_phpredis =
+                    p.redis_client.as_deref().is_none_or(|client| client == "phpredis");
+                let has_redis_service = p.service_images.iter().any(|(_, image)| {
+                    image_stem_matches(image, "redis") || image_stem_matches(image, "valkey/valkey")
+                });
+                wants_phpredis && has_redis_service && !modules.iter().any(|m| m == "redis")
+            })
+            .map(|p| {
+                for_project(
+                    finding(
+                        self.id(),
+                        Severity::Error,
+                        format!("{}: the app container has no phpredis extension", p.name),
+                        "Redis calls will throw \"Please make sure the PHP Redis extension \
+                         is installed\". Rebuild the app image without cache; if it \
+                         persists, set REDIS_CLIENT=predis and `composer require \
+                         predis/predis` instead.",
+                    ),
+                    p,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Stub rot: services still running what Sail shipped years ago and has
@@ -1372,6 +1573,10 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(DockerDesktopLinux),
         Box::new(Xdebug),
         Box::new(StubDrift),
+        Box::new(IdentityCollision),
+        Box::new(ProjectNameShape),
+        Box::new(CliServerWorkers),
+        Box::new(RedisExtension),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1457,6 +1662,13 @@ mod tests {
             env_crlf: false,
             xdebug: None,
             service_images: Vec::new(),
+            compose_name: Some(id.into()),
+            dir_basename: id.into(),
+            name_from_dir: false,
+            php_modules: None,
+            cli_server_workers: false,
+            redis_client: None,
+            app_service: "laravel.test".into(),
         }
     }
 
@@ -1675,6 +1887,95 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn identity_collisions_split_fatal_names_from_image_overwrites() {
+        let mut a = sail_project("a");
+        a.service_images = vec![("laravel.test".into(), "sail-8.4/app".into())];
+        let mut b = sail_project("b");
+        b.service_images = vec![("laravel.test".into(), "sail-8.4/app".into())];
+        let (_, findings) = run_all(&ctx(vec![a, b]));
+        let image = findings
+            .iter()
+            .find(|f| f.check == "identity-collision" && f.severity == Severity::Warning)
+            .unwrap();
+        assert!(image.title.contains("sail-8.4/app"), "{}", image.title);
+        assert!(image.detail.contains("a, b"), "{}", image.detail);
+
+        // Same compose name: the fatal variant.
+        let mut a = sail_project("a");
+        a.compose_name = Some("shop".into());
+        let mut b = sail_project("b");
+        b.compose_name = Some("shop".into());
+        let (_, findings) = run_all(&ctx(vec![a, b]));
+        let name = findings
+            .iter()
+            .find(|f| f.check == "identity-collision" && f.severity == Severity::Error)
+            .unwrap();
+        assert!(name.detail.contains("COMPOSE_PROJECT_NAME"), "{}", name.detail);
+
+        // Distinct everything: silence.
+        let (_, findings) = run_all(&ctx(vec![sail_project("a"), sail_project("b")]));
+        assert!(!findings.iter().any(|f| f.check == "identity-collision"));
+    }
+
+    #[test]
+    fn awkward_directory_names_offer_the_pinning_repair() {
+        let mut p = sail_project("a");
+        p.name_from_dir = true;
+        p.dir_basename = "My.Shop App".into();
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "project-name").unwrap();
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_SET_PROJECT_NAME);
+        assert_eq!(repair.arg.as_deref(), Some("myshopapp"));
+
+        // An explicitly named project is nobody's business.
+        let mut p = sail_project("a");
+        p.name_from_dir = false;
+        p.dir_basename = "My.Shop App".into();
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(!findings.iter().any(|f| f.check == "project-name"));
+        // A clean basename is fine too.
+        let mut p = sail_project("a");
+        p.name_from_dir = true;
+        p.dir_basename = "my-shop".into();
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(!findings.iter().any(|f| f.check == "project-name"));
+    }
+
+    #[test]
+    fn cli_server_workers_and_redis_extension_checks() {
+        let mut p = sail_project("a");
+        p.cli_server_workers = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check == "cli-server-workers" && f.detail.contains("#56922"))
+        );
+
+        // Redis service + phpredis default + no extension in the container.
+        let mut p = sail_project("a");
+        p.service_images = vec![("redis".into(), "redis:alpine".into())];
+        p.php_modules = Some(vec!["curl".into(), "pdo_mysql".into()]);
+        let (_, findings) = run_all(&ctx(vec![p.clone()]));
+        assert!(findings.iter().any(|f| f.check == "redis-extension"));
+
+        // predis chosen, extension loaded, or no redis service: silence.
+        let mut q = p.clone();
+        q.redis_client = Some("predis".into());
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "redis-extension"));
+        let mut q = p.clone();
+        q.php_modules = Some(vec!["redis".into()]);
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "redis-extension"));
+        let mut q = p.clone();
+        q.service_images = vec![("mysql".into(), "mysql:8.4".into())];
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "redis-extension"));
     }
 
     #[test]

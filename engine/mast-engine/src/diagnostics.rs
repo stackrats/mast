@@ -17,7 +17,7 @@ use mast_diagnostics::{
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
-    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -190,6 +190,9 @@ struct ProjectSeed {
     resolution_error: Option<String>,
     /// (service name, aliases) from the resolved model.
     services: Vec<(String, Vec<String>)>,
+    /// The compose project name comes only from the directory basename —
+    /// nothing pins it (-p, env, .env, name:).
+    name_from_dir: bool,
     host_ports: Vec<(String, u16)>,
     external_networks: Vec<String>,
     running: bool,
@@ -278,6 +281,22 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             None
         },
         drifted_services: Vec::new(),
+        compose_name: None, // filled from the resolved model in gather
+        dir_basename: seed
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        name_from_dir: seed.name_from_dir,
+        php_modules: None, // filled by the gather probe
+        cli_server_workers: env
+            .get("PHP_CLI_SERVER_WORKERS")
+            .is_some_and(|v| !v.trim().is_empty()),
+        redis_client: env.get("REDIS_CLIENT").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+        app_service: env
+            .get("APP_SERVICE")
+            .cloned()
+            .unwrap_or_else(|| "laravel.test".to_string()),
         vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
             .ok()
             .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
@@ -488,6 +507,10 @@ impl Engine {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    name_from_dir: e
+                        .invocation
+                        .as_ref()
+                        .is_none_or(|i| i.name_source == mast_compose::NameSource::DirBasename),
                     host_ports: e.host_ports.clone(),
                     external_networks: e
                         .model
@@ -617,6 +640,7 @@ impl Engine {
                     .iter()
                     .map(|(service, image, _)| (service.clone(), image.clone()))
                     .collect();
+                facts.compose_name = Some(meta.compose_name.clone());
             }
         }
 
@@ -631,17 +655,28 @@ impl Engine {
                 let Some(invocation) = invocations.get(&facts.id) else { continue };
                 facts.db = crate::db_repair::probe_db(invocation, &target).await;
             }
-            // Xdebug extension probe: one `php -m` per running project that
-            // requests an Xdebug mode.
+            // Extension probe: one `php -m` per running project that needs
+            // it — an Xdebug mode is requested, or a redis service exists
+            // with phpredis expected. Feeds both checks from one exec.
             for (facts, _) in &mut inspected {
                 if !facts.running {
                     continue;
                 }
                 let Some(invocation) = invocations.get(&facts.id) else { continue };
-                let Some(xdebug) = facts.xdebug.as_mut() else { continue };
+                let wants_redis_check = facts
+                    .redis_client
+                    .as_deref()
+                    .is_none_or(|client| client == "phpredis")
+                    && facts.service_images.iter().any(|(_, image)| {
+                        image.contains("redis") || image.contains("valkey")
+                    });
+                if facts.xdebug.is_none() && !wants_redis_check {
+                    continue;
+                }
+                let app_service = facts.app_service.clone();
                 let argv = crate::db_repair::exec_env_argv(
                     invocation,
-                    &xdebug.app_service,
+                    &app_service,
                     &[],
                     &["php".into(), "-m".into()],
                 );
@@ -650,9 +685,18 @@ impl Engine {
                         .await
                     && out.success()
                 {
-                    xdebug.extension_loaded = Some(
-                        out.stdout.lines().any(|l| l.trim().eq_ignore_ascii_case("xdebug")),
+                    facts.php_modules = Some(
+                        out.stdout
+                            .lines()
+                            .map(|l| l.trim().to_ascii_lowercase())
+                            .filter(|l| !l.is_empty() && !l.starts_with('['))
+                            .collect(),
                     );
+                }
+                if let (Some(modules), Some(xdebug)) =
+                    (facts.php_modules.clone(), facts.xdebug.as_mut())
+                {
+                    xdebug.extension_loaded = Some(modules.iter().any(|m| m == "xdebug"));
                 }
             }
             // Volume-vs-image version scan — deliberately including stopped
@@ -1048,6 +1092,51 @@ impl Engine {
                         (false, None) => vec!["neither storage/ nor bootstrap/cache exists".into()],
                     };
                     Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_SET_PROJECT_NAME => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let name = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "set-project-name needs the name to pin".into(),
+                    })?
+                    .to_string();
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let before = std::fs::read_to_string(&env_path).map_err(|_| {
+                        ErrorInfo::InvalidInput { message: "no .env file — create one first".into() }
+                    })?;
+                    let mut file = mast_laravel::EnvFile::parse(&before);
+                    let no_op = file
+                        .get("COMPOSE_PROJECT_NAME")
+                        .is_some_and(|e| e.value.trim() == name);
+                    let summary = if no_op {
+                        vec![format!("COMPOSE_PROJECT_NAME is already {name} — nothing to do")]
+                    } else {
+                        file.set("COMPOSE_PROJECT_NAME", &name)
+                            .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                        vec![
+                            format!("set COMPOSE_PROJECT_NAME={name} in .env"),
+                            "apply while the project is STOPPED — the new name is a new \
+                             compose identity; old containers/volumes stay under the old \
+                             name"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            after: file.to_string(),
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
                 })
                 .await
                 .map_err(crate::internal_err)?
@@ -1458,6 +1547,37 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_SET_PROJECT_NAME => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let name = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "set-project-name needs the name to pin".into(),
+                    })?
+                    .to_string();
+                let backups = self.inner.deps.store.backups_dir();
+                let display = name.clone();
+                tokio::task::spawn_blocking(move || {
+                    mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                        f.set("COMPOSE_PROJECT_NAME", &name)
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::env_write_error)?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "COMPOSE_PROJECT_NAME={display} pinned — takes effect on the \
+                             next start (old containers/volumes keep the old name)"
+                        ),
                         stderr: false,
                     },
                 );

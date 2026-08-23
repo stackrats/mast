@@ -145,6 +145,19 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         repair: None,
     },
     ErrorSignature {
+        id: "host-dns-split-brain",
+        needles: &[
+            "php_network_getaddresses: getaddrinfo",
+            "could not translate host name",
+        ],
+        explanation: "a process on the HOST is using container hostnames (DB_HOST=mysql \
+                      only resolves inside the compose network) — typically artisan run \
+                      outside sail, an IDE plugin, or host cron",
+        advice: "run it through sail (`sail artisan …`), or point host-side tools at \
+                 127.0.0.1 with the FORWARD_*_PORT ports",
+        repair: None,
+    },
+    ErrorSignature {
         id: "env-var-missing",
         needles: &["required variable", "is missing a value"],
         explanation: "the compose file requires an environment variable that neither \
@@ -184,6 +197,8 @@ mod tests {
             ("FATAL:  database files are incompatible with server", "db-version-mismatch"),
             ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "docker-daemon-down"),
             ("error while interpolating services.app.image: required variable MISSING is missing a value", "env-var-missing"),
+            ("SQLSTATE[HY000] [2002] php_network_getaddresses: getaddrinfo for mysql failed", "host-dns-split-brain"),
+            ("could not translate host name \"pgsql\" to address", "host-dns-split-brain"),
         ];
         for (line, expected) in cases {
             let sig = classify_line(line).unwrap_or_else(|| panic!("unclassified: {line}"));
