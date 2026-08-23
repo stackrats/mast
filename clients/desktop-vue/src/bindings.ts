@@ -401,6 +401,15 @@ export type Action =
  */
 { type: "shareProject"; id: ProjectId } | 
 /**
+ * Claim (or clear, with `domain: None`) a stable `https://…test`
+ * address for this project. Mast keeps one shared Caddy container
+ * (`mast-proxy`, ports 80/443) whose internal CA signs the
+ * certificate; the two host-side steps it cannot do silently — the
+ * `/etc/hosts` line and trusting that CA — surface as high-risk Fix
+ * buttons on the operation.
+ */
+{ type: "setLocalDomain"; id: ProjectId; domain: string | null } | 
+/**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
  * sail:install --php=…` — each run in the official composer image inside
@@ -805,6 +814,11 @@ shareUrl?: string | null;
  * auto-moved off a busy port); None while not sharing.
  */
 shareDashboardUrl?: string | null; 
+/**
+ * Stable local HTTPS address ([`Action::SetLocalDomain`]) served by the
+ * shared `mast-proxy` Caddy container; None when not claimed.
+ */
+localDomain?: string | null; 
 /**
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …

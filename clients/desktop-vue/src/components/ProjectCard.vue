@@ -10,6 +10,7 @@ import {
   Database,
   FileCog,
   Globe,
+  Lock,
   Plus,
   FolderOpen,
   GitBranch,
@@ -40,7 +41,7 @@ import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } 
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
 import { envReport } from "../lib/transport";
-import { commandKey, shareKey, useEngineStore } from "../stores/engine";
+import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
 import Badge from "./ui/Badge.vue";
@@ -192,6 +193,35 @@ function startShare() {
 function stopShare() {
   void store.cancelLifecycle(shareKey(project.id));
 }
+// --- local HTTPS domain: one shared Caddy proxy serves every claimed
+// .test address with a locally-trusted certificate; the operation's own
+// output and follow-up Fix buttons live in this dialog ---
+const httpsOpen = ref(false);
+const domainOp = computed(() => store.operations[domainKey(project.id)]);
+const domainBusy = computed(() => domainOp.value != null && domainOp.value.terminal === null);
+const domainDraft = ref("");
+watch(httpsOpen, (open) => {
+  if (!open) return;
+  const slug =
+    project.name
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "app";
+  domainDraft.value = project.localDomain ?? `${slug}.test`;
+});
+const domainValid = computed(() =>
+  /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.(test|localhost)$/.test(
+    domainDraft.value.trim().toLowerCase(),
+  ),
+);
+function setDomain(domain: string | null) {
+  void store.runLifecycle(
+    domainKey(project.id),
+    domain ? `Enable https://${domain}` : "Disable local domain",
+    { type: "setLocalDomain", id: project.id, domain },
+  );
+}
+
 // --- DB connection card: host/port from the resolved model, credentials
 // from .env — everything a GUI client asks for, without grepping compose
 // files. Fetched on open so it is never stale. ---
@@ -471,6 +501,18 @@ async function addCommand() {
         <Button variant="ghost" size="sm" @click="shareOpen = true">
           <Share2 class="h-3.5 w-3.5" /> Share
           <span v-if="sharing" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        </Button>
+      </Tooltip>
+      <Tooltip
+        :text="
+          project.localDomain
+            ? `Serving https://${project.localDomain} through the local proxy.`
+            : 'Serve this app at a stable, trusted https://…test address through a local proxy.'
+        "
+      >
+        <Button variant="ghost" size="sm" @click="httpsOpen = true">
+          <Lock class="h-3.5 w-3.5" /> HTTPS
+          <span v-if="project.localDomain" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
         </Button>
       </Tooltip>
     </div>
@@ -977,11 +1019,96 @@ async function addCommand() {
           Share failed: {{ shareOp.error }}
         </p>
         <FixButton
-          v-if="shareOp && shareOp.terminal === 'failed' && shareOp.fix"
-          :repair="shareOp.fix.repair"
-          :project="shareOp.fix.project"
+          v-for="f in shareOp && shareOp.terminal === 'failed' ? shareOp.fixes : []"
+          :key="f.repair.id + (f.repair.arg ?? '')"
+          :repair="f.repair"
+          :project="f.project"
           @applied="store.dismissOperation(shareKey(project.id))"
         />
+      </div>
+    </Modal>
+
+    <!-- The HTTPS differentiator: claim a .test domain, watch the proxy
+         converge, and pick up the two system-level steps as Fix buttons —
+         the operation's output stays in the dialog so "why does the browser
+         still warn" has an answer in view. -->
+    <Modal v-model:open="httpsOpen" title="Local HTTPS domain">
+      <div class="space-y-3">
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          One shared Caddy proxy (ports 80/443) serves every Mast project that claims a domain, with
+          certificates from its own local-only authority — secure cookies, service workers and other
+          HTTPS-only features work in dev, and the address stays stable however the ports move.
+        </p>
+        <label class="block text-xs text-slate-600 dark:text-slate-300">
+          Domain
+          <Input v-model="domainDraft" placeholder="myapp.test" class="mt-1 font-mono" />
+        </label>
+        <p v-if="!domainValid" class="text-xs text-amber-700 dark:text-amber-300">
+          Lowercase letters, digits and hyphens, ending in
+          <span class="font-mono">.test</span> or <span class="font-mono">.localhost</span>.
+        </p>
+        <div class="flex flex-wrap gap-2">
+          <Button
+            :disabled="store.readOnly || !domainValid || domainBusy"
+            @click="setDomain(domainDraft.trim().toLowerCase())"
+          >
+            <Lock class="h-3.5 w-3.5" />
+            {{ project.localDomain ? "Update" : "Enable" }}
+          </Button>
+          <Button
+            v-if="project.localDomain"
+            variant="outline"
+            @click="store.run({ type: 'openUrl', url: `https://${project.localDomain}` })"
+          >
+            <Globe class="h-3.5 w-3.5" /> Open
+          </Button>
+          <Button
+            v-if="project.localDomain"
+            variant="outline"
+            :disabled="store.readOnly || domainBusy"
+            @click="setDomain(null)"
+          >
+            Disable
+          </Button>
+        </div>
+        <div
+          v-if="domainOp && domainOp.lines.length > 0"
+          class="max-h-48 overflow-y-auto rounded-md border border-slate-200 bg-slate-50 p-2 font-mono text-[11px] leading-relaxed dark:border-slate-800 dark:bg-neutral-900"
+        >
+          <p
+            v-for="(line, i) in domainOp.lines"
+            :key="i"
+            :class="
+              line.stderr
+                ? 'text-amber-700 dark:text-amber-300'
+                : 'text-slate-600 dark:text-slate-300'
+            "
+          >
+            {{ line.line }}
+          </p>
+        </div>
+        <p
+          v-if="domainOp && domainOp.terminal === 'failed'"
+          class="text-xs text-red-700 dark:text-red-300"
+        >
+          Failed: {{ domainOp.error }}
+        </p>
+        <!-- Follow-up steps, not failure fallout: these render on success
+             too, because /etc/hosts and CA trust are what stand between a
+             green operation and a browser that stops warning. -->
+        <div v-if="domainOp && domainOp.fixes.length > 0" class="flex flex-wrap gap-1">
+          <FixButton
+            v-for="f in domainOp.fixes"
+            :key="f.repair.id + (f.repair.arg ?? '')"
+            :repair="f.repair"
+            :project="f.project"
+          />
+        </div>
+        <p class="text-xs text-slate-400">
+          Two one-time system steps — the <span class="font-mono">/etc/hosts</span> line and
+          trusting the certificate authority — appear as Fix buttons after enabling, each with a
+          preview and a polkit prompt. Nothing touches your system without them.
+        </p>
       </div>
     </Modal>
 
@@ -1106,9 +1233,10 @@ async function addCommand() {
            when the engine matched the failure to a repair, fixable in place. -->
       <div v-if="op.terminal === 'failed'" class="mt-1 flex flex-wrap items-center gap-1">
         <FixButton
-          v-if="op.fix"
-          :repair="op.fix.repair"
-          :project="op.fix.project"
+          v-for="f in op.fixes"
+          :key="f.repair.id + (f.repair.arg ?? '')"
+          :repair="f.repair"
+          :project="f.project"
           @applied="store.dismissOperation(project.id)"
         />
         <Button

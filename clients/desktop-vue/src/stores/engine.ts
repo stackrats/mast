@@ -75,7 +75,10 @@ export interface OperationView {
   error: string | null;
   /** A one-click repair the engine matched to this operation's failure —
    * rendered as a Fix button whose preview says what will change. */
-  fix: { repair: RepairOffer; project: ProjectId } | null;
+  /** Repairs the engine matched to this operation (a failure signature, or
+   * follow-up system steps a feature must not do silently) — each renders
+   * as its own Fix button. */
+  fixes: { repair: RepairOffer; project: ProjectId }[];
 }
 
 export interface LogView {
@@ -105,6 +108,12 @@ export function commandKey(project: string, name: string): string {
  * buttons (and their Cancel semantics) the whole time. */
 export function shareKey(project: string): string {
   return `${project}:share`;
+}
+
+/** Local-domain (HTTPS proxy) operations get their own slot for the same
+ * reason as shares: they must not block the lifecycle buttons. */
+export function domainKey(project: string): string {
+  return `${project}:domain`;
 }
 
 /** Operations-map key for a project being scaffolded — it has no id yet. */
@@ -466,7 +475,7 @@ export const useEngineStore = defineStore("engine", {
         lines: [],
         terminal: null,
         error: null,
-        fix: null,
+        fixes: [],
       };
       // The panel is the user's to open. It used to force itself open on every
       // operation, which stole vertical space mid-task and undid a deliberate
@@ -497,9 +506,14 @@ export const useEngineStore = defineStore("engine", {
                 false,
               );
               break;
-            case "fixAvailable":
-              op.fix = { repair: event.kind.repair, project: event.kind.project };
+            case "fixAvailable": {
+              const repair = event.kind.repair;
+              // Re-emissions of the same repair (retries) collapse to one button.
+              if (!op.fixes.some((f) => f.repair.id === repair.id && f.repair.arg === repair.arg)) {
+                op.fixes.push({ repair, project: event.kind.project });
+              }
               break;
+            }
             case "failed":
               op.terminal = "failed";
               op.error = event.kind.error;

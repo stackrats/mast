@@ -440,6 +440,7 @@ mod tests {
             php: None,
             share_url: None,
             share_dashboard_url: None,
+            local_domain: None,
         }
     }
 
