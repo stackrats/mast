@@ -5,6 +5,7 @@
 //! and cancellable-operation machinery carry over from M1 unchanged.
 
 pub mod captures;
+mod db_repair;
 mod diagnostics;
 mod effects;
 mod history;

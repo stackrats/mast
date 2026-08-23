@@ -41,6 +41,8 @@ pub const REPAIR_NODE_INSTALL: &str = "node-install";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
 pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
 pub const REPAIR_STORAGE_LINK: &str = "storage-link";
+pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
+pub const REPAIR_DB_RECREATE: &str = "db-recreate-volume";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -93,6 +95,24 @@ pub struct SystemFacts {
     pub gid: u32,
 }
 
+/// Outcome of probing the project's database service with the credentials
+/// `.env` declares (engine-gathered; only for running projects whose DB_HOST
+/// names a compose service).
+#[derive(Debug, Clone)]
+pub struct DbProbeFacts {
+    /// Compose service the probe ran in.
+    pub service: String,
+    pub kind: mast_laravel::db::DbKind,
+    pub database: String,
+    pub username: String,
+    /// `None` = the `.env` credentials work.
+    pub failure: Option<mast_laravel::db::ProbeFailure>,
+    /// An administrative login still works on the initialized volume
+    /// (probed only after a failure) — the gate between a live reconcile
+    /// and a destructive volume recreate.
+    pub admin_access: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectFacts {
     pub id: String,
@@ -133,6 +153,9 @@ pub struct ProjectFacts {
     /// Networks the compose model declares as `external: true`.
     pub external_networks: Vec<String>,
     pub resolution_error: Option<String>,
+    /// Database credential probe outcome; `None` when nothing was probeable
+    /// (stopped project, no Sail-shaped DB config, docker down).
+    pub db: Option<DbProbeFacts>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +264,28 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           container (artisan's default absolute link only works in one)."
                 .into(),
             arg: None,
+        }),
+        REPAIR_DB_RECONCILE => Some(RepairSpec {
+            id: REPAIR_DB_RECONCILE,
+            title: "Reconcile the database with .env".into(),
+            risk: RiskTier::Caution,
+            description: "Logs into the database as an administrator inside the service \
+                          container and creates/updates the database, user, password and \
+                          grants to match `.env` — no data is touched. Verifies the app \
+                          credentials afterwards."
+                .into(),
+            arg: arg.map(String::from),
+        }),
+        REPAIR_DB_RECREATE => Some(RepairSpec {
+            id: REPAIR_DB_RECREATE,
+            title: "Recreate the database volume (DESTROYS ITS DATA)".into(),
+            risk: RiskTier::HighRisk,
+            description: "Stops the database service, deletes its named data volume, and \
+                          starts it again so the image re-initializes from the current \
+                          `.env`. Every database in that volume is permanently lost — \
+                          export anything you need first."
+                .into(),
+            arg: arg.map(String::from),
         }),
         REPAIR_DOCKER_GROUP => Some(RepairSpec {
             id: REPAIR_DOCKER_GROUP,

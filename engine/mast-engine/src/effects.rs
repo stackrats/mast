@@ -686,6 +686,7 @@ mod tests {
                     image: None,
                     aliases: Vec::new(),
                     published_ports: ports.to_vec(),
+                    volumes: Vec::new(),
                 })
                 .collect(),
             external_networks: Vec::new(),

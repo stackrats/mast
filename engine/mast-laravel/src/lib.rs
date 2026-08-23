@@ -3,6 +3,7 @@
 //! arrive with M7.
 
 pub mod app_key;
+pub mod db;
 pub mod env;
 pub mod env_write;
 pub mod ports;

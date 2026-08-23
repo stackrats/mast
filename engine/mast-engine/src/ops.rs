@@ -178,6 +178,23 @@ impl Engine {
         redactor: &Redactor,
         timeout: Duration,
     ) -> Result<(), ErrorInfo> {
+        self.run_streamed_command_env(handle, op, argv, cwd, &[], redactor, timeout).await
+    }
+
+    /// [`Self::run_streamed_command`] with an env overlay on the child —
+    /// for invocations that need e.g. `SAIL_SKIP_CHECKS=1` without putting
+    /// it on the argv.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_streamed_command_env(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env_overlay: &[(String, String)],
+        redactor: &Redactor,
+        timeout: Duration,
+    ) -> Result<(), ErrorInfo> {
         let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
         let forwarder = {
             let engine = self.clone();
@@ -199,7 +216,7 @@ impl Engine {
         let result = mast_docker::run_streaming(
             argv,
             cwd,
-            &[],
+            env_overlay,
             line_tx,
             handle.cancel.clone(),
             timeout,
