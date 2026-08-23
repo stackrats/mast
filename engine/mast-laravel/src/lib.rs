@@ -2,6 +2,7 @@
 //! Sail detection lives in `mast-project`; artisan and the service catalog
 //! arrive with M7.
 
+pub mod app_key;
 pub mod env;
 pub mod env_write;
 pub mod ports;
@@ -9,6 +10,7 @@ pub mod processes;
 pub mod url;
 pub mod validate;
 
+pub use app_key::generate_app_key;
 pub use env::{EnvEntry, EnvError, EnvFile, EnvItem, Quoting};
 pub use env_write::{EnvWriteError, edit_env_file};
 pub use ports::{is_host_port_key, next_free_port};

@@ -1344,11 +1344,14 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let project = make_project(tmp.path(), "clinic");
     std::fs::write(
         project.join("composer.json"),
-        r#"{"require": {"php": "^8.2"}, "require-dev": {"laravel/sail": "^1.41"}}"#,
+        r#"{"require": {"php": "^8.2", "laravel/framework": "^12.0"}, "require-dev": {"laravel/sail": "^1.41"}}"#,
     )
     .unwrap();
     std::fs::write(project.join(".env.example"), "APP_NAME=clinic\nWWWUSER=\nWWWGROUP=\n")
         .unwrap();
+    // A public disk with no public/storage link — the post-clone state.
+    std::fs::create_dir_all(project.join("storage/app/public")).unwrap();
+    std::fs::create_dir_all(project.join("public")).unwrap();
 
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -1399,14 +1402,45 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     assert!(project.join(".env").is_file());
 
     // With .env in place the WWWUSER parity check engages (empty != uid) and
-    // its repair rewrites .env through the transactional writer.
+    // its repair rewrites .env through the transactional writer. The copied
+    // .env has no APP_KEY, and the public disk is unlinked — both surface too.
     let report = engine.run_diagnostics().await.unwrap();
     assert!(report.findings.iter().any(|f| f.check == "wwwuser-parity"));
+    let app_key = report
+        .findings
+        .iter()
+        .find(|f| f.check == "app-key-missing")
+        .expect("empty APP_KEY must be found");
+    assert_eq!(app_key.repair.as_ref().unwrap().id, "generate-app-key");
+    let storage = report
+        .findings
+        .iter()
+        .find(|f| f.check == "storage-link")
+        .expect("unlinked public disk must be found");
+    assert_eq!(storage.repair.as_ref().unwrap().id, "storage-link");
     run_action(
         &engine,
         Action::ApplyRepair { repair: "set-wwwuser".into(), arg: None, project: Some(pid.clone()) },
     )
     .await;
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "generate-app-key".into(),
+            arg: None,
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "storage-link".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("APP_KEY=base64:"), "{env}");
+    let link = std::fs::read_link(project.join("public/storage")).unwrap();
+    assert_eq!(link, std::path::PathBuf::from("../storage/app/public"));
     let uid = String::from_utf8(
         std::process::Command::new("id").arg("-u").output().unwrap().stdout,
     )
@@ -1416,13 +1450,15 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let env = std::fs::read_to_string(project.join(".env")).unwrap();
     assert!(env.contains(&format!("WWWUSER={uid}")), "{env}");
 
-    // Both repaired findings are gone on the next run.
+    // Every repaired finding is gone on the next run.
     let report = engine.run_diagnostics().await.unwrap();
     assert!(
-        !report
-            .findings
-            .iter()
-            .any(|f| f.check == "env-missing" || f.check == "wwwuser-parity"),
+        !report.findings.iter().any(|f| {
+            matches!(
+                f.check.as_str(),
+                "env-missing" | "wwwuser-parity" | "app-key-missing" | "storage-link"
+            )
+        }),
         "{:?}",
         report.findings
     );
@@ -1430,9 +1466,9 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     // Every run and repair is in the audit history, newest first.
     let history = engine.diagnostics_history().await.unwrap();
     assert_eq!(history.runs.len(), 3);
-    assert_eq!(history.repairs.len(), 2);
+    assert_eq!(history.repairs.len(), 4);
     assert!(history.repairs.iter().all(|r| r.outcome == "applied"));
-    assert_eq!(history.repairs[0].repair, "set-wwwuser");
+    assert_eq!(history.repairs[0].repair, "storage-link");
     assert_eq!(history.repairs[0].risk, "safe");
 }
 

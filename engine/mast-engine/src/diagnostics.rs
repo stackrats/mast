@@ -14,8 +14,8 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DOCKER_GROUP, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -226,6 +226,13 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
             .unwrap_or_default(),
         env_present,
         env_example_present: seed.path.join(".env.example").is_file(),
+        app_key_empty: env_present
+            && env.get("APP_KEY").is_none_or(|v| v.trim().is_empty()),
+        storage_link_missing: seed.path.join("storage/app/public").is_dir()
+            && seed.path.join("public").is_dir()
+            // symlink_metadata: a dangling link still counts as present —
+            // replacing it is not this repair's call.
+            && std::fs::symlink_metadata(seed.path.join("public/storage")).is_err(),
         wwwuser: env.get("WWWUSER").cloned(),
         wwwgroup: env.get("WWWGROUP").cloned(),
         env_error_count,
@@ -628,6 +635,50 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_GENERATE_APP_KEY => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let src = std::fs::read_to_string(path.join(".env"))
+                        .map_err(|_| ErrorInfo::InvalidInput {
+                            message: "no .env file — create one first".into(),
+                        })?;
+                    let file = mast_laravel::EnvFile::parse(&src);
+                    let no_op =
+                        file.get("APP_KEY").is_some_and(|e| !e.value.trim().is_empty());
+                    let summary = if no_op {
+                        vec!["APP_KEY is already set — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            "generate a fresh base64: key (32 random bytes) and write \
+                             APP_KEY to .env"
+                                .into(),
+                            "the key is minted at apply time and never leaves this machine"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_STORAGE_LINK => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let no_op = std::fs::symlink_metadata(path.join("public/storage")).is_ok();
+                    let summary = if no_op {
+                        vec!["public/storage already exists — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            "create symlink public/storage → ../storage/app/public".into(),
+                            "relative, so it resolves on the host and inside the container"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_DOCKER_GROUP => {
                 let user = self.current_username()?;
                 Ok(RepairPlan {
@@ -874,6 +925,84 @@ impl Engine {
                 let install = sail_install_argv(&path, uid, gid);
                 self.run_streamed_command(handle, op, &install, Some(&path), &redactor, timeout)
                     .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_GENERATE_APP_KEY => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                tokio::task::spawn_blocking(move || -> Result<(), ErrorInfo> {
+                    let src = std::fs::read_to_string(&path).map_err(crate::internal_err)?;
+                    // Never rotate a live key from a repair — decrypting
+                    // existing data depends on it. Only fill an empty slot.
+                    if mast_laravel::EnvFile::parse(&src)
+                        .get("APP_KEY")
+                        .is_some_and(|e| !e.value.trim().is_empty())
+                    {
+                        return Err(ErrorInfo::Conflict {
+                            message: "APP_KEY is already set — refusing to overwrite it"
+                                .into(),
+                        });
+                    }
+                    let key = mast_laravel::generate_app_key().map_err(crate::internal_err)?;
+                    mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                        f.set("APP_KEY", &key)
+                    })
+                    .map(|_backup| ())
+                    .map_err(crate::env_write_error)
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "generated a fresh APP_KEY (value not shown)".into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_STORAGE_LINK => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || -> Result<(), ErrorInfo> {
+                    if !path.join("storage/app/public").is_dir() {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: "storage/app/public does not exist — nothing to link"
+                                .into(),
+                        });
+                    }
+                    let link = path.join("public/storage");
+                    if std::fs::symlink_metadata(&link).is_ok() {
+                        return Err(ErrorInfo::Conflict {
+                            message: "public/storage already exists — refusing to replace it"
+                                .into(),
+                        });
+                    }
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink("../storage/app/public", &link)
+                            .map_err(crate::internal_err)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = link;
+                        Err(ErrorInfo::Internal {
+                            message: "storage links are unix-only for now".into(),
+                        })
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "created public/storage → ../storage/app/public".into(),
+                        stderr: false,
+                    },
+                );
                 self.hint();
                 Ok(())
             }
