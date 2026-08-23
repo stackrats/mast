@@ -14,15 +14,16 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
-    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY,
+    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
 use crate::{Engine, OperationEventKind, OperationId, workspace_summaries};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const PROBE_CAP: usize = 64 * 1024;
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_CAP: usize = 64 * 1024;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -186,23 +187,33 @@ struct ProjectSeed {
     name: String,
     path: PathBuf,
     resolution_error: Option<String>,
-    service_names: Vec<String>,
+    /// (service name, aliases) from the resolved model.
+    services: Vec<(String, Vec<String>)>,
     host_ports: Vec<(String, u16)>,
     external_networks: Vec<String>,
     running: bool,
 }
 
-/// Filesystem half of a project's facts — runs in `spawn_blocking`.
-fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
+/// Filesystem half of a project's facts — runs in `spawn_blocking`. The
+/// second value is the database the async half should probe, when there is
+/// one (`facts.db` stays `None` until that probe fills it).
+fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
     let env = mast_compose::parse_env_file(&env_path);
+    let service_names: Vec<String> = seed
+        .services
+        .iter()
+        .flat_map(|(name, aliases)| std::iter::once(name.clone()).chain(aliases.iter().cloned()))
+        .collect();
+    let mut db_target = None;
     let env_error_count = if env_present {
         let src = std::fs::read_to_string(&env_path).unwrap_or_default();
         let parsed = mast_laravel::EnvFile::parse(&src);
         let pairs: Vec<(String, String)> =
             parsed.entries().map(|e| (e.key.clone(), e.value.clone())).collect();
-        mast_laravel::validate(&pairs, &seed.service_names)
+        db_target = crate::db_repair::resolve_db_target(&pairs, &seed.services);
+        mast_laravel::validate(&pairs, &service_names)
             .iter()
             .filter(|f| f.severity == mast_laravel::Severity::Error)
             .count()
@@ -210,7 +221,7 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
         0
     };
     let node = mast_project::inspect_node_project(&seed.path);
-    ProjectFacts {
+    let facts = ProjectFacts {
         sail_flavored: mast_project::is_sail_flavored(&seed.path),
         is_laravel: std::fs::read_to_string(seed.path.join("composer.json"))
             .map(|c| c.contains("laravel/framework"))
@@ -242,12 +253,14 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
         running: seed.running,
         external_networks: seed.external_networks,
         resolution_error: seed.resolution_error,
-    }
+        db: None,
+    };
+    (facts, db_target)
 }
 
 impl Engine {
     async fn gather_diag_ctx(&self) -> DiagCtx {
-        let (docker, seeds, workspace_issues, docker_host_env) = {
+        let (docker, seeds, invocations, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
@@ -257,16 +270,13 @@ impl Engine {
                     name: e.summary.name.clone(),
                     path: e.record.path.clone(),
                     resolution_error: e.summary.resolution_error.clone(),
-                    service_names: e
+                    services: e
                         .model
                         .as_ref()
                         .map(|m| {
                             m.services
                                 .iter()
-                                .flat_map(|s| {
-                                    std::iter::once(s.name.clone())
-                                        .chain(s.aliases.iter().cloned())
-                                })
+                                .map(|s| (s.name.clone(), s.aliases.clone()))
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -279,6 +289,11 @@ impl Engine {
                     running: e.summary.status != mast_contract::ProjectStatus::Stopped,
                 })
                 .collect();
+            let invocations: std::collections::HashMap<String, mast_compose::ComposeInvocation> =
+                st.projects
+                    .values()
+                    .filter_map(|e| e.invocation.clone().map(|i| (e.record.id.clone(), i)))
+                    .collect();
             let issues = workspace_summaries(&st)
                 .into_iter()
                 .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
@@ -289,7 +304,7 @@ impl Engine {
                 .process_env
                 .get("DOCKER_HOST")
                 .is_some_and(|v| !v.is_empty());
-            (st.docker.clone(), seeds, issues, docker_host_env)
+            (st.docker.clone(), seeds, invocations, issues, docker_host_env)
         };
 
         let compose_version = {
@@ -347,11 +362,25 @@ impl Engine {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
 
-        let projects = tokio::task::spawn_blocking(move || {
+        let mut inspected = tokio::task::spawn_blocking(move || {
             seeds.into_iter().map(inspect_project).collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
+
+        // Live credential probes — only where there is something to probe:
+        // a running project whose DB_HOST names a service in its model.
+        if docker.available {
+            for (facts, target) in &mut inspected {
+                let Some(target) = target.take() else { continue };
+                if !facts.running {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                facts.db = crate::db_repair::probe_db(invocation, &target).await;
+            }
+        }
+        let projects: Vec<ProjectFacts> = inspected.into_iter().map(|(facts, _)| facts).collect();
 
         DiagCtx {
             system: SystemFacts {
@@ -679,6 +708,12 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_DB_RECONCILE => {
+                self.db_reconcile_preview(offer, self.require_project(project)?, arg).await
+            }
+            REPAIR_DB_RECREATE => {
+                self.db_recreate_preview(offer, self.require_project(project)?, arg).await
+            }
             REPAIR_DOCKER_GROUP => {
                 let user = self.current_username()?;
                 Ok(RepairPlan {
@@ -927,6 +962,12 @@ impl Engine {
                     .await?;
                 self.hint();
                 Ok(())
+            }
+            REPAIR_DB_RECONCILE => {
+                self.db_reconcile_apply(handle, op, self.require_project(project)?, arg).await
+            }
+            REPAIR_DB_RECREATE => {
+                self.db_recreate_apply(handle, op, self.require_project(project)?, arg).await
             }
             REPAIR_GENERATE_APP_KEY => {
                 let path = self.project_path(self.require_project(project)?)?.join(".env");

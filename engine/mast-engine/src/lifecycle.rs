@@ -81,7 +81,7 @@ pub fn lifecycle_argv(
 /// them to empty strings and builds a container owned by the wrong user
 /// (finding 9). Mirror the wrapper: real environment and `.env` win, the
 /// uid/gid default only fills the gap.
-fn parity_env(invocation: &ComposeInvocation) -> Vec<(String, String)> {
+pub(crate) fn parity_env(invocation: &ComposeInvocation) -> Vec<(String, String)> {
     #[cfg(unix)]
     if matches!(invocation.runner, Runner::DockerCompose) {
         let dotenv = mast_compose::parse_env_file(&invocation.project_dir.join(".env"));

@@ -295,6 +295,10 @@ pub struct ResolvedService {
     /// `.env` to read, so collision checks that scan `.env` alone miss it —
     /// this is the authoritative list.
     pub published_ports: Vec<u16>,
+    /// Named volumes this service mounts (the compose-file source names,
+    /// e.g. `sail-mysql`) — bind mounts excluded. What a data-destroying
+    /// repair must name before touching anything.
+    pub volumes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,11 +449,29 @@ pub async fn resolve_model(invocation: &ComposeInvocation) -> Result<ResolvedMod
                         .unwrap_or_default();
                     published_ports.sort_unstable();
                     published_ports.dedup();
+                    // `config` expands volumes to long form, so named mounts
+                    // are exactly the entries with type == "volume".
+                    let mut volumes: Vec<String> = def
+                        .get("volumes")
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter(|m| {
+                                    m.get("type").and_then(|t| t.as_str()) == Some("volume")
+                                })
+                                .filter_map(|m| m.get("source").and_then(|s| s.as_str()))
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    volumes.sort();
+                    volumes.dedup();
                     ResolvedService {
                         name: service.clone(),
                         image: def.get("image").and_then(|i| i.as_str()).map(String::from),
                         aliases,
                         published_ports,
+                        volumes,
                     }
                 })
                 .collect()
@@ -624,7 +646,7 @@ mod tests {
         write(
             tmp.path(),
             "compose.yaml",
-            "services:\n  app:\n    image: alpine:latest\n  db:\n    image: mysql:8\n",
+            "services:\n  app:\n    image: alpine:latest\n    volumes:\n      - ./src:/app\n  db:\n    image: mysql:8\n    volumes:\n      - 'sail-mysql:/var/lib/mysql'\nvolumes:\n  sail-mysql:\n    driver: local\n",
         );
         let inv = resolve_invocation(tmp.path(), &env(&[])).unwrap();
         let model = resolve_model(&inv).await.unwrap();
@@ -632,6 +654,9 @@ mod tests {
         let names: Vec<_> = model.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["app", "db"]);
         assert_eq!(model.services[0].image.as_deref(), Some("alpine:latest"));
+        // Named mounts surface as sources; bind mounts stay out.
+        assert!(model.services[0].volumes.is_empty(), "{:?}", model.services[0].volumes);
+        assert_eq!(model.services[1].volumes, vec!["sail-mysql"]);
     }
 
     #[test]

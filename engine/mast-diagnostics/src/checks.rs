@@ -4,10 +4,11 @@
 
 use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
-    REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DOCKER_GROUP,
-    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE,
+    REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL,
+    REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
+use mast_laravel::db::ProbeFailure;
 
 fn finding(
     check: &'static str,
@@ -498,6 +499,70 @@ impl Check for StorageLinkMissing {
     }
 }
 
+/// The init-once-volume trap, Sail's most-reported "not a bug": the database
+/// image creates user/password/database only when its data volume is first
+/// initialized, so `.env` edits after the first start silently never apply
+/// and the app fails with "Access denied". The engine probed the live
+/// container with the `.env` credentials; this check turns the outcome into
+/// an explanation and the right repair for what admin access remains.
+struct DbCredentials;
+impl Check for DbCredentials {
+    fn id(&self) -> &'static str {
+        "db-credentials"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.db.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| p.db.as_ref().and_then(|db| db.failure.map(|f| (p, db, f))))
+            .map(|(p, db, failure)| {
+                let engine = db.kind.as_str();
+                let title = match failure {
+                    ProbeFailure::AccessDenied => format!(
+                        "{}: .env database credentials don't work against \"{}\"",
+                        p.name, db.service
+                    ),
+                    ProbeFailure::UnknownDatabase => format!(
+                        "{}: database \"{}\" does not exist in \"{}\"",
+                        p.name, db.database, db.service
+                    ),
+                };
+                let trap = format!(
+                    "The {engine} image only creates user, password and database when its \
+                     data volume is first initialized — editing .env afterwards changes \
+                     nothing inside the volume. Logging in as \"{}\" with the current .env \
+                     values failed.",
+                    db.username
+                );
+                let (detail, repair_id) = if db.admin_access {
+                    (
+                        format!(
+                            "{trap} An administrative login still works, so Mast can bring \
+                             the live server in line with .env without touching data."
+                        ),
+                        REPAIR_DB_RECONCILE,
+                    )
+                } else {
+                    (
+                        format!(
+                            "{trap} No administrative login works with the current values \
+                             either (the volume was initialized under a different \
+                             password), so a live repair is impossible — the volume must \
+                             be recreated, which destroys its data."
+                        ),
+                        REPAIR_DB_RECREATE,
+                    )
+                };
+                let mut f = finding(self.id(), Severity::Error, title, detail);
+                f.repair = repair_spec(repair_id, Some(&db.service));
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 struct WwwUserParity;
 impl Check for WwwUserParity {
     fn id(&self) -> &'static str {
@@ -738,6 +803,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(SailMissing),
         Box::new(AppKeyMissing),
         Box::new(StorageLinkMissing),
+        Box::new(DbCredentials),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -809,6 +875,18 @@ mod tests {
             running: false,
             external_networks: Vec::new(),
             resolution_error: None,
+            db: None,
+        }
+    }
+
+    fn db_facts(failure: Option<ProbeFailure>, admin_access: bool) -> crate::DbProbeFacts {
+        crate::DbProbeFacts {
+            service: "mysql".into(),
+            kind: mast_laravel::db::DbKind::Mysql,
+            database: "laravel".into(),
+            username: "sail".into(),
+            failure,
+            admin_access,
         }
     }
 
@@ -921,6 +999,37 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "app-key-missing"));
+    }
+
+    #[test]
+    fn db_credential_failures_route_to_the_right_repair() {
+        // Admin access alive → live reconcile, Caution.
+        let mut p = sail_project("a");
+        p.db = Some(db_facts(Some(ProbeFailure::AccessDenied), true));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "db-credentials").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_DB_RECONCILE);
+        assert_eq!(repair.risk, RiskTier::Caution);
+        assert_eq!(repair.arg.as_deref(), Some("mysql"));
+        assert!(f.detail.contains("volume is first initialized"), "{}", f.detail);
+
+        // No admin access → only the destructive path remains, HighRisk.
+        let mut p = sail_project("a");
+        p.db = Some(db_facts(Some(ProbeFailure::UnknownDatabase), false));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "db-credentials").unwrap();
+        assert!(f.title.contains("does not exist"), "{}", f.title);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_DB_RECREATE);
+        assert_eq!(repair.risk, RiskTier::HighRisk);
+
+        // A healthy probe emits nothing.
+        let mut p = sail_project("a");
+        p.db = Some(db_facts(None, false));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(!findings.iter().any(|f| f.check == "db-credentials"));
     }
 
     #[test]
