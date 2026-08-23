@@ -70,8 +70,8 @@ pub fn project_warnings(dir: &Path) -> Vec<String> {
     if is_sail_flavored(dir) && !dir.join("vendor/bin/sail").is_file() {
         warnings.push(
             "Sail project without vendor/ — dependencies are not installed, so lifecycle \
-             runs through bare docker compose (WWWUSER/WWWGROUP will be empty). Run a \
-             containerized `composer install` (laravelsail/phpXX-composer) to bootstrap."
+             runs through bare docker compose (Mast fills in WWWUSER/WWWGROUP itself). Run \
+             the containerized `composer install` from Diagnostics to bootstrap."
                 .to_string(),
         );
     }

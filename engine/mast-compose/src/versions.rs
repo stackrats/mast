@@ -3,10 +3,10 @@
 //! Changing "the version of mysql" is really rewriting one scalar — the tag on
 //! a service's `image:` — so the offer is keyed by the repo the service
 //! already uses, not by which catalog entry it resembles. A project scaffolded
-//! by Sail runs `mysql:8.4` while [`crate::catalog`] installs
-//! `mysql/mysql-server:8.0`; those are different repos with different tag
-//! namespaces, and offering one's tags for the other would produce an image
-//! that cannot be pulled.
+//! by an older Sail (or an older Mast catalog) runs `mysql/mysql-server:8.0`
+//! while current stubs use `mysql:8.4`; those are different repos with
+//! different tag namespaces, and offering one's tags for the other would
+//! produce an image that cannot be pulled.
 //!
 //! The real answer comes from the registry (`mast-registry`, cached by the
 //! engine). The table below is the offline fallback only: what to show before

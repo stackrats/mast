@@ -5,7 +5,8 @@
 use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
     REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DOCKER_GROUP,
-    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 
 fn finding(
@@ -263,8 +264,8 @@ impl Check for EnvMissing {
                         title: "Create .env from .env.example".into(),
                         risk: RiskTier::Safe,
                         description: "Copies `.env.example` to `.env` (refuses if `.env` \
-                                      appears in the meantime). You may still need to set \
-                                      APP_KEY afterwards."
+                                      appears in the meantime). Re-run diagnostics afterwards \
+                                      — a fresh copy usually needs an APP_KEY generated."
                             .into(),
                         arg: None,
                     });
@@ -303,8 +304,8 @@ impl Check for VendorMissing {
                     title: "Run composer install in a container".into(),
                     risk: RiskTier::Caution,
                     description: "Runs `composer install --ignore-platform-reqs` in the \
-                                  matching `laravelsail/phpXX-composer` image with your \
-                                  UID/GID, mounting only this project directory."
+                                  official composer image with your UID/GID, mounting only \
+                                  this project directory."
                         .into(),
                     arg: None,
                 });
@@ -423,11 +424,74 @@ impl Check for SailMissing {
                     title: "Install Laravel Sail in a container".into(),
                     risk: RiskTier::Caution,
                     description: "Runs `composer require laravel/sail --dev` then `php artisan \
-                                  sail:install` inside the matching laravelsail/phpXX-composer \
-                                  image — no local PHP needed."
+                                  sail:install` inside the official composer image — no local \
+                                  PHP needed."
                         .into(),
                     arg: None,
                 });
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// APP_KEY absent or empty on a Laravel project. Laravel refuses every request
+/// with "No application encryption key has been specified" — the standard
+/// state right after cloning + copying `.env.example`, and the missing half of
+/// the clone-bootstrap story (laravel/sail's docs stop at `composer install`).
+struct AppKeyMissing;
+impl Check for AppKeyMissing {
+    fn id(&self) -> &'static str {
+        "app-key-missing"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.is_laravel && p.env_present)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.is_laravel && p.env_present && p.app_key_empty)
+            .map(|p| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{} has no APP_KEY", p.name),
+                    "APP_KEY in `.env` is empty, so Laravel will refuse every request with \
+                     \"No application encryption key has been specified\".",
+                );
+                f.repair = repair_spec(REPAIR_GENERATE_APP_KEY, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// `storage/app/public` exists but `public/storage` does not point at it, so
+/// everything stored on the `public` disk 404s in the browser. Repaired with a
+/// relative symlink rather than `artisan storage:link`: artisan's default
+/// absolute target only resolves on whichever side of the bind mount created
+/// it, and creating the link needs no running container anyway.
+struct StorageLinkMissing;
+impl Check for StorageLinkMissing {
+    fn id(&self) -> &'static str {
+        "storage-link"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.is_laravel)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.is_laravel && p.storage_link_missing)
+            .map(|p| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{} has no public/storage link", p.name),
+                    "`storage/app/public` exists but is not linked into `public/`, so files \
+                     on the public disk will 404 in the browser.",
+                );
+                f.repair = repair_spec(REPAIR_STORAGE_LINK, None);
                 for_project(f, p)
             })
             .collect()
@@ -672,6 +736,8 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(NodeModulesMissing),
         Box::new(AmbiguousLockfiles),
         Box::new(SailMissing),
+        Box::new(AppKeyMissing),
+        Box::new(StorageLinkMissing),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -734,6 +800,8 @@ mod tests {
             conflicting_lockfiles: Vec::new(),
             env_present: true,
             env_example_present: true,
+            app_key_empty: false,
+            storage_link_missing: false,
             wwwuser: Some("1000".into()),
             wwwgroup: Some("1000".into()),
             env_error_count: 0,
@@ -834,6 +902,36 @@ mod tests {
         assert_eq!(fa.repair.as_ref().unwrap().id, REPAIR_COPY_ENV_EXAMPLE);
         let fb = findings.iter().find(|f| f.check == "env-missing" && f.project.as_deref() == Some("b")).unwrap();
         assert!(fb.repair.is_none());
+    }
+
+    #[test]
+    fn empty_app_key_is_an_error_with_a_safe_repair() {
+        let mut p = sail_project("a");
+        p.app_key_empty = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "app-key-missing").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_GENERATE_APP_KEY);
+        assert_eq!(repair.risk, RiskTier::Safe);
+
+        // Not a Laravel project → not our key to mint.
+        let mut q = sail_project("b");
+        q.app_key_empty = true;
+        q.is_laravel = false;
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "app-key-missing"));
+    }
+
+    #[test]
+    fn missing_storage_link_warns_with_a_safe_repair() {
+        let mut p = sail_project("a");
+        p.storage_link_missing = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "storage-link").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_STORAGE_LINK);
+        assert_eq!(f.repair.as_ref().unwrap().risk, RiskTier::Safe);
     }
 
     #[test]

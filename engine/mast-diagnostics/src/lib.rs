@@ -39,6 +39,8 @@ pub const REPAIR_DOCKER_GROUP: &str = "docker-group";
 pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
+pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
+pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -112,6 +114,12 @@ pub struct ProjectFacts {
     pub conflicting_lockfiles: Vec<String>,
     pub env_present: bool,
     pub env_example_present: bool,
+    /// `.env` exists but APP_KEY is absent or empty — Laravel 500s on every
+    /// request until it is set ("No application encryption key").
+    pub app_key_empty: bool,
+    /// `storage/app/public` and `public/` both exist but `public/storage`
+    /// does not — uploaded-file URLs 404 until `storage:link` runs.
+    pub storage_link_missing: bool,
     pub wwwuser: Option<String>,
     pub wwwgroup: Option<String>,
     /// Error-severity findings from the `.env` validator.
@@ -211,6 +219,26 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Writes free port numbers to the `.env` keys that publish the \
                           contested ports (`APP_PORT`, `VITE_PORT`, `FORWARD_*_PORT`), through \
                           the transactional writer. The compose file is untouched."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_GENERATE_APP_KEY => Some(RepairSpec {
+            id: REPAIR_GENERATE_APP_KEY,
+            title: "Generate an APP_KEY".into(),
+            risk: RiskTier::Safe,
+            description: "Mints a fresh `base64:` key from OS entropy (the same shape \
+                          `artisan key:generate` produces) and writes it to `.env` through \
+                          the transactional writer. Refuses if APP_KEY is no longer empty."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_STORAGE_LINK => Some(RepairSpec {
+            id: REPAIR_STORAGE_LINK,
+            title: "Link public/storage".into(),
+            risk: RiskTier::Safe,
+            description: "Creates the `public/storage → ../storage/app/public` symlink as a \
+                          relative link, so it resolves both on the host and inside the \
+                          container (artisan's default absolute link only works in one)."
                 .into(),
             arg: None,
         }),

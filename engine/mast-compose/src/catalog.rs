@@ -29,6 +29,10 @@ pub struct CatalogDef {
     pub volumes: &'static [&'static str],
     /// `.env` updates applied alongside the add (listed in the preview).
     pub env_sets: &'static [(&'static str, &'static str)],
+    /// Images earlier Mast releases installed for this entry. Three-way
+    /// removal accepts these as "ours" too, so a service added before an
+    /// image bump stays cleanly removable.
+    pub legacy_images: &'static [&'static str],
 }
 
 pub const CATALOG: &[CatalogDef] = &[
@@ -55,6 +59,7 @@ pub const CATALOG: &[CatalogDef] = &[
         ],
         volumes: &["sail-redis"],
         env_sets: &[("REDIS_HOST", "redis")],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mailpit",
@@ -75,6 +80,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("MAIL_HOST", "mailpit"),
             ("MAIL_PORT", "1025"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "meilisearch",
@@ -106,6 +112,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("SCOUT_DRIVER", "meilisearch"),
             ("MEILISEARCH_HOST", "http://meilisearch:7700"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "minio",
@@ -142,8 +149,13 @@ pub const CATALOG: &[CatalogDef] = &[
             ("AWS_DEFAULT_REGION", "us-east-1"),
             ("AWS_BUCKET", "local"),
             ("AWS_ENDPOINT", "http://minio:9000"),
+            // The endpoint only resolves inside the compose network; without
+            // a browser-reachable AWS_URL, Storage::url() hands the host a
+            // dead minio:9000 link (the classic MinIO split-brain).
+            ("AWS_URL", "http://localhost:9000/local"),
             ("AWS_USE_PATH_STYLE_ENDPOINT", "true"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "pgsql",
@@ -181,6 +193,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "pgsql"),
             ("DB_PORT", "5432"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mariadb",
@@ -217,16 +230,19 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "mariadb"),
             ("DB_PORT", "3306"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mysql",
         title: "MySQL",
-        description: "MySQL 8 database (DB_* env pointed at it on add).",
+        description: "MySQL 8.4 database (DB_* env pointed at it on add).",
         service_key: "mysql",
         image_stems: &["mysql", "mysql/mysql-server"],
         role: "database",
         lines: &[
-            "image: 'mysql/mysql-server:8.0'",
+            // mysql/mysql-server was abandoned upstream (laravel/sail#829);
+            // Sail's own stub moved to mysql:8.4 (laravel/sail#834).
+            "image: 'mysql:8.4'",
             "ports:",
             "  - '${FORWARD_DB_PORT:-3306}:3306'",
             "environment:",
@@ -253,6 +269,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "mysql"),
             ("DB_PORT", "3306"),
         ],
+        legacy_images: &["mysql/mysql-server:8.0"],
     },
     CatalogDef {
         id: "typesense",
@@ -288,6 +305,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("TYPESENSE_PORT", "8108"),
             ("TYPESENSE_PROTOCOL", "http"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "rustfs",
@@ -315,8 +333,12 @@ pub const CATALOG: &[CatalogDef] = &[
             ("AWS_DEFAULT_REGION", "us-east-1"),
             ("AWS_BUCKET", "local"),
             ("AWS_ENDPOINT", "http://rustfs:9000"),
+            // Same split-brain as minio: signed for the network, served to
+            // the browser.
+            ("AWS_URL", "http://localhost:9000/local"),
             ("AWS_USE_PATH_STYLE_ENDPOINT", "true"),
         ],
+        legacy_images: &[],
     },
 ];
 
@@ -373,19 +395,41 @@ fn has_sail_network(root: &Yaml) -> bool {
         .any(|(k, _)| matches!(k, Yaml::Value(saphyr::Scalar::String(s)) if s == "sail"))))
 }
 
-/// Parse the block we would render for `def` into a Yaml subtree (the "ours"
-/// document of the three-way comparison).
-fn expected_subtree(def: &CatalogDef, sail_network: bool) -> Result<Yaml<'static>, String> {
-    let mut doc = format!("{}:\n", def.service_key);
-    for line in service_lines(def, sail_network) {
+/// Parse a rendered service block into a Yaml subtree (the "ours" document of
+/// the three-way comparison).
+fn block_subtree(service_key: &str, lines: &[String]) -> Result<Yaml<'static>, String> {
+    let mut doc = format!("{service_key}:\n");
+    for line in lines {
         doc.push_str("  ");
-        doc.push_str(&line);
+        doc.push_str(line);
         doc.push('\n');
     }
     let parsed = Yaml::load_from_str(&doc).map_err(|e| e.to_string())?;
     let root = parsed.into_iter().next().ok_or("empty rendered block")?;
     let Yaml::Mapping(m) = root else { return Err("rendered block is not a mapping".into()) };
     m.into_iter().next().map(|(_, v)| v).ok_or_else(|| "rendered block is empty".into())
+}
+
+fn expected_subtree(def: &CatalogDef, sail_network: bool) -> Result<Yaml<'static>, String> {
+    block_subtree(def.service_key, &service_lines(def, sail_network))
+}
+
+/// Does the current block match what add would render — with today's image or
+/// one this entry installed in an earlier release?
+fn matches_ours(current: &Yaml, def: &CatalogDef, sail_network: bool) -> Result<bool, String> {
+    if *current == expected_subtree(def, sail_network)? {
+        return Ok(true);
+    }
+    let lines = service_lines(def, sail_network);
+    Ok(def.legacy_images.iter().any(|legacy| {
+        let substituted: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                if l.starts_with("image:") { format!("image: '{legacy}'") } else { l.clone() }
+            })
+            .collect();
+        block_subtree(def.service_key, &substituted).is_ok_and(|expected| *current == expected)
+    }))
 }
 
 pub fn plan_catalog_add(source: &str, def: &CatalogDef) -> Result<CatalogPlan, String> {
@@ -580,8 +624,7 @@ pub fn plan_catalog_remove(source: &str, def: &CatalogDef) -> Result<CatalogPlan
         .ok_or_else(|| format!("service \"{}\" is not in this file", def.service_key))?;
 
     let sail_network = has_sail_network(root);
-    let expected = expected_subtree(def, sail_network)?;
-    if *current != expected {
+    if !matches_ours(current, def, sail_network)? {
         return Err(format!(
             "service \"{}\" has been customized since it was added — refusing to remove it \
              automatically; edit the compose file directly",
@@ -677,6 +720,37 @@ mod tests {
             let removal = plan_catalog_remove(&added, def(id)).unwrap();
             let restored = apply_all(&added, &removal.edits).unwrap();
             assert_eq!(restored, SAIL_DOC, "three-way removal must restore bytes for {id}");
+        }
+    }
+
+    /// A mysql service added by a release that installed
+    /// `mysql/mysql-server:8.0` must stay removable after the image bump to
+    /// `mysql:8.4` — the legacy image is still "ours", not a customization.
+    #[test]
+    fn remove_accepts_a_legacy_image_install() {
+        let plan = plan_catalog_add(SAIL_DOC, def("mysql")).unwrap();
+        let added = apply_all(SAIL_DOC, &plan.edits).unwrap();
+        let old_install = added.replace("image: 'mysql:8.4'", "image: 'mysql/mysql-server:8.0'");
+        assert_ne!(old_install, added, "the substitution must have applied");
+        let removal = plan_catalog_remove(&old_install, def("mysql")).unwrap();
+        let restored = apply_all(&old_install, &removal.edits).unwrap();
+        assert_eq!(restored, SAIL_DOC);
+    }
+
+    /// Object-storage entries must hand the browser a usable URL alongside
+    /// the in-network endpoint, or Storage::url() links at minio:9000 die on
+    /// the host (the MinIO split-brain).
+    #[test]
+    fn object_storage_entries_set_a_browser_facing_aws_url() {
+        for id in ["minio", "rustfs"] {
+            let d = def(id);
+            let url = d.env_sets.iter().find(|(k, _)| *k == "AWS_URL");
+            assert_eq!(
+                url,
+                Some(&("AWS_URL", "http://localhost:9000/local")),
+                "{id} must set AWS_URL"
+            );
+            assert!(d.env_sets.iter().any(|(k, _)| *k == "AWS_ENDPOINT"), "{id}");
         }
     }
 
