@@ -13,6 +13,7 @@ import type {
   OperationId,
   ProjectId,
   ProjectSummary,
+  RepairOffer,
   UsageSample,
   WorkspaceSummary,
 } from "../bindings";
@@ -72,6 +73,9 @@ export interface OperationView {
   lines: { line: string; stderr: boolean }[];
   terminal: "completed" | "failed" | "cancelled" | null;
   error: string | null;
+  /** A one-click repair the engine matched to this operation's failure —
+   * rendered as a Fix button whose preview says what will change. */
+  fix: { repair: RepairOffer; project: ProjectId } | null;
 }
 
 export interface LogView {
@@ -455,7 +459,15 @@ export const useEngineStore = defineStore("engine", {
       const token = ++nextToken;
       // Registered BEFORE dispatch: channel events can beat the invoke reply.
       // Always re-read through the store (reactive proxy) and match by token.
-      this.operations[project] = { token, id: -1, label, lines: [], terminal: null, error: null };
+      this.operations[project] = {
+        token,
+        id: -1,
+        label,
+        lines: [],
+        terminal: null,
+        error: null,
+        fix: null,
+      };
       // The panel is the user's to open. It used to force itself open on every
       // operation, which stole vertical space mid-task and undid a deliberate
       // close; output still accumulates while it is shut.
@@ -484,6 +496,9 @@ export const useEngineStore = defineStore("engine", {
                 event.kind.type === "completed" ? `✓ ${label} completed` : `⏹ ${label} cancelled`,
                 false,
               );
+              break;
+            case "fixAvailable":
+              op.fix = { repair: event.kind.repair, project: event.kind.project };
               break;
             case "failed":
               op.terminal = "failed";

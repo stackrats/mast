@@ -14,6 +14,25 @@ pub struct ErrorSignature {
     pub explanation: &'static str,
     /// What to do about it.
     pub advice: &'static str,
+    /// A repair id (see [`crate::repair_spec`]) that addresses this failure
+    /// directly — powers the Fix button on a failed operation. `None` when
+    /// the remedy is not a one-click change.
+    pub repair: Option<&'static str>,
+}
+
+/// The repair argument this signature's matched line carries, when the
+/// repair id needs one (e.g. the missing network's name).
+pub fn extract_repair_arg(sig: &ErrorSignature, line: &str) -> Option<String> {
+    match sig.id {
+        // "network mast-shared declared as external, but could not be found"
+        "external-network-missing" => {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let at = tokens.iter().position(|t| *t == "network")?;
+            let name = tokens.get(at + 1)?.trim_matches(['"', '\'', '`']);
+            (!name.is_empty()).then(|| name.to_string())
+        }
+        _ => None,
+    }
 }
 
 pub const SIGNATURES: &[ErrorSignature] = &[
@@ -24,6 +43,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       fresh `sail build` failures, worldwide and temporary",
         advice: "this is not your project's fault; retry later, and if it keeps failing \
                  rebuild without cache so a poisoned layer is not reused",
+        repair: None,
     },
     ErrorSignature {
         id: "apt-breakage",
@@ -31,6 +51,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "an upstream apt repository is broken or mid-publish (Ubuntu/PPA/\
                       nodesource churn hits every fresh Sail build at once)",
         advice: "retry later; if it persists, rebuild without cache",
+        repair: None,
     },
     ErrorSignature {
         id: "image-missing",
@@ -38,6 +59,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "the image tag does not exist on the registry (a typo, a removed tag, \
                       or an image that has not been published yet)",
         advice: "check the image name and tag; pick a tag the registry actually offers",
+        repair: None,
     },
     ErrorSignature {
         id: "build-segfault",
@@ -46,6 +68,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       regression or a broken upstream package, not project code",
         advice: "update Docker, then rebuild without cache; if it persists, check the \
                  base image's issue tracker",
+        repair: None,
     },
     ErrorSignature {
         id: "mysql-root-user",
@@ -53,6 +76,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "the MySQL image refuses MYSQL_USER=root — DB_USERNAME=root cannot \
                       be used to initialize the container",
         advice: "set DB_USERNAME to a non-root name in .env (root exists anyway)",
+        repair: None,
     },
     ErrorSignature {
         id: "port-taken",
@@ -61,6 +85,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       project publishes",
         advice: "run Diagnostics — Mast can move this project's ports; if the holder is \
                  not a Mast project, stop it or change the port in .env",
+        repair: Some(crate::REPAIR_REASSIGN_PORTS),
     },
     ErrorSignature {
         id: "disk-full",
@@ -68,6 +93,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "Docker's data disk is full",
         advice: "reclaim space (`docker system prune`, old images/volumes) — Diagnostics \
                  shows how much is free",
+        repair: None,
     },
     ErrorSignature {
         id: "external-network-missing",
@@ -75,6 +101,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "the compose file marks a network `external`, and that network does \
                       not exist on the daemon",
         advice: "run Diagnostics — creating the missing network is a one-click repair",
+        repair: Some(crate::REPAIR_CREATE_NETWORK),
     },
     ErrorSignature {
         id: "dependency-unhealthy",
@@ -82,6 +109,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "a service this one depends on started but never became healthy",
         advice: "open that service's logs (its last words are kept in Captures if it \
                  died) — the root cause is there, not here",
+        repair: None,
     },
     ErrorSignature {
         id: "compose-dotted-name",
@@ -89,6 +117,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "this compose/Bake version rejects dotted service names like Sail's \
                       `laravel.test`",
         advice: "set COMPOSE_BAKE=false, upgrade compose (2.37.1+), or rename the service",
+        repair: None,
     },
     ErrorSignature {
         id: "db-version-mismatch",
@@ -100,6 +129,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "the database's data volume was written by a different major version \
                       than the image now running",
         advice: "run Diagnostics — the db-volume-version check explains the safe way out",
+        repair: None,
     },
     ErrorSignature {
         id: "docker-daemon-down",
@@ -112,6 +142,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       its socket)",
         advice: "run Diagnostics — it tells a stopped daemon apart from a permissions \
                  problem",
+        repair: None,
     },
     ErrorSignature {
         id: "env-var-missing",
@@ -119,6 +150,7 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         explanation: "the compose file requires an environment variable that neither \
                       .env nor the environment provides",
         advice: "set the named variable in .env",
+        repair: None,
     },
 ];
 
@@ -171,6 +203,28 @@ mod tests {
         ] {
             assert!(classify_line(line).is_none(), "false positive: {line}");
         }
+    }
+
+    #[test]
+    fn repair_args_extract_from_the_matched_line() {
+        let net = classify_line("network mast-shared declared as external, but could not be found")
+            .unwrap();
+        assert_eq!(net.repair, Some(crate::REPAIR_CREATE_NETWORK));
+        assert_eq!(
+            extract_repair_arg(net, "network mast-shared declared as external, but could not be found")
+                .as_deref(),
+            Some("mast-shared")
+        );
+        // Quoted variants (newer compose wording) strip cleanly.
+        assert_eq!(
+            extract_repair_arg(net, "network \"acme-net\" declared as external, but could not be found")
+                .as_deref(),
+            Some("acme-net")
+        );
+
+        let port = classify_line("bind: address already in use").unwrap();
+        assert_eq!(port.repair, Some(crate::REPAIR_REASSIGN_PORTS));
+        assert_eq!(extract_repair_arg(port, "bind: address already in use"), None);
     }
 
     #[test]

@@ -126,7 +126,7 @@ impl Engine {
                 Ok(()) => OperationEventKind::Completed,
                 Err(_) if handle.cancel.is_cancelled() => OperationEventKind::Cancelled,
                 Err(e) => {
-                    engine.flush_signature_explanations(&handle, id);
+                    engine.flush_signature_explanations(&handle, id, Some(&project));
                     OperationEventKind::Failed { error: redactor.redact(&e.to_string()) }
                 }
             };

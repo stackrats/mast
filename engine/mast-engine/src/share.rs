@@ -81,7 +81,7 @@ impl Engine {
                     OperationEventKind::Cancelled
                 }
                 Err(e) => {
-                    engine.flush_signature_explanations(&handle, id);
+                    engine.flush_signature_explanations(&handle, id, Some(&project));
                     OperationEventKind::Failed { error: redactor.redact(&e.to_string()) }
                 }
             };
@@ -115,7 +115,7 @@ impl Engine {
             self.emit_op(handle, op, OperationEventKind::Output { line, stderr });
         };
 
-        let (settings, hot) = tokio::task::spawn_blocking({
+        let (mut settings, hot) = tokio::task::spawn_blocking({
             let path = path.to_path_buf();
             move || {
                 let src = std::fs::read_to_string(path.join(".env")).unwrap_or_default();
@@ -166,6 +166,26 @@ impl Engine {
                 .into(),
             false,
         );
+
+        // The dashboard port is fixed at 4040 by default and NOT covered by
+        // the project port remap (it is not a compose-published port) — a
+        // second tunnel or any resident 4040 user used to kill the share
+        // with "port is already allocated". Pick a free one for this run;
+        // nothing depends on the number, and the output says which it is.
+        if let Ok(preferred) = settings.dashboard_port.parse::<u16>()
+            && crate::ports::port_is_bound(preferred)
+            && let Some(free) =
+                mast_laravel::next_free_port(preferred, |p| !crate::ports::port_is_bound(p))
+        {
+            out(
+                format!(
+                    "dashboard port {preferred} is busy — using {free} for this share \
+                     (http://localhost:{free})"
+                ),
+                false,
+            );
+            settings.dashboard_port = free.to_string();
+        }
 
         // A crashed previous share can leave the named container behind.
         let rm: Vec<String> = ["docker", "rm", "-f", container].map(String::from).into();

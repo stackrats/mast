@@ -677,7 +677,14 @@ export type OperationEventKind = { type: "started" } | { type: "progress"; perce
 /**
  * One line of live subprocess output (compose/sail shell-outs).
  */
-{ type: "output"; line: string; stderr: boolean } | { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" }
+{ type: "output"; line: string; stderr: boolean } | 
+/**
+ * A one-click repair that addresses a failure signature spotted in this
+ * operation's output — emitted just before [`Self::Failed`], so a
+ * failure can carry its own Fix button. Preview the repair before
+ * applying; the preview says exactly what will change.
+ */
+{ type: "fixAvailable"; repair: RepairOffer; project: ProjectId } | { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" }
 export type OperationId = number
 export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } | 
 /**
