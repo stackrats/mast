@@ -51,6 +51,7 @@ pub const REPAIR_REMOVE_HOT: &str = "remove-hot-file";
 pub const REPAIR_NORMALIZE_ENV_EOL: &str = "normalize-env-eol";
 pub const REPAIR_ADD_HOST_GATEWAY: &str = "add-host-gateway";
 pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
+pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -231,6 +232,23 @@ pub struct ProjectFacts {
     /// (service, image) for every image-based service in the resolved model
     /// — what the stub-drift check reads.
     pub service_images: Vec<(String, String)>,
+    /// Resolved compose project name (None when the model is unresolved).
+    pub compose_name: Option<String>,
+    /// The project directory's basename, and whether the compose project
+    /// name is merely derived from it (nothing pins it explicitly).
+    pub dir_basename: String,
+    pub name_from_dir: bool,
+    /// Lowercased `php -m` output from the running app container; `None`
+    /// when not probeable. Feeds the Xdebug and Redis extension checks.
+    pub php_modules: Option<Vec<String>>,
+    /// `.env` sets PHP_CLI_SERVER_WORKERS (silently ignored under Sail
+    /// since Laravel 11.45 — framework #56922).
+    pub cli_server_workers: bool,
+    /// `.env` REDIS_CLIENT value, when set.
+    pub redis_client: Option<String>,
+    /// The app service (`APP_SERVICE`, default laravel.test) — the target
+    /// for in-container probes.
+    pub app_service: String,
 }
 
 /// Everything the Xdebug doctor needs, per project. Gathered only when
@@ -418,6 +436,21 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           service through the compose write transaction — what Sail's \
                           current stub ships and files published before it lack. Without \
                           it, Xdebug's default client_host resolves to nothing on Linux."
+                .into(),
+            arg: arg.map(String::from),
+        }),
+        REPAIR_SET_PROJECT_NAME => Some(RepairSpec {
+            id: REPAIR_SET_PROJECT_NAME,
+            title: match arg {
+                Some(name) => format!("Pin the compose project name to \"{name}\""),
+                None => "Pin the compose project name".into(),
+            },
+            risk: RiskTier::Caution,
+            description: "Writes COMPOSE_PROJECT_NAME to `.env` through the transactional \
+                          writer. Apply while the project is STOPPED: the new name is a new \
+                          compose identity, so existing containers and named volumes are \
+                          left behind under the old name (data is not deleted, but fresh \
+                          empty volumes are created on next start)."
                 .into(),
             arg: arg.map(String::from),
         }),
