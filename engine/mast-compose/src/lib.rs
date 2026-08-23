@@ -13,6 +13,7 @@
 
 pub mod catalog;
 pub mod network;
+pub mod sail;
 pub mod transaction;
 pub mod versions;
 

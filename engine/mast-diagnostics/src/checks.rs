@@ -645,6 +645,71 @@ impl Check for ConfigCache {
     }
 }
 
+/// PHP runtime coherence for Sail-shaped builds. Two traps from the tracker:
+/// a Sail update removes the runtime a committed compose file still builds
+/// from (PHP 7.4/8.0 removals), and a half-done version switch — context
+/// changed, image tag not, or vice versa — that builds one PHP and labels it
+/// as another (laravel/sail#442's afternoon-eating shape).
+struct PhpRuntime;
+impl Check for PhpRuntime {
+    fn id(&self) -> &'static str {
+        "php-runtime"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.sail_builds.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for p in &ctx.projects {
+            for b in &p.sail_builds {
+                if !b.context_exists {
+                    let available = if p.available_runtimes.is_empty() {
+                        "run composer install first".to_string()
+                    } else {
+                        format!("available: {}", p.available_runtimes.join(", "))
+                    };
+                    findings.push(for_project(
+                        finding(
+                            self.id(),
+                            Severity::Error,
+                            format!(
+                                "{}: \"{}\" builds from a runtime that does not exist",
+                                p.name, b.service
+                            ),
+                            format!(
+                                "build.context is {} but that directory is missing — a Sail \
+                                 update has likely dropped PHP {} ({available}). Point the \
+                                 context (and the image tag) at an available series, then \
+                                 rebuild without cache.",
+                                b.context, b.context_series
+                            ),
+                        ),
+                        p,
+                    ));
+                } else if let Some(image_series) = &b.image_series
+                    && *image_series != b.context_series
+                {
+                    findings.push(for_project(
+                        finding(
+                            self.id(),
+                            Severity::Warning,
+                            format!(
+                                "{}: \"{}\" builds PHP {} but tags it sail-{}/app",
+                                p.name, b.service, b.context_series, image_series
+                            ),
+                            "A PHP version switch changes BOTH build.context and the image \
+                             tag; half-done, the container runs a different PHP than \
+                             everything believes. Align them, then rebuild without cache.",
+                        ),
+                        p,
+                    ));
+                }
+            }
+        }
+        findings
+    }
+}
+
 fn version_series(text: &str) -> Vec<u32> {
     text.trim()
         .trim_start_matches('v')
@@ -966,6 +1031,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(DbVolumeVersion),
         Box::new(ConfigCache),
         Box::new(ComposeQuirks),
+        Box::new(PhpRuntime),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1042,6 +1108,8 @@ mod tests {
             db_versions: Vec::new(),
             config_cached: false,
             dotted_services: Vec::new(),
+            sail_builds: Vec::new(),
+            available_runtimes: Vec::new(),
         }
     }
 
@@ -1245,6 +1313,51 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn php_runtime_issues_split_missing_context_from_mismatched_tag() {
+        let mut p = sail_project("a");
+        p.available_runtimes = vec!["8.3".into(), "8.4".into()];
+        p.sail_builds = vec![
+            crate::SailBuildFacts {
+                service: "laravel.test".into(),
+                context: "./vendor/laravel/sail/runtimes/8.0".into(),
+                context_series: "8.0".into(),
+                context_exists: false,
+                image_series: Some("8.0".into()),
+            },
+            crate::SailBuildFacts {
+                service: "worker".into(),
+                context: "./vendor/laravel/sail/runtimes/8.4".into(),
+                context_series: "8.4".into(),
+                context_exists: true,
+                image_series: Some("8.2".into()),
+            },
+        ];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let missing = findings
+            .iter()
+            .find(|f| f.check == "php-runtime" && f.severity == Severity::Error)
+            .unwrap();
+        assert!(missing.detail.contains("8.3, 8.4"), "{}", missing.detail);
+        let mismatch = findings
+            .iter()
+            .find(|f| f.check == "php-runtime" && f.severity == Severity::Warning)
+            .unwrap();
+        assert!(mismatch.title.contains("builds PHP 8.4 but tags it sail-8.2/app"), "{}", mismatch.title);
+
+        // A coherent build says nothing.
+        let mut q = sail_project("b");
+        q.sail_builds = vec![crate::SailBuildFacts {
+            service: "laravel.test".into(),
+            context: "./vendor/laravel/sail/runtimes/8.4".into(),
+            context_series: "8.4".into(),
+            context_exists: true,
+            image_series: Some("8.4".into()),
+        }];
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "php-runtime"));
     }
 
     #[test]

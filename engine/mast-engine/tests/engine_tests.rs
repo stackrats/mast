@@ -2012,6 +2012,76 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
     drop(squatter2);
 }
 
+/// A failing operation whose output carries a known error signature ends
+/// with a plain-language explanation before the Failed event — the GPG/PPA
+/// build-failure wave, port squatters, and version-locked volumes read as
+/// sentences instead of scrollback.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_operations_explain_known_error_signatures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "sigapp");
+    std::fs::write(
+        project.join("fail-like-a-gpg-outage.sh"),
+        "#!/bin/sh\necho 'gpg: keyserver receive failed: Server indicated a failure' >&2\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project.join("fail-like-a-gpg-outage.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "build".into(),
+                command: "./fail-like-a-gpg-outage.sh".into(),
+                auto_start: false,
+            }],
+        },
+    )
+    .await;
+
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "build".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut lines: Vec<String> = Vec::new();
+    let mut failed = false;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Output { line, .. } => lines.push(line),
+            OperationEventKind::Failed { .. } => {
+                failed = true;
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "the command must fail");
+    let cause = lines
+        .iter()
+        .position(|l| l.starts_with("likely cause:") && l.contains("GPG keyserver"))
+        .unwrap_or_else(|| panic!("no explanation in {lines:?}"));
+    assert!(
+        lines[cause + 1].starts_with("  fix:"),
+        "advice must follow the cause: {lines:?}"
+    );
+}
+
 /// `docker compose config` runs without a daemon, but the CLI still has to be
 /// installed; tests that need a resolved model skip without it.
 async fn compose_cli_available() -> bool {
