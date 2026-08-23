@@ -508,24 +508,35 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                 None => "Add the /etc/hosts entry".into(),
             },
             risk: RiskTier::HighRisk,
-            description: "Appends one `127.0.0.1` line to /etc/hosts so the browser \
-                          resolves the local domain. Runs via polkit (pkexec) — you \
-                          will be asked for elevation, and the preview shows the exact \
-                          line."
-                .into(),
+            description: if cfg!(target_os = "macos") {
+                "Appends one `127.0.0.1` line to /etc/hosts so the browser resolves \
+                 the local domain. Asks for your administrator password, and the \
+                 preview shows the exact line."
+            } else {
+                "Appends one `127.0.0.1` line to /etc/hosts so the browser resolves \
+                 the local domain. Runs via polkit (pkexec) — you will be asked for \
+                 elevation, and the preview shows the exact line."
+            }
+            .into(),
             arg: arg.map(str::to_string),
         }),
         REPAIR_TRUST_PROXY_CA => Some(RepairSpec {
             id: REPAIR_TRUST_PROXY_CA,
             title: "Trust the local HTTPS certificate authority".into(),
             risk: RiskTier::HighRisk,
-            description: "Copies the proxy's own root certificate out of the \
-                          `mast-proxy` container and installs it into the system \
-                          trust store (via pkexec) and, when `certutil` exists, into \
-                          ~/.pki/nssdb for Chrome/Chromium. It only ever signs \
-                          certificates for your local domains and never leaves this \
-                          machine."
-                .into(),
+            description: if cfg!(target_os = "macos") {
+                "Copies the proxy's own root certificate out of the `mast-proxy` \
+                 container and adds it to the System keychain as a trusted root \
+                 (asks for your administrator password). It only ever signs \
+                 certificates for your local domains and never leaves this machine."
+            } else {
+                "Copies the proxy's own root certificate out of the `mast-proxy` \
+                 container and installs it into the system trust store (via pkexec) \
+                 and, when `certutil` exists, into ~/.pki/nssdb for Chrome/Chromium. \
+                 It only ever signs certificates for your local domains and never \
+                 leaves this machine."
+            }
+            .into(),
             arg: None,
         }),
         _ => None,
