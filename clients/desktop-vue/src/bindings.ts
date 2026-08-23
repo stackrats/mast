@@ -54,6 +54,30 @@ async envReport(project: ProjectId) : Promise<Result<EnvReport, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async laravelLog(project: ProjectId) : Promise<Result<LaravelLogReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("laravel_log", { project }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async proxyCa() : Promise<Result<ProxyCa | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("proxy_ca") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async phpRuntime(project: ProjectId) : Promise<Result<PhpRuntimeReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("php_runtime", { project }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async networkAttachPreview(workspace: WorkspaceId, project: ProjectId) : Promise<Result<FileEditPreview, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("network_attach_preview", { workspace, project }) };
@@ -302,6 +326,11 @@ export type Action =
  */
 { type: "openInBrowser"; id: ProjectId } | 
 /**
+ * Open an http(s) URL Mast itself surfaced (share URL, tunnel
+ * dashboard) in the default browser. Non-http schemes are refused.
+ */
+{ type: "openUrl"; url: string } | 
+/**
  * Persist external-tool preferences.
  */
 { type: "setIntegrations"; integrations: IntegrationSettings } | 
@@ -372,6 +401,63 @@ export type Action =
  * (or any edited service block) takes effect.
  */
 { type: "rebuildService"; id: ProjectId; service: string } | 
+/**
+ * Switch a Sail-built service to another vendored PHP runtime, as ONE
+ * operation: rewrites `build.context` and the `sail-X.Y/app` image tag
+ * together, rebuilds without cache, recreates the container when the
+ * project is running, and verifies `php -v` inside it — the exact
+ * sequence users half-do by hand (laravel/sail#442).
+ */
+{ type: "setPhpVersion"; id: ProjectId; service: string; series: string } | 
+/**
+ * Pin the app's Node major (`build.args.NODE_VERSION`, Sail's
+ * documented override of the runtime Dockerfile's default) and run the
+ * same verified switch as PHP: rebuild without cache, recreate when
+ * running, confirm `node -v` inside the container.
+ */
+{ type: "setNodeVersion"; id: ProjectId; service: string; major: string } | 
+/**
+ * Publish the running app through Sail's expose tunnel (`sail share`,
+ * same image, flags and `.env` knobs). Long-running: the operation
+ * stays live while the tunnel is up, cancelling it stops the share.
+ * The public URL lands on [`ProjectSummary::share_url`] once the
+ * tunnel reports it.
+ */
+{ type: "shareProject"; id: ProjectId } | 
+/**
+ * Claim (or clear, with `domain: None`) a stable `https://…test`
+ * address for this project. Mast keeps one shared Caddy container
+ * (`mast-proxy`, ports 80/443) whose internal CA signs the
+ * certificate; the two host-side steps it cannot do silently — the
+ * `/etc/hosts` line and trusting that CA — surface as high-risk Fix
+ * buttons on the operation.
+ */
+{ type: "setLocalDomain"; id: ProjectId; domain: string | null } | 
+/**
+ * Open the platform's hosts file in the desktop's default editor — the
+ * manual fallback when the elevated add-hosts-entry repair is not
+ * possible or not wanted. Opens read-only for most users; the dialog
+ * shows the exact line to add.
+ */
+{ type: "openHostsFile" } | 
+/**
+ * Truncate `storage/logs/laravel.log` — a fresh slate for the App log
+ * viewer. The file is kept (empty), so running processes keep their
+ * open handle and Laravel appends as before.
+ */
+{ type: "clearLaravelLog"; id: ProjectId } | 
+/**
+ * Open a directory in the file manager. Restricted to paths Mast
+ * already knows — a watched directory or an imported project's root —
+ * so the surface stays as narrow as the buttons that use it.
+ */
+{ type: "revealPath"; path: string } | 
+/**
+ * Open one file inside a project in the configured editor — the
+ * vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
+ * dialog. `file` is project-relative and may not escape the project.
+ */
+{ type: "openProjectFile"; id: ProjectId; file: string } | 
 /**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
@@ -622,6 +708,39 @@ editor: string | null;
  */
 autoPortRemap?: boolean }
 /**
+ * One grouped entry from `storage/logs/laravel.log`: the Monolog header
+ * split into fields, with the stack trace (when one follows) kept attached
+ * instead of scattered across raw lines.
+ */
+export type LaravelLogEntry = { timestamp: string; environment: string; 
+/**
+ * Monolog level, uppercase (`ERROR`, `WARNING`, …).
+ */
+level: string; message: string; 
+/**
+ * Continuation lines — stack trace, previous exceptions — when any.
+ */
+detail: string | null }
+/**
+ * The tail of the application log, parsed. On demand only, like
+ * [`EnvReport`]: log bodies routinely carry user data.
+ */
+export type LaravelLogReport = { 
+/**
+ * False when `storage/logs/laravel.log` does not exist (fresh app, or
+ * LOG_CHANNEL points elsewhere).
+ */
+exists: boolean; 
+/**
+ * Newest first.
+ */
+entries: LaravelLogEntry[]; 
+/**
+ * True when the file outgrew the read window and older entries were
+ * left behind.
+ */
+truncated: boolean }
+/**
  * A container's last words. Persisted, therefore redacted at write time —
  * unlike a live log stream, which is transient and is not (see `redact.rs`).
  */
@@ -661,7 +780,14 @@ export type OperationEventKind = { type: "started" } | { type: "progress"; perce
 /**
  * One line of live subprocess output (compose/sail shell-outs).
  */
-{ type: "output"; line: string; stderr: boolean } | { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" }
+{ type: "output"; line: string; stderr: boolean } | 
+/**
+ * A one-click repair that addresses a failure signature spotted in this
+ * operation's output — emitted just before [`Self::Failed`], so a
+ * failure can carry its own Fix button. Preview the repair before
+ * applying; the preview says exactly what will change.
+ */
+{ type: "fixAvailable"; repair: RepairOffer; project: ProjectId } | { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" }
 export type OperationId = number
 export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } | 
 /**
@@ -674,6 +800,67 @@ export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } |
  * discard stragglers from a superseded subscription generation.
  */
 export type PatchStreamItem = { streamId: number; item: SubscriptionItem }
+/**
+ * One effective `php.ini` setting read from the running app container.
+ */
+export type PhpIniValue = { key: string; 
+/**
+ * As `ini_get` reports it; empty when the runtime has no value.
+ */
+value: string }
+/**
+ * What the PHP runtime actually is right now: loaded extensions and the
+ * common limits, read live from the app container — plus where the
+ * vendored runtime keeps the files that change them (paths relative to
+ * the project, present only when the files exist).
+ */
+export type PhpRuntimeReport = { 
+/**
+ * `php -m`, sorted, section headers dropped.
+ */
+extensions: string[]; 
+/**
+ * The classic limits (`memory_limit`, upload sizes, …), in a stable
+ * display order.
+ */
+ini: PhpIniValue[]; 
+/**
+ * The vendored runtime's `php.ini` (e.g. `docker/8.4/php.ini`).
+ */
+iniFile: string | null; 
+/**
+ * The vendored runtime's `Dockerfile` — where extensions are added.
+ */
+dockerfile: string | null }
+/**
+ * The app's Sail PHP runtime: what `build.context` currently pins and which
+ * vendored runtimes it could switch to (drives the PHP version picker).
+ */
+export type PhpVersionInfo = { 
+/**
+ * The Sail-built compose service (usually the app).
+ */
+service: string; 
+/**
+ * PHP series the build context pins ("8.4").
+ */
+current: string; 
+/**
+ * Series available under `vendor/laravel/sail/runtimes/`.
+ */
+available: string[]; 
+/**
+ * Effective Node major: the compose `build.args.NODE_VERSION` override
+ * when present, else the runtime Dockerfile's `ARG NODE_VERSION`
+ * default. None when neither is readable.
+ */
+node?: string | null; 
+/**
+ * Node majors the picker offers (nodesource release lines the runtime
+ * Dockerfile can install). Empty when the build shape cannot take an
+ * override — the chip stays read-only then.
+ */
+nodeAvailable?: string[] }
 /**
  * A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
  * long-running artisan command inside the app container. Detected from
@@ -688,7 +875,14 @@ export type ProjectCommand = { name: string; command: string;
 /**
  * Run automatically once the project reaches Running.
  */
-autoStart: boolean }
+autoStart: boolean; 
+/**
+ * Working directory: relative to the project (`../frontend`) or
+ * absolute. None = the project directory. Lets a Sail project drive a
+ * sibling repo's dev server; `sail …` commands refuse it, since the
+ * wrapper only works from the project root.
+ */
+cwd?: string | null }
 export type ProjectId = string
 export type ProjectStatus = "stopped" | "starting" | "running" | "degraded" | "failed"
 export type ProjectSummary = { id: ProjectId; name: string; 
@@ -727,10 +921,45 @@ gitDirty?: boolean | null;
  */
 appUrl?: string | null; 
 /**
+ * The Sail PHP runtime and its alternatives; None when no service
+ * builds from a Sail runtime shape.
+ */
+php?: PhpVersionInfo | null; 
+/**
+ * Public URL of the live share tunnel ([`Action::ShareProject`]);
+ * None while not sharing.
+ */
+shareUrl?: string | null; 
+/**
+ * The live tunnel's local dashboard (SAIL_SHARE_DASHBOARD, possibly
+ * auto-moved off a busy port); None while not sharing.
+ */
+shareDashboardUrl?: string | null; 
+/**
+ * Stable local HTTPS address ([`Action::SetLocalDomain`]) served by the
+ * shared `mast-proxy` Caddy container; None when not claimed.
+ */
+localDomain?: string | null; 
+/**
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …
  */
 warnings: string[] }
+/**
+ * The local HTTPS proxy's root certificate, exported for manual trust —
+ * Firefox's import dialog wants the file, `curl --cacert` and
+ * `NODE_EXTRA_CA_CERTS` want the path, and pasting into another tool wants
+ * the PEM text.
+ */
+export type ProxyCa = { 
+/**
+ * Where the exported `root.crt` lives on this machine.
+ */
+path: string; 
+/**
+ * The certificate itself, PEM-encoded.
+ */
+pem: string }
 export type RepairAuditEntry = { appliedUnix: number; repair: string; projectName: string | null; risk: string; outcome: string }
 /**
  * A repair a finding offers. `arg` disambiguates the target when the id
@@ -764,7 +993,18 @@ export type ServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy"
  * One compose service of a project: declared by the resolved model and/or
  * observed as a container. `container_id == None` means declared-but-absent.
  */
-export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth }
+export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth; 
+/**
+ * Host-reachable address of this service's web dashboard (Mailpit,
+ * Meilisearch, MinIO console, …) when the image is recognized and the
+ * container port is published — powers "Open UI" on the service chip.
+ */
+uiUrl?: string | null; 
+/**
+ * Host-side port of a recognized database service — what a GUI client
+ * on the host connects to (with the credentials from `.env`).
+ */
+dbPort?: number | null }
 /**
  * One service's share of the machine, over one sampling interval.
  */

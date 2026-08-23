@@ -14,15 +14,18 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DOCKER_GROUP, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER,
+    REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
+    REPAIR_REASSIGN_PORTS, REPAIR_TRUST_PROXY_CA,
+    REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
 use crate::{Engine, OperationEventKind, OperationId, workspace_summaries};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const PROBE_CAP: usize = 64 * 1024;
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_CAP: usize = 64 * 1024;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -47,7 +50,7 @@ fn risk_to_contract(r: RiskTier) -> RepairRisk {
     }
 }
 
-fn offer_to_contract(spec: RepairSpec) -> RepairOffer {
+pub(crate) fn offer_to_contract(spec: RepairSpec) -> RepairOffer {
     RepairOffer {
         id: spec.id.to_string(),
         title: spec.title,
@@ -186,35 +189,55 @@ struct ProjectSeed {
     name: String,
     path: PathBuf,
     resolution_error: Option<String>,
-    service_names: Vec<String>,
+    /// (service name, aliases) from the resolved model.
+    services: Vec<(String, Vec<String>)>,
+    /// The compose project name comes only from the directory basename —
+    /// nothing pins it (-p, env, .env, name:).
+    name_from_dir: bool,
     host_ports: Vec<(String, u16)>,
     external_networks: Vec<String>,
     running: bool,
 }
 
-/// Filesystem half of a project's facts — runs in `spawn_blocking`.
-fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
+/// Filesystem half of a project's facts — runs in `spawn_blocking`. The
+/// second value is the database the async half should probe, when there is
+/// one (`facts.db` stays `None` until that probe fills it).
+fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
     let env = mast_compose::parse_env_file(&env_path);
-    let env_error_count = if env_present {
+    let service_names: Vec<String> = seed
+        .services
+        .iter()
+        .flat_map(|(name, aliases)| std::iter::once(name.clone()).chain(aliases.iter().cloned()))
+        .collect();
+    let mut db_target = None;
+    let pairs: Vec<(String, String)> = if env_present {
         let src = std::fs::read_to_string(&env_path).unwrap_or_default();
-        let parsed = mast_laravel::EnvFile::parse(&src);
-        let pairs: Vec<(String, String)> =
-            parsed.entries().map(|e| (e.key.clone(), e.value.clone())).collect();
-        mast_laravel::validate(&pairs, &seed.service_names)
+        mast_laravel::EnvFile::parse(&src)
+            .entries()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let env_error_count = if env_present {
+        db_target = crate::db_repair::resolve_db_target(&pairs, &seed.services);
+        mast_laravel::validate(&pairs, &service_names)
             .iter()
             .filter(|f| f.severity == mast_laravel::Severity::Error)
             .count()
     } else {
         0
     };
+    let sail_flavored = mast_project::is_sail_flavored(&seed.path);
     let node = mast_project::inspect_node_project(&seed.path);
-    ProjectFacts {
-        sail_flavored: mast_project::is_sail_flavored(&seed.path),
-        is_laravel: std::fs::read_to_string(seed.path.join("composer.json"))
-            .map(|c| c.contains("laravel/framework"))
-            .unwrap_or(false),
+    let is_laravel = std::fs::read_to_string(seed.path.join("composer.json"))
+        .map(|c| c.contains("laravel/framework"))
+        .unwrap_or(false);
+    let facts = ProjectFacts {
+        sail_flavored,
+        is_laravel,
         has_compose: mast_project::has_compose_file(&seed.path),
         has_vendor: seed.path.join("vendor").is_dir(),
         package_manager: node.as_ref().map(|n| n.manager.as_str().to_string()),
@@ -226,6 +249,13 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
             .unwrap_or_default(),
         env_present,
         env_example_present: seed.path.join(".env.example").is_file(),
+        app_key_empty: env_present
+            && env.get("APP_KEY").is_none_or(|v| v.trim().is_empty()),
+        storage_link_missing: seed.path.join("storage/app/public").is_dir()
+            && seed.path.join("public").is_dir()
+            // symlink_metadata: a dangling link still counts as present —
+            // replacing it is not this repair's call.
+            && std::fs::symlink_metadata(seed.path.join("public/storage")).is_err(),
         wwwuser: env.get("WWWUSER").cloned(),
         wwwgroup: env.get("WWWGROUP").cloned(),
         env_error_count,
@@ -235,12 +265,230 @@ fn inspect_project(seed: ProjectSeed) -> ProjectFacts {
         running: seed.running,
         external_networks: seed.external_networks,
         resolution_error: seed.resolution_error,
+        db: None,
+        db_versions: Vec::new(),
+        config_cached: seed.path.join("bootstrap/cache/config.php").is_file(),
+        dotted_services: seed
+            .services
+            .iter()
+            .filter(|(name, _)| name.contains('.'))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        sail_builds: crate::php::sail_build_facts(&seed.path),
+        available_runtimes: crate::php::available_runtimes(&seed.path),
+        foreign_owned: if is_laravel {
+            foreign_owned_scan(&seed.path, uid_gid().0)
+        } else {
+            None
+        },
+        drifted_services: Vec::new(),
+        compose_name: None, // filled from the resolved model in gather
+        dir_basename: seed
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        name_from_dir: seed.name_from_dir,
+        php_modules: None, // filled by the gather probe
+        cli_server_workers: env
+            .get("PHP_CLI_SERVER_WORKERS")
+            .is_some_and(|v| !v.trim().is_empty()),
+        redis_client: env.get("REDIS_CLIENT").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+        app_service: env
+            .get("APP_SERVICE")
+            .cloned()
+            .unwrap_or_else(|| "laravel.test".to_string()),
+        vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
+            .ok()
+            .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
+            .map(|hot| mast_diagnostics::ViteHotFacts {
+                dev_server_listening: dev_server_listening(&hot),
+                url: hot.url,
+            }),
+        env_crlf: env_present
+            && std::fs::read(&env_path)
+                .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
+                .unwrap_or(false),
+        xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
+        service_images: Vec::new(), // filled from the resolved model in gather
+    };
+    (facts, db_target)
+}
+
+/// The Xdebug doctor's per-project facts (no docker involved; the
+/// extension probe is the async half's job).
+fn xdebug_facts(
+    dir: &Path,
+    pairs: &[(String, String)],
+    env: &std::collections::HashMap<String, String>,
+) -> Option<mast_diagnostics::XdebugFacts> {
+    let xdebug = mast_laravel::xdebug::xdebug_env(pairs)?;
+    let mut compose_passes_mode = false;
+    let mut compose_has_host_gateway = false;
+    for name in [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+        "compose.override.yaml",
+        "compose.override.yml",
+        "docker-compose.override.yaml",
+        "docker-compose.override.yml",
+    ] {
+        if let Ok(source) = std::fs::read_to_string(dir.join(name)) {
+            compose_passes_mode |= source.contains("XDEBUG_MODE");
+            compose_has_host_gateway |= source.contains("host-gateway");
+        }
     }
+    // The IDE's listener lives on THIS machine whatever client_host says —
+    // that variable is how the container finds us, not where the IDE binds.
+    let ide_listening = xdebug.wants_debug().then(|| {
+        use std::net::{SocketAddr, TcpStream};
+        ["127.0.0.1", "[::1]"].iter().any(|host| {
+            format!("{host}:{}", xdebug.client_port)
+                .parse::<SocketAddr>()
+                .is_ok_and(|addr| {
+                    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+                })
+        })
+    });
+    Some(mast_diagnostics::XdebugFacts {
+        app_service: env
+            .get("APP_SERVICE")
+            .cloned()
+            .unwrap_or_else(|| "laravel.test".to_string()),
+        env: xdebug,
+        compose_passes_mode,
+        compose_has_host_gateway,
+        ide_listening,
+        extension_loaded: None,
+    })
+}
+
+/// Bounded ownership scan over the paths Laravel must write (`storage/`,
+/// `bootstrap/cache`): anything owned by a uid other than the user's is the
+/// #81 permission trap in its cured-too-late form. Depth- and entry-capped so
+/// a giant storage/ cannot stall gathering; a truncated count still proves
+/// the problem exists.
+#[cfg(unix)]
+fn foreign_owned_scan(dir: &Path, uid: u32) -> Option<(usize, String, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    if uid == 0 {
+        return None; // root owns everything it looks at — the scan is meaningless
+    }
+    let mut count = 0usize;
+    let mut example: Option<(String, u32)> = None;
+    let mut budget = 2000usize;
+    let mut note = |path: &Path, owner: u32| {
+        count += 1;
+        if example.is_none() {
+            let rel = path.strip_prefix(dir).unwrap_or(path);
+            example = Some((rel.display().to_string(), owner));
+        }
+    };
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    for root in ["storage", "bootstrap/cache"] {
+        let path = dir.join(root);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.uid() != uid {
+            note(&path, meta.uid());
+        }
+        if meta.is_dir() {
+            stack.push((path, 0));
+        }
+    }
+    while let Some((path, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else { continue };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return example.map(|(path, owner)| (count, path, owner));
+            }
+            budget -= 1;
+            let child = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&child) else { continue };
+            if meta.uid() != uid {
+                note(&child, meta.uid());
+            }
+            if meta.is_dir() && depth < 4 {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    example.map(|(path, owner)| (count, path, owner))
+}
+
+/// Windows adapter TODO: unix ownership semantics do not apply.
+#[cfg(not(unix))]
+fn foreign_owned_scan(_dir: &Path, _uid: u32) -> Option<(usize, String, u32)> {
+    None
+}
+
+/// Current per-service config hashes (`config --hash "*"`), through the
+/// read-only runner rule: `SAIL_SKIP_CHECKS=1 sail` for Sail projects, bare
+/// compose otherwise. Compared against running containers'
+/// `com.docker.compose.config-hash` labels — ADR-0001's drift signal.
+async fn config_hashes(
+    invocation: &mast_compose::ComposeInvocation,
+) -> Option<std::collections::HashMap<String, String>> {
+    let (argv, env) =
+        crate::db_repair::scoped_compose_argv(invocation, &["config", "--hash", "*"]);
+    let out = run_command(&argv, Some(&invocation.project_dir), &env, PROBE_TIMEOUT, PROBE_CAP)
+        .await
+        .ok()
+        .filter(|o| o.success())?;
+    Some(
+        out.stdout
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                Some((cols.next()?.to_string(), cols.next()?.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// Does anything answer at the hot file's address? `None` when the host is
+/// not loopback — a remote dev server is not ours to judge from here.
+pub(crate) fn dev_server_listening(hot: &mast_laravel::vite::HotFile) -> Option<bool> {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    if !hot.loopback {
+        return None;
+    }
+    let host = hot.host.trim_start_matches('[').trim_end_matches(']');
+    // Wildcard binds answer on the loopback address.
+    let host = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
+    let addrs: Vec<SocketAddr> = (host, hot.port).to_socket_addrs().ok()?.collect();
+    Some(
+        addrs
+            .iter()
+            .any(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(250)).is_ok()),
+    )
+}
+
+/// The containerized chown for [`REPAIR_CHOWN_STORAGE`]: mounts the project
+/// and touches ONLY the paths Laravel must own. `None` when neither target
+/// exists.
+fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
+    let targets: Vec<String> = ["storage", "bootstrap/cache"]
+        .iter()
+        .filter(|rel| dir.join(rel).is_dir())
+        .map(|rel| format!("/mast-fix/{rel}"))
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> =
+        ["docker", "run", "--rm", "-v"].map(String::from).into();
+    argv.push(format!("{}:/mast-fix", dir.display()));
+    argv.extend(["alpine:latest".into(), "chown".into(), "-R".into()]);
+    argv.push(format!("{uid}:{gid}"));
+    argv.extend(targets);
+    Some(argv)
 }
 
 impl Engine {
     async fn gather_diag_ctx(&self) -> DiagCtx {
-        let (docker, seeds, workspace_issues, docker_host_env) = {
+        let (docker, seeds, invocations, db_metas, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
@@ -250,19 +498,20 @@ impl Engine {
                     name: e.summary.name.clone(),
                     path: e.record.path.clone(),
                     resolution_error: e.summary.resolution_error.clone(),
-                    service_names: e
+                    services: e
                         .model
                         .as_ref()
                         .map(|m| {
                             m.services
                                 .iter()
-                                .flat_map(|s| {
-                                    std::iter::once(s.name.clone())
-                                        .chain(s.aliases.iter().cloned())
-                                })
+                                .map(|s| (s.name.clone(), s.aliases.clone()))
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    name_from_dir: e
+                        .invocation
+                        .as_ref()
+                        .is_none_or(|i| i.name_source == mast_compose::NameSource::DirBasename),
                     host_ports: e.host_ports.clone(),
                     external_networks: e
                         .model
@@ -270,6 +519,31 @@ impl Engine {
                         .map(|m| m.external_networks.clone())
                         .unwrap_or_default(),
                     running: e.summary.status != mast_contract::ProjectStatus::Stopped,
+                })
+                .collect();
+            let invocations: std::collections::HashMap<String, mast_compose::ComposeInvocation> =
+                st.projects
+                    .values()
+                    .filter_map(|e| e.invocation.clone().map(|i| (e.record.id.clone(), i)))
+                    .collect();
+            let db_metas: Vec<crate::db_repair::DbServiceMeta> = st
+                .projects
+                .values()
+                .filter_map(|e| {
+                    let model = e.model.as_ref()?;
+                    Some(crate::db_repair::DbServiceMeta {
+                        project_id: e.record.id.clone(),
+                        compose_name: model.name.clone(),
+                        services: model
+                            .services
+                            .iter()
+                            .filter_map(|s| {
+                                s.image
+                                    .clone()
+                                    .map(|image| (s.name.clone(), image, s.volumes.clone()))
+                            })
+                            .collect(),
+                    })
                 })
                 .collect();
             let issues = workspace_summaries(&st)
@@ -282,7 +556,7 @@ impl Engine {
                 .process_env
                 .get("DOCKER_HOST")
                 .is_some_and(|v| !v.is_empty());
-            (st.docker.clone(), seeds, issues, docker_host_env)
+            (st.docker.clone(), seeds, invocations, db_metas, issues, docker_host_env)
         };
 
         let compose_version = {
@@ -296,19 +570,30 @@ impl Engine {
                 .filter(|v| !v.is_empty())
         };
 
-        // Security options + data root in one daemon round trip.
-        let (rootless, docker_root) = {
-            let argv: Vec<String> =
-                ["docker", "info", "--format", "{{.SecurityOptions}}\t{{.DockerRootDir}}"]
-                    .map(String::from)
-                    .into();
+        // Security options, data root and server version in one round trip.
+        let (rootless, docker_root, docker_server_version) = {
+            let argv: Vec<String> = [
+                "docker",
+                "info",
+                "--format",
+                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}",
+            ]
+            .map(String::from)
+            .into();
             match run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP).await {
                 Ok(out) if out.success() => {
                     let line = out.stdout.lines().next().unwrap_or_default();
-                    let (security, root) = line.split_once('\t').unwrap_or((line, ""));
-                    (Some(security.contains("rootless")), Some(root.trim().to_string()))
+                    let mut cols = line.split('\t');
+                    let security = cols.next().unwrap_or_default();
+                    let root = cols.next().unwrap_or_default();
+                    let server = cols.next().unwrap_or_default().trim();
+                    (
+                        Some(security.contains("rootless")),
+                        Some(root.trim().to_string()),
+                        (!server.is_empty()).then(|| server.to_string()),
+                    )
                 }
-                _ => (None, None),
+                _ => (None, None, None),
             }
         };
 
@@ -340,11 +625,126 @@ impl Engine {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
 
-        let projects = tokio::task::spawn_blocking(move || {
+        let mut inspected = tokio::task::spawn_blocking(move || {
             seeds.into_iter().map(inspect_project).collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
+
+        // Service images from the resolved model (needs no docker) — feeds
+        // the stub-drift check.
+        for meta in &db_metas {
+            if let Some((facts, _)) = inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+            {
+                facts.service_images = meta
+                    .services
+                    .iter()
+                    .map(|(service, image, _)| (service.clone(), image.clone()))
+                    .collect();
+                facts.compose_name = Some(meta.compose_name.clone());
+            }
+        }
+
+        // Live credential probes — only where there is something to probe:
+        // a running project whose DB_HOST names a service in its model.
+        if docker.available {
+            for (facts, target) in &mut inspected {
+                let Some(target) = target.take() else { continue };
+                if !facts.running {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                facts.db = crate::db_repair::probe_db(invocation, &target).await;
+            }
+            // Extension probe: one `php -m` per running project that needs
+            // it — an Xdebug mode is requested, or a redis service exists
+            // with phpredis expected. Feeds both checks from one exec.
+            for (facts, _) in &mut inspected {
+                if !facts.running {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                let wants_redis_check = facts
+                    .redis_client
+                    .as_deref()
+                    .is_none_or(|client| client == "phpredis")
+                    && facts.service_images.iter().any(|(_, image)| {
+                        image.contains("redis") || image.contains("valkey")
+                    });
+                if facts.xdebug.is_none() && !wants_redis_check {
+                    continue;
+                }
+                let app_service = facts.app_service.clone();
+                let argv = crate::db_repair::exec_env_argv(
+                    invocation,
+                    &app_service,
+                    &[],
+                    &["php".into(), "-m".into()],
+                );
+                if let Ok(out) =
+                    run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                    && out.success()
+                {
+                    facts.php_modules = Some(
+                        out.stdout
+                            .lines()
+                            .map(|l| l.trim().to_ascii_lowercase())
+                            .filter(|l| !l.is_empty() && !l.starts_with('['))
+                            .collect(),
+                    );
+                }
+                if let (Some(modules), Some(xdebug)) =
+                    (facts.php_modules.clone(), facts.xdebug.as_mut())
+                {
+                    xdebug.extension_loaded = Some(modules.iter().any(|m| m == "xdebug"));
+                }
+            }
+            // Volume-vs-image version scan — deliberately including stopped
+            // projects: the point is warning before the crash-loop.
+            let mut version_issues = crate::db_repair::scan_db_versions(&db_metas).await;
+            for (facts, _) in &mut inspected {
+                if let Some(issues) = version_issues.remove(&facts.id) {
+                    facts.db_versions = issues;
+                }
+            }
+            // Config drift: containers created under an older resolved
+            // config than the files+.env now produce.
+            let adapter = self.inner.adapter.lock().unwrap().clone();
+            let observations = match adapter {
+                Some(adapter) => adapter.list_compose_containers().await.ok(),
+                None => None,
+            };
+            if let Some(observations) = observations {
+                for meta in &db_metas {
+                    let running: Vec<_> = observations
+                        .iter()
+                        .filter(|o| o.project == meta.compose_name && o.state == "running")
+                        .collect();
+                    if running.is_empty() {
+                        continue;
+                    }
+                    let Some(invocation) = invocations.get(&meta.project_id) else { continue };
+                    let Some(current) = config_hashes(invocation).await else { continue };
+                    let mut drifted: Vec<String> = running
+                        .iter()
+                        .filter_map(|o| {
+                            let label = o.config_hash.as_ref()?;
+                            let now = current.get(&o.service)?;
+                            (label != now).then(|| o.service.clone())
+                        })
+                        .collect();
+                    drifted.sort();
+                    drifted.dedup();
+                    if let Some((facts, _)) =
+                        inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+                    {
+                        facts.drifted_services = drifted;
+                    }
+                }
+            }
+        }
+        let projects: Vec<ProjectFacts> = inspected.into_iter().map(|(facts, _)| facts).collect();
 
         DiagCtx {
             system: SystemFacts {
@@ -354,6 +754,8 @@ impl Engine {
                 context_name: docker.context_name.clone(),
                 docker_host_env,
                 compose_version,
+                docker_server_version,
+                linux: cfg!(target_os = "linux"),
                 socket,
                 rootless,
                 snap_docker,
@@ -509,7 +911,7 @@ impl Engine {
                     let summary = if no_op {
                         vec![".env already exists — nothing to do".to_string()]
                     } else {
-                        vec![format!("create .env as a copy of .env.example")]
+                        vec!["create .env as a copy of .env.example".to_string()]
                     };
                     Ok(RepairPlan {
                         repair: offer,
@@ -628,12 +1030,350 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_GENERATE_APP_KEY => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let src = std::fs::read_to_string(path.join(".env"))
+                        .map_err(|_| ErrorInfo::InvalidInput {
+                            message: "no .env file — create one first".into(),
+                        })?;
+                    let file = mast_laravel::EnvFile::parse(&src);
+                    let no_op =
+                        file.get("APP_KEY").is_some_and(|e| !e.value.trim().is_empty());
+                    let summary = if no_op {
+                        vec!["APP_KEY is already set — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            "generate a fresh base64: key (32 random bytes) and write \
+                             APP_KEY to .env"
+                                .into(),
+                            "the key is minted at apply time and never leaves this machine"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_STORAGE_LINK => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let no_op = std::fs::symlink_metadata(path.join("public/storage")).is_ok();
+                    let summary = if no_op {
+                        vec!["public/storage already exists — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            "create symlink public/storage → ../storage/app/public".into(),
+                            "relative, so it resolves on the host and inside the container"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_CHOWN_STORAGE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let argv = chown_storage_argv(&path, uid, gid);
+                    let scan = foreign_owned_scan(&path, uid);
+                    let no_op = scan.is_none();
+                    let summary = match (no_op, argv) {
+                        (true, _) => {
+                            vec!["everything is already owned by you — nothing to do".into()]
+                        }
+                        (false, Some(argv)) => vec![
+                            format!("run: {}", argv.join(" ")),
+                            "only storage/ and bootstrap/cache are touched".into(),
+                            "runs as root in a throwaway container — no sudo on the host"
+                                .into(),
+                        ],
+                        (false, None) => vec!["neither storage/ nor bootstrap/cache exists".into()],
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_SET_PROJECT_NAME => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let name = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "set-project-name needs the name to pin".into(),
+                    })?
+                    .to_string();
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let before = std::fs::read_to_string(&env_path).map_err(|_| {
+                        ErrorInfo::InvalidInput { message: "no .env file — create one first".into() }
+                    })?;
+                    let mut file = mast_laravel::EnvFile::parse(&before);
+                    let no_op = file
+                        .get("COMPOSE_PROJECT_NAME")
+                        .is_some_and(|e| e.value.trim() == name);
+                    let summary = if no_op {
+                        vec![format!("COMPOSE_PROJECT_NAME is already {name} — nothing to do")]
+                    } else {
+                        file.set("COMPOSE_PROJECT_NAME", &name)
+                            .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                        vec![
+                            format!("set COMPOSE_PROJECT_NAME={name} in .env"),
+                            "apply while the project is STOPPED — the new name is a new \
+                             compose identity; old containers/volumes stay under the old \
+                             name"
+                                .into(),
+                        ]
+                    };
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            after: file.to_string(),
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_MIGRATE_MAILPIT => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "migrate-mailpit needs the MailHog service name".into(),
+                    })?
+                    .to_string();
+                let (_invocation, file) = self.catalog_context(project)?;
+                tokio::task::spawn_blocking(move || {
+                    let before = std::fs::read_to_string(&file).map_err(crate::internal_err)?;
+                    let plan = mast_compose::catalog::plan_mailpit_migration(&before, &service)
+                        .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                    let after = mast_yaml_edit::apply_all(&before, &plan.edits)
+                        .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: file.to_string_lossy().into_owned(),
+                            before,
+                            after,
+                            summary: plan.summary.clone(),
+                            no_op: false,
+                        }),
+                        summary: plan.summary,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_ADD_HOST_GATEWAY => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-host-gateway needs the app service name".into(),
+                    })?
+                    .to_string();
+                let (_invocation, file) = self.catalog_context(project)?;
+                tokio::task::spawn_blocking(move || {
+                    let before = std::fs::read_to_string(&file).map_err(crate::internal_err)?;
+                    let (edits, summary) =
+                        mast_compose::sail::plan_add_host_gateway(&before, &service)
+                            .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                    let after = mast_yaml_edit::apply_all(&before, &edits)
+                        .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: file.to_string_lossy().into_owned(),
+                            before,
+                            after,
+                            summary: summary.clone(),
+                            no_op: false,
+                        }),
+                        summary,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_NORMALIZE_ENV_EOL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let crlf = std::fs::read(&env_path)
+                        .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
+                        .unwrap_or(false);
+                    let no_op = !crlf;
+                    let summary = if no_op {
+                        vec![".env already has Unix line endings — nothing to do".into()]
+                    } else {
+                        vec![
+                            "rewrite every CRLF line ending in .env to LF".into(),
+                            "values are untouched; a timestamped backup is kept".into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_REMOVE_HOT => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let hot_path = path.join("public/hot");
+                    let hot = std::fs::read_to_string(&hot_path)
+                        .ok()
+                        .and_then(|c| mast_laravel::vite::parse_hot_file(&c));
+                    let no_op = !hot_path.exists();
+                    let summary = match &hot {
+                        _ if no_op => vec!["public/hot is already gone — nothing to do".into()],
+                        Some(hot) if dev_server_listening(hot) == Some(true) => vec![
+                            format!("a dev server IS listening at {} — applying will refuse", hot.url),
+                            "stop the dev server first, or leave the file alone".into(),
+                        ],
+                        Some(hot) => vec![
+                            format!("delete public/hot (points at {})", hot.url),
+                            "Blade serves built assets again immediately".into(),
+                        ],
+                        None => vec!["delete public/hot".into()],
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_CONFIG_CLEAR => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let cache = path.join("bootstrap/cache/config.php");
+                    let no_op = !cache.is_file();
+                    let summary = if no_op {
+                        vec!["no cached configuration — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            format!("delete {}", cache.display()),
+                            "Laravel reads .env again on the next request".into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_DB_RECONCILE => {
+                self.db_reconcile_preview(offer, self.require_project(project)?, arg).await
+            }
+            REPAIR_DB_RECREATE => {
+                self.db_recreate_preview(offer, self.require_project(project)?, arg).await
+            }
+            REPAIR_HOSTS_ENTRY => {
+                let domain = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-hosts-entry needs the domain".into(),
+                    })?
+                    .to_ascii_lowercase();
+                // Validated again here: the arg travels through the UI and
+                // ends up interpolated into a root shell.
+                crate::proxy::validate_local_domain(&domain)?;
+                tokio::task::spawn_blocking(move || {
+                    let hosts_path = crate::proxy::hosts_file_path();
+                    let before = std::fs::read_to_string(hosts_path).unwrap_or_default();
+                    let no_op = crate::proxy::hosts_resolves(&before, &domain);
+                    let line = format!("127.0.0.1\t{domain}\t# mast local domain");
+                    let after = if no_op {
+                        before.clone()
+                    } else {
+                        let sep = if before.ends_with('\n') || before.is_empty() { "" } else { "\n" };
+                        format!("{before}{sep}{line}\n")
+                    };
+                    let summary = if no_op {
+                        vec![format!("{hosts_path} already resolves {domain} — nothing to do")]
+                    } else {
+                        vec![
+                            format!("append \"{line}\" to {hosts_path}"),
+                            crate::proxy::elevation_note().into(),
+                            format!(
+                                "prefer to do it yourself? add that line to {hosts_path} in \
+                                 any editor — the HTTPS dialog has a copy button and an \
+                                 Open hosts file button"
+                            ),
+                        ]
+                    };
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: hosts_path.into(),
+                            after,
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_TRUST_PROXY_CA => {
+                let no_op = self.proxy_ca_trusted().await;
+                let exported = self.inner.deps.store.proxy_dir().join("root.crt");
+                let summary = if no_op {
+                    vec!["the proxy CA is already in the system trust store — nothing to do"
+                        .to_string()]
+                } else if cfg!(target_os = "macos") {
+                    vec![
+                        "copy the proxy's root certificate out of the mast-proxy container"
+                            .into(),
+                        "add it to the System keychain as a trusted root \
+                         (security add-trusted-cert)"
+                            .into(),
+                        crate::proxy::elevation_note().into(),
+                        format!(
+                            "the certificate file itself lands at {} — Firefox keeps its \
+                             own store, so import that file there; the HTTPS dialog can \
+                             also copy the path or the PEM for any other tool",
+                            exported.display()
+                        ),
+                    ]
+                } else {
+                    vec![
+                        "copy the proxy's root certificate out of the mast-proxy container"
+                            .into(),
+                        "install it into the system trust store \
+                         (update-ca-certificates or update-ca-trust)"
+                            .into(),
+                        crate::proxy::elevation_note().into(),
+                        "add it to ~/.pki/nssdb for Chrome/Chromium when certutil is available"
+                            .into(),
+                        format!(
+                            "the certificate file itself lands at {} — Firefox keeps its \
+                             own store, so import that file there (or enable \
+                             security.enterprise_roots.enabled); the HTTPS dialog can \
+                             also copy the path or the PEM for any other tool",
+                            exported.display()
+                        ),
+                    ]
+                };
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
+            }
             REPAIR_DOCKER_GROUP => {
                 let user = self.current_username()?;
                 Ok(RepairPlan {
                     summary: vec![
                         format!("run: pkexec usermod -aG docker {user}"),
                         "asks for elevation via polkit".into(),
+                        format!(
+                            "prefer to do it yourself? run `sudo usermod -aG docker {user}` \
+                             in any terminal — same effect"
+                        ),
                         "log out and back in for group membership to apply".into(),
                     ],
                     repair: offer,
@@ -874,6 +1614,495 @@ impl Engine {
                 let install = sail_install_argv(&path, uid, gid);
                 self.run_streamed_command(handle, op, &install, Some(&path), &redactor, timeout)
                     .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_CHOWN_STORAGE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let argv = chown_storage_argv(&path, uid, gid).ok_or_else(|| {
+                    ErrorInfo::InvalidInput {
+                        message: "neither storage/ nor bootstrap/cache exists".into(),
+                    }
+                })?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output { line: format!("$ {}", argv.join(" ")), stderr: false },
+                );
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_SET_PROJECT_NAME => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let name = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "set-project-name needs the name to pin".into(),
+                    })?
+                    .to_string();
+                let backups = self.inner.deps.store.backups_dir();
+                let display = name.clone();
+                tokio::task::spawn_blocking(move || {
+                    mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                        f.set("COMPOSE_PROJECT_NAME", &name)
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::env_write_error)?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "COMPOSE_PROJECT_NAME={display} pinned — takes effect on the \
+                             next start (old containers/volumes keep the old name)"
+                        ),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_MIGRATE_MAILPIT => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "migrate-mailpit needs the MailHog service name".into(),
+                    })?
+                    .to_string();
+                let (invocation, file) = self.catalog_context(project)?;
+                let source = tokio::task::spawn_blocking({
+                    let file = file.clone();
+                    move || std::fs::read_to_string(file)
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::internal_err)?;
+                let plan = mast_compose::catalog::plan_mailpit_migration(&source, &service)
+                    .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                self.write_compose(&invocation, &file, &plan.edits, plan.summary.clone()).await?;
+                for line in &plan.summary {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output { line: line.clone(), stderr: false },
+                    );
+                }
+                // Same .env updates a catalog mailpit add applies.
+                let mailpit = mast_compose::catalog::catalog_def("mailpit")
+                    .expect("mailpit is a catalog entry");
+                let env_path = invocation.project_dir.join(".env");
+                if env_path.is_file() {
+                    let backups = self.inner.deps.store.backups_dir();
+                    let sets: Vec<(String, String)> = mailpit
+                        .env_sets
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    tokio::task::spawn_blocking(move || {
+                        mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
+                            for (k, v) in &sets {
+                                f.set(k, v)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .map_err(crate::internal_err)?
+                    .map_err(crate::env_write_error)?;
+                }
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "MailHog replaced with Mailpit — Start recreates the stack with \
+                               the new mailbox (dashboard on port 8025)"
+                            .into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_ADD_HOST_GATEWAY => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-host-gateway needs the app service name".into(),
+                    })?
+                    .to_string();
+                let (invocation, file) = self.catalog_context(project)?;
+                let source = tokio::task::spawn_blocking({
+                    let file = file.clone();
+                    move || std::fs::read_to_string(file)
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::internal_err)?;
+                let (edits, summary) = mast_compose::sail::plan_add_host_gateway(&source, &service)
+                    .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                self.write_compose(&invocation, &file, &edits, summary).await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "{service}: host.docker.internal now maps to the host — recreate \
+                             the container (Start) to apply it"
+                        ),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_NORMALIZE_ENV_EOL => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                let normalized = tokio::task::spawn_blocking(move || {
+                    mast_laravel::env_write::normalize_env_line_endings(&path, Some(&backups))
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::env_write_error)?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if normalized.is_some() {
+                            ".env converted to Unix line endings (backup kept)".into()
+                        } else {
+                            ".env already had Unix line endings".into()
+                        },
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_REMOVE_HOT => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let removed = tokio::task::spawn_blocking(move || -> Result<bool, ErrorInfo> {
+                    let hot_path = path.join("public/hot");
+                    // Re-probe at click time: a dev server that has started
+                    // meanwhile OWNS this file — deleting it would desync a
+                    // healthy dev setup.
+                    if let Ok(contents) = std::fs::read_to_string(&hot_path)
+                        && let Some(hot) = mast_laravel::vite::parse_hot_file(&contents)
+                        && dev_server_listening(&hot) == Some(true)
+                    {
+                        return Err(ErrorInfo::Conflict {
+                            message: format!(
+                                "a Vite dev server is now listening at {} — its hot file is \
+                                 not stale any more",
+                                hot.url
+                            ),
+                        });
+                    }
+                    match std::fs::remove_file(&hot_path) {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(e) => Err(crate::internal_err(e)),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if removed {
+                            "removed public/hot — built assets are served again".into()
+                        } else {
+                            "public/hot was already gone".into()
+                        },
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_CONFIG_CLEAR => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let removed = tokio::task::spawn_blocking(move || {
+                    let cache = path.join("bootstrap/cache/config.php");
+                    match std::fs::remove_file(&cache) {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(e) => Err(crate::internal_err(e)),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if removed {
+                            "removed bootstrap/cache/config.php — .env is live again".into()
+                        } else {
+                            "no cached configuration — already clear".into()
+                        },
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_DB_RECONCILE => {
+                self.db_reconcile_apply(handle, op, self.require_project(project)?, arg).await
+            }
+            REPAIR_DB_RECREATE => {
+                self.db_recreate_apply(handle, op, self.require_project(project)?, arg).await
+            }
+            REPAIR_GENERATE_APP_KEY => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                tokio::task::spawn_blocking(move || -> Result<(), ErrorInfo> {
+                    let src = std::fs::read_to_string(&path).map_err(crate::internal_err)?;
+                    // Never rotate a live key from a repair — decrypting
+                    // existing data depends on it. Only fill an empty slot.
+                    if mast_laravel::EnvFile::parse(&src)
+                        .get("APP_KEY")
+                        .is_some_and(|e| !e.value.trim().is_empty())
+                    {
+                        return Err(ErrorInfo::Conflict {
+                            message: "APP_KEY is already set — refusing to overwrite it"
+                                .into(),
+                        });
+                    }
+                    let key = mast_laravel::generate_app_key().map_err(crate::internal_err)?;
+                    mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                        f.set("APP_KEY", &key)
+                    })
+                    .map(|_backup| ())
+                    .map_err(crate::env_write_error)
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "generated a fresh APP_KEY (value not shown)".into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_STORAGE_LINK => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || -> Result<(), ErrorInfo> {
+                    if !path.join("storage/app/public").is_dir() {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: "storage/app/public does not exist — nothing to link"
+                                .into(),
+                        });
+                    }
+                    let link = path.join("public/storage");
+                    if std::fs::symlink_metadata(&link).is_ok() {
+                        return Err(ErrorInfo::Conflict {
+                            message: "public/storage already exists — refusing to replace it"
+                                .into(),
+                        });
+                    }
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink("../storage/app/public", &link)
+                            .map_err(crate::internal_err)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = link;
+                        Err(ErrorInfo::Internal {
+                            message: "storage links are unix-only for now".into(),
+                        })
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "created public/storage → ../storage/app/public".into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_HOSTS_ENTRY => {
+                let domain = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-hosts-entry needs the domain".into(),
+                    })?
+                    .to_ascii_lowercase();
+                crate::proxy::validate_local_domain(&domain)?;
+                let hosts_path = crate::proxy::hosts_file_path();
+                let hosts = tokio::fs::read_to_string(hosts_path).await.unwrap_or_default();
+                if crate::proxy::hosts_resolves(&hosts, &domain) {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: format!("{hosts_path} already resolves {domain}"),
+                            stderr: false,
+                        },
+                    );
+                    return Ok(());
+                }
+                // The domain passed the strict character validation above,
+                // so it is safe as a printf argument word.
+                let mut script = format!(
+                    "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> {hosts_path}"
+                );
+                if cfg!(target_os = "macos") {
+                    // macOS caches negative lookups; without a flush the
+                    // fresh entry can take minutes to be seen.
+                    script.push_str(" && dscacheutil -flushcache");
+                }
+                let argv = crate::proxy::privileged_shell_argv(&script);
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    None,
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("{domain} now resolves to 127.0.0.1 on this machine"),
+                        stderr: false,
+                    },
+                );
+                Ok(())
+            }
+            REPAIR_TRUST_PROXY_CA => {
+                let dir = self.inner.deps.store.proxy_dir();
+                tokio::fs::create_dir_all(&dir).await.map_err(crate::internal_err)?;
+                let crt = dir.join("root.crt");
+                let crt_str = crt.to_string_lossy().into_owned();
+                if crt_str.contains('\'') {
+                    return Err(ErrorInfo::Internal {
+                        message: "data directory path contains a quote — cannot build a \
+                                  safe elevated command"
+                            .into(),
+                    });
+                }
+                let cp: Vec<String> =
+                    ["docker", "cp", crate::proxy::CA_IN_CONTAINER, crt_str.as_str()]
+                        .map(String::from)
+                        .into();
+                let copied = run_command(&cp, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !copied.success() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: "the proxy has not generated its certificate authority \
+                                  yet — enable a local domain first, then retry"
+                            .into(),
+                    });
+                }
+                let script = if cfg!(target_os = "macos") {
+                    format!(
+                        "security add-trusted-cert -d -r trustRoot \
+                         -k /Library/Keychains/System.keychain '{crt_str}'"
+                    )
+                } else {
+                    let (dest, refresh) = if std::path::Path::new(
+                        "/usr/local/share/ca-certificates",
+                    )
+                    .is_dir()
+                    {
+                        ("/usr/local/share/ca-certificates/mast-proxy.crt", "update-ca-certificates")
+                    } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir() {
+                        ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                    } else {
+                        return Err(ErrorInfo::Internal {
+                            message: format!(
+                                "no known system trust store on this machine — the \
+                                 certificate was exported to {crt_str}; install it \
+                                 manually (the HTTPS dialog can copy the path or PEM)"
+                            ),
+                        });
+                    };
+                    format!("install -m 644 '{crt_str}' {dest} && {refresh}")
+                };
+                let argv = crate::proxy::privileged_shell_argv(&script);
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    None,
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                // Chrome/Chromium on Linux read NSS, not the system store;
+                // best-effort, and its absence only means a browser warning
+                // remains. On macOS the keychain covers them already.
+                let nssdb = if cfg!(target_os = "macos") {
+                    None
+                } else {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
+                };
+                if let Some(nssdb) = nssdb {
+                    let _ = tokio::fs::create_dir_all(&nssdb).await;
+                    let db = format!("sql:{}", nssdb.display());
+                    let add: Vec<String> = [
+                        "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
+                        "Mast local HTTPS (Caddy)", "-i", crt_str.as_str(),
+                    ]
+                    .map(String::from)
+                    .into();
+                    let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+                    let line = match nss {
+                        Ok(o) if o.success() => {
+                            "added to ~/.pki/nssdb — Chrome/Chromium trust it after a restart"
+                                .to_string()
+                        }
+                        _ => "certutil not available — Chrome/Chromium may still warn; \
+                              install libnss3-tools and re-apply, or import the certificate \
+                              in the browser"
+                            .to_string(),
+                    };
+                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                }
+                let done = if cfg!(target_os = "macos") {
+                    "added to the System keychain — restart the browser; Firefox needs \
+                     the certificate imported manually"
+                } else {
+                    "system trust store updated — restart the browser; Firefox needs \
+                     the certificate imported manually or security.enterprise_roots.enabled"
+                };
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output { line: done.into(), stderr: false },
+                );
                 self.hint();
                 Ok(())
             }

@@ -72,7 +72,30 @@ pub fn lifecycle_argv(
         }
         argv.push(service.to_string());
     }
-    (argv, Vec::new())
+    (argv, parity_env(invocation))
+}
+
+/// The sail wrapper exports `WWWUSER=${WWWUSER:-$UID}` / `WWWGROUP` before
+/// invoking compose (ADR-0001 finding 8), so a Sail-flavored file driven
+/// through bare `docker compose` — the vendorless-clone path — interpolates
+/// them to empty strings and builds a container owned by the wrong user
+/// (finding 9). Mirror the wrapper: real environment and `.env` win, the
+/// uid/gid default only fills the gap.
+pub(crate) fn parity_env(invocation: &ComposeInvocation) -> Vec<(String, String)> {
+    #[cfg(unix)]
+    if matches!(invocation.runner, Runner::DockerCompose) {
+        let dotenv = mast_compose::parse_env_file(&invocation.project_dir.join(".env"));
+        let (uid, gid) = crate::diagnostics::uid_gid();
+        return [("WWWUSER", uid), ("WWWGROUP", gid)]
+            .into_iter()
+            .filter(|(key, _)| {
+                std::env::var_os(key).is_none_or(|v| v.is_empty()) && !dotenv.contains_key(*key)
+            })
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+    }
+    let _ = invocation;
+    Vec::new()
 }
 
 /// Runs lifecycle commands; injected so engine tests need no docker.
@@ -135,7 +158,29 @@ mod tests {
         assert!(argv.contains(&"--profile".to_string()));
         assert!(argv.contains(&"debug".to_string()));
         assert_eq!(&argv[argv.len() - 2..], ["up", "-d"]);
+        // Bare compose gets the wrapper's WWWUSER/WWWGROUP exports mirrored
+        // (ADR-0001 finding 9) — nothing pins them here, so both are filled.
+        #[cfg(unix)]
+        {
+            let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["WWWUSER", "WWWGROUP"], "{env:?}");
+        }
+        #[cfg(not(unix))]
         assert!(env.is_empty());
+    }
+
+    /// A value the developer pinned in `.env` beats the uid/gid default,
+    /// exactly as the sail wrapper's `${WWWUSER:-$UID}` would.
+    #[cfg(unix)]
+    #[test]
+    fn parity_env_defers_to_dotenv_per_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(tmp.path().join(".env"), "WWWUSER=1337\n").unwrap();
+        let inv = resolve_invocation(tmp.path(), &HashMap::new()).unwrap();
+        let (_, env) = lifecycle_argv(&inv, LifecycleVerb::Up, None);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["WWWGROUP"], "pinned WWWUSER must not be overridden: {env:?}");
     }
 
     #[test]

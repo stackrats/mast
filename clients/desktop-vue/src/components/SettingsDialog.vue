@@ -141,13 +141,24 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
             class="flex items-center justify-between rounded-md border border-slate-100 bg-slate-50 px-2 py-1 font-mono text-xs text-slate-600 dark:border-slate-800 dark:bg-neutral-800/60 dark:text-slate-300"
           >
             {{ directory }}
-            <Button
-              variant="ghost"
-              size="iconSm"
-              @click="store.run({ type: 'removeWatchedDirectory', path: directory })"
-            >
-              <X class="h-3.5 w-3.5" />
-            </Button>
+            <span class="flex items-center gap-1">
+              <Tooltip text="Open this directory in your file manager.">
+                <Button
+                  variant="ghost"
+                  size="iconSm"
+                  @click="store.run({ type: 'revealPath', path: directory })"
+                >
+                  <FolderOpen class="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
+              <Button
+                variant="ghost"
+                size="iconSm"
+                @click="store.run({ type: 'removeWatchedDirectory', path: directory })"
+              >
+                <X class="h-3.5 w-3.5" />
+              </Button>
+            </span>
           </li>
         </ul>
       </section>

@@ -60,6 +60,18 @@ export async function envReport(project: ProjectId) {
   return unwrap(await commands.envReport(project));
 }
 
+export async function laravelLog(project: ProjectId) {
+  return unwrap(await commands.laravelLog(project));
+}
+
+export async function phpRuntime(project: ProjectId) {
+  return unwrap(await commands.phpRuntime(project));
+}
+
+export async function proxyCa() {
+  return unwrap(await commands.proxyCa());
+}
+
 export async function networkAttachPreview(workspace: string, project: ProjectId) {
   return unwrap(await commands.networkAttachPreview(workspace, project));
 }

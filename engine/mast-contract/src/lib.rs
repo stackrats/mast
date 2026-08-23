@@ -68,6 +68,15 @@ pub struct ServiceState {
     pub container_id: Option<String>,
     pub state: Option<ContainerState>,
     pub health: ServiceHealth,
+    /// Host-reachable address of this service's web dashboard (Mailpit,
+    /// Meilisearch, MinIO console, …) when the image is recognized and the
+    /// container port is published — powers "Open UI" on the service chip.
+    #[serde(default)]
+    pub ui_url: Option<String>,
+    /// Host-side port of a recognized database service — what a GUI client
+    /// on the host connects to (with the credentials from `.env`).
+    #[serde(default)]
+    pub db_port: Option<u16>,
 }
 
 /// A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
@@ -81,6 +90,29 @@ pub struct ProcessState {
     pub running: bool,
 }
 
+/// The app's Sail PHP runtime: what `build.context` currently pins and which
+/// vendored runtimes it could switch to (drives the PHP version picker).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpVersionInfo {
+    /// The Sail-built compose service (usually the app).
+    pub service: String,
+    /// PHP series the build context pins ("8.4").
+    pub current: String,
+    /// Series available under `vendor/laravel/sail/runtimes/`.
+    pub available: Vec<String>,
+    /// Effective Node major: the compose `build.args.NODE_VERSION` override
+    /// when present, else the runtime Dockerfile's `ARG NODE_VERSION`
+    /// default. None when neither is readable.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Node majors the picker offers (nodesource release lines the runtime
+    /// Dockerfile can install). Empty when the build shape cannot take an
+    /// override — the chip stays read-only then.
+    #[serde(default)]
+    pub node_available: Vec<String>,
+}
+
 /// A user-defined per-project command (M7.5): argv-only (whitespace-split,
 /// no shell), `sail` prefix resolves to `vendor/bin/sail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -90,6 +122,12 @@ pub struct ProjectCommand {
     pub command: String,
     /// Run automatically once the project reaches Running.
     pub auto_start: bool,
+    /// Working directory: relative to the project (`../frontend`) or
+    /// absolute. None = the project directory. Lets a Sail project drive a
+    /// sibling repo's dev server; `sail …` commands refuse it, since the
+    /// wrapper only works from the project root.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -123,6 +161,22 @@ pub struct ProjectSummary {
     /// `APP_PORT`); None when `.env` gives no http(s) address.
     #[serde(default)]
     pub app_url: Option<String>,
+    /// The Sail PHP runtime and its alternatives; None when no service
+    /// builds from a Sail runtime shape.
+    #[serde(default)]
+    pub php: Option<PhpVersionInfo>,
+    /// Public URL of the live share tunnel ([`Action::ShareProject`]);
+    /// None while not sharing.
+    #[serde(default)]
+    pub share_url: Option<String>,
+    /// The live tunnel's local dashboard (SAIL_SHARE_DASHBOARD, possibly
+    /// auto-moved off a busy port); None while not sharing.
+    #[serde(default)]
+    pub share_dashboard_url: Option<String>,
+    /// Stable local HTTPS address ([`Action::SetLocalDomain`]) served by the
+    /// shared `mast-proxy` Caddy container; None when not claimed.
+    #[serde(default)]
+    pub local_domain: Option<String>,
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
@@ -321,6 +375,76 @@ pub struct EnvReport {
     /// Keys present in .env.example but missing from .env.
     pub missing_from_env: Vec<String>,
     pub findings: Vec<EnvFinding>,
+}
+
+/// One grouped entry from `storage/logs/laravel.log`: the Monolog header
+/// split into fields, with the stack trace (when one follows) kept attached
+/// instead of scattered across raw lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LaravelLogEntry {
+    pub timestamp: String,
+    pub environment: String,
+    /// Monolog level, uppercase (`ERROR`, `WARNING`, …).
+    pub level: String,
+    pub message: String,
+    /// Continuation lines — stack trace, previous exceptions — when any.
+    pub detail: Option<String>,
+}
+
+/// The tail of the application log, parsed. On demand only, like
+/// [`EnvReport`]: log bodies routinely carry user data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LaravelLogReport {
+    /// False when `storage/logs/laravel.log` does not exist (fresh app, or
+    /// LOG_CHANNEL points elsewhere).
+    pub exists: bool,
+    /// Newest first.
+    pub entries: Vec<LaravelLogEntry>,
+    /// True when the file outgrew the read window and older entries were
+    /// left behind.
+    pub truncated: bool,
+}
+
+/// One effective `php.ini` setting read from the running app container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpIniValue {
+    pub key: String,
+    /// As `ini_get` reports it; empty when the runtime has no value.
+    pub value: String,
+}
+
+/// What the PHP runtime actually is right now: loaded extensions and the
+/// common limits, read live from the app container — plus where the
+/// vendored runtime keeps the files that change them (paths relative to
+/// the project, present only when the files exist).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpRuntimeReport {
+    /// `php -m`, sorted, section headers dropped.
+    pub extensions: Vec<String>,
+    /// The classic limits (`memory_limit`, upload sizes, …), in a stable
+    /// display order.
+    pub ini: Vec<PhpIniValue>,
+    /// The vendored runtime's `php.ini` (e.g. `docker/8.4/php.ini`).
+    pub ini_file: Option<String>,
+    /// The vendored runtime's `Dockerfile` — where extensions are added.
+    pub dockerfile: Option<String>,
+}
+
+/// The local HTTPS proxy's root certificate, exported for manual trust —
+/// Firefox's import dialog wants the file, `curl --cacert` and
+/// `NODE_EXTRA_CA_CERTS` want the path, and pasting into another tool wants
+/// the PEM text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCa {
+    /// Where the exported `root.crt` lives on this machine.
+    pub path: String,
+    /// The certificate itself, PEM-encoded.
+    pub pem: String,
 }
 
 // ---------- service catalog (M7) ----------
@@ -756,6 +880,9 @@ pub enum Action {
     /// Open the project's `.env` address (`ProjectSummary::app_url`) in the
     /// default browser.
     OpenInBrowser { id: ProjectId },
+    /// Open an http(s) URL Mast itself surfaced (share URL, tunnel
+    /// dashboard) in the default browser. Non-http schemes are refused.
+    OpenUrl { url: String },
     /// Persist external-tool preferences.
     SetIntegrations { integrations: IntegrationSettings },
     /// Set a LITERAL value in the project's .env (lossless model; creates
@@ -799,6 +926,47 @@ pub enum Action {
     /// Pull the service's image and recreate just that container, so a retag
     /// (or any edited service block) takes effect.
     RebuildService { id: ProjectId, service: String },
+    /// Switch a Sail-built service to another vendored PHP runtime, as ONE
+    /// operation: rewrites `build.context` and the `sail-X.Y/app` image tag
+    /// together, rebuilds without cache, recreates the container when the
+    /// project is running, and verifies `php -v` inside it — the exact
+    /// sequence users half-do by hand (laravel/sail#442).
+    SetPhpVersion { id: ProjectId, service: String, series: String },
+    /// Pin the app's Node major (`build.args.NODE_VERSION`, Sail's
+    /// documented override of the runtime Dockerfile's default) and run the
+    /// same verified switch as PHP: rebuild without cache, recreate when
+    /// running, confirm `node -v` inside the container.
+    SetNodeVersion { id: ProjectId, service: String, major: String },
+    /// Publish the running app through Sail's expose tunnel (`sail share`,
+    /// same image, flags and `.env` knobs). Long-running: the operation
+    /// stays live while the tunnel is up, cancelling it stops the share.
+    /// The public URL lands on [`ProjectSummary::share_url`] once the
+    /// tunnel reports it.
+    ShareProject { id: ProjectId },
+    /// Claim (or clear, with `domain: None`) a stable `https://…test`
+    /// address for this project. Mast keeps one shared Caddy container
+    /// (`mast-proxy`, ports 80/443) whose internal CA signs the
+    /// certificate; the two host-side steps it cannot do silently — the
+    /// `/etc/hosts` line and trusting that CA — surface as high-risk Fix
+    /// buttons on the operation.
+    SetLocalDomain { id: ProjectId, domain: Option<String> },
+    /// Open the platform's hosts file in the desktop's default editor — the
+    /// manual fallback when the elevated add-hosts-entry repair is not
+    /// possible or not wanted. Opens read-only for most users; the dialog
+    /// shows the exact line to add.
+    OpenHostsFile,
+    /// Truncate `storage/logs/laravel.log` — a fresh slate for the App log
+    /// viewer. The file is kept (empty), so running processes keep their
+    /// open handle and Laravel appends as before.
+    ClearLaravelLog { id: ProjectId },
+    /// Open a directory in the file manager. Restricted to paths Mast
+    /// already knows — a watched directory or an imported project's root —
+    /// so the surface stays as narrow as the buttons that use it.
+    RevealPath { path: String },
+    /// Open one file inside a project in the configured editor — the
+    /// vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
+    /// dialog. `file` is project-relative and may not escape the project.
+    OpenProjectFile { id: ProjectId, file: String },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -830,6 +998,11 @@ pub enum OperationEventKind {
     Progress { percent: u8, message: String },
     /// One line of live subprocess output (compose/sail shell-outs).
     Output { line: String, stderr: bool },
+    /// A one-click repair that addresses a failure signature spotted in this
+    /// operation's output — emitted just before [`Self::Failed`], so a
+    /// failure can carry its own Fix button. Preview the repair before
+    /// applying; the preview says exactly what will change.
+    FixAvailable { repair: RepairOffer, project: ProjectId },
     Completed,
     Failed { error: String },
     Cancelled,
@@ -910,6 +1083,8 @@ mod tests {
             container_id: Some("abc123".into()),
             state: Some(ContainerState::Running),
             health: ServiceHealth::Healthy,
+            ui_url: None,
+            db_port: None,
         }
     }
 
@@ -928,6 +1103,7 @@ mod tests {
                 name: "dev".into(),
                 command: "sail npm run dev".into(),
                 auto_start: true,
+                cwd: None,
             }],
             processes: vec![ProcessState {
                 id: "horizon".into(),
@@ -937,6 +1113,16 @@ mod tests {
             git_branch: Some("main".into()),
             git_dirty: Some(false),
             app_url: Some("http://localhost:8080".into()),
+            php: Some(PhpVersionInfo {
+                service: "laravel.test".into(),
+                current: "8.4".into(),
+                available: vec!["8.3".into(), "8.4".into()],
+                node: Some("24".into()),
+                node_available: vec!["18".into(), "20".into(), "22".into(), "24".into()],
+            }),
+            share_url: None,
+            share_dashboard_url: None,
+            local_domain: None,
         }
     }
 
@@ -1133,6 +1319,7 @@ mod tests {
                     name: "dev".into(),
                     command: "sail npm run dev".into(),
                     auto_start: true,
+                cwd: None,
                 }],
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },

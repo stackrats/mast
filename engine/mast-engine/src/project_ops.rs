@@ -25,6 +25,67 @@ const SAIL_APP_SERVICE: &str = "laravel.test";
 use crate::{Engine, ProjectEntry, Redactor, initial_summary, internal_err};
 
 impl Engine {
+    /// The tail of `storage/logs/laravel.log`, parsed into grouped entries
+    /// (newest first). On demand only, like the env report — log bodies
+    /// routinely carry user data. Reads at most the last 256 KiB, so a
+    /// months-old multi-gigabyte log answers as fast as a fresh one.
+    pub async fn laravel_log(
+        &self,
+        project: &ProjectId,
+    ) -> Result<mast_contract::LaravelLogReport, ErrorInfo> {
+        const WINDOW: u64 = 256 * 1024;
+        const MAX_ENTRIES: usize = 300;
+        let path = {
+            let st = self.inner.state.lock().unwrap();
+            st.projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?
+                .record
+                .path
+                .clone()
+        };
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let log_path = path.join("storage/logs/laravel.log");
+            let Ok(mut file) = std::fs::File::open(&log_path) else {
+                return Ok(mast_contract::LaravelLogReport {
+                    exists: false,
+                    entries: Vec::new(),
+                    truncated: false,
+                });
+            };
+            let len = file.metadata().map_err(crate::internal_err)?.len();
+            let mut truncated = len > WINDOW;
+            if truncated {
+                file.seek(SeekFrom::End(-(WINDOW as i64))).map_err(crate::internal_err)?;
+            }
+            let mut body = String::new();
+            // Not read_to_string: a seek can land mid-UTF-8-sequence.
+            let mut bytes = Vec::with_capacity(WINDOW as usize);
+            file.read_to_end(&mut bytes).map_err(crate::internal_err)?;
+            body.push_str(&String::from_utf8_lossy(&bytes));
+            let mut parsed = mast_laravel::log::parse_log(&body);
+            if parsed.len() > MAX_ENTRIES {
+                truncated = true;
+                parsed.drain(..parsed.len() - MAX_ENTRIES);
+            }
+            parsed.reverse();
+            let entries = parsed
+                .into_iter()
+                .map(|e| mast_contract::LaravelLogEntry {
+                    timestamp: e.timestamp,
+                    environment: e.environment,
+                    level: e.level,
+                    message: e.message,
+                    detail: e.detail,
+                })
+                .collect();
+            Ok(mast_contract::LaravelLogReport { exists: true, entries, truncated })
+        })
+        .await
+        .map_err(crate::internal_err)?
+    }
+
     /// Build the env editor payload: entries with secret flags, the
     /// .env/.env.example diff, and validation findings against the resolved
     /// service names. On demand only — never in snapshots/patches.
@@ -139,6 +200,7 @@ impl Engine {
                     redactor: Redactor::default(),
                     app_port: None,
                     host_ports: Vec::new(),
+                    compose_fingerprint: None,
                 };
                 events.push(PatchEvent::ProjectAdded { project: entry.summary.clone() });
                 st.projects.insert(entry.record.id.clone(), entry);
@@ -544,7 +606,7 @@ impl Engine {
         project: &ProjectId,
         name: &str,
     ) -> Result<(), ErrorInfo> {
-        let (path, redactor, command) = {
+        let (path, redactor, command, cwd) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -556,13 +618,46 @@ impl Engine {
                 .iter()
                 .find(|c| c.name == name)
                 .ok_or(ErrorInfo::NotFound { what: format!("command \"{name}\"") })?;
-            (entry.record.path.clone(), entry.redactor.clone(), cmd.command.clone())
+            (
+                entry.record.path.clone(),
+                entry.redactor.clone(),
+                cmd.command.clone(),
+                cmd.cwd.clone(),
+            )
         };
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
         }
+        // A relative override walks from the project; absolute stands alone.
+        // Resolved at run time, not save time — the sibling repo may be
+        // cloned after the command is.
+        let run_dir = match &cwd {
+            Some(dir) => {
+                let resolved = path.join(dir);
+                let resolved = resolved.canonicalize().map_err(|_| ErrorInfo::InvalidInput {
+                    message: format!(
+                        "working directory {} does not exist (from \"{dir}\")",
+                        resolved.display()
+                    ),
+                })?;
+                if !resolved.is_dir() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: format!("{} is not a directory", resolved.display()),
+                    });
+                }
+                resolved
+            }
+            None => path.clone(),
+        };
         if argv[0] == "sail" {
+            if cwd.is_some() {
+                return Err(ErrorInfo::InvalidInput {
+                    message: "sail commands only work from the project root — leave the \
+                              working directory empty"
+                        .into(),
+                });
+            }
             let script = path.join("vendor/bin/sail");
             if !script.is_file() {
                 return Err(ErrorInfo::InvalidInput {
@@ -576,10 +671,17 @@ impl Engine {
         self.emit_op(
             handle,
             op,
-            OperationEventKind::Output { line: format!("$ {command}"), stderr: false },
+            OperationEventKind::Output {
+                line: if run_dir == path {
+                    format!("$ {command}")
+                } else {
+                    format!("$ {command}  (in {})", run_dir.display())
+                },
+                stderr: false,
+            },
         );
         // A week ≈ unbounded: dev servers run until the user stops them.
-        self.run_streamed_command(handle, op, &argv, Some(&path), &redactor, Duration::from_secs(7 * 24 * 3600))
+        self.run_streamed_command(handle, op, &argv, Some(&run_dir), &redactor, Duration::from_secs(7 * 24 * 3600))
             .await
     }
 
@@ -716,6 +818,11 @@ impl Engine {
                 Ok(CommandOutcome::Cancelled) => OperationEventKind::Cancelled,
                 Err(e) => OperationEventKind::Failed { error: redactor.redact(&e) },
             };
+            // A failing verb owes its explanation (and Fix button, when a
+            // signature maps to a repair) before the terminal event.
+            if matches!(kind, OperationEventKind::Failed { .. }) {
+                engine.flush_signature_explanations(&handle, id, Some(&project));
+            }
             // Order matters: journal cleared and lock released BEFORE the
             // terminal event — once a client sees the terminal, dispatching a
             // follow-up verb must succeed.
@@ -784,6 +891,111 @@ fn capitalize(word: &str) -> String {
 
 /// Sail's own app-service selector: `.env` `APP_SERVICE`, default
 /// `laravel.test`.
+/// The classic limits everyone tunes, in display order.
+const PHP_INI_KEYS: [&str; 6] = [
+    "memory_limit",
+    "max_execution_time",
+    "upload_max_filesize",
+    "post_max_size",
+    "max_input_vars",
+    "opcache.enable",
+];
+
+impl crate::Engine {
+    /// The PHP runtime as it actually is: `php -m` and the common limits via
+    /// `ini_get`, both from the RUNNING app container — what the runtime
+    /// loaded beats what any file promises — plus the vendored runtime files
+    /// that change them, for the dialog's edit buttons.
+    pub async fn php_runtime(
+        &self,
+        project: &ProjectId,
+    ) -> Result<mast_contract::PhpRuntimeReport, ErrorInfo> {
+        let (path, services) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            (entry.record.path.clone(), entry.summary.services.clone())
+        };
+        let app = app_service_of(&path);
+        let container = services
+            .iter()
+            .find(|s| s.name == app && s.state == Some(mast_contract::ContainerState::Running))
+            .and_then(|s| s.container_id.clone())
+            .ok_or_else(|| ErrorInfo::InvalidInput {
+                message: format!("{app} is not running — start the project first"),
+            })?;
+
+        let exec = |tail: Vec<String>| {
+            let container = container.clone();
+            async move {
+                let mut argv: Vec<String> =
+                    ["docker", "exec", container.as_str()].map(String::from).into();
+                let label = tail.join(" ");
+                argv.extend(tail);
+                let out = mast_docker::run_command(
+                    &argv,
+                    None,
+                    &[],
+                    crate::diagnostics::PROBE_TIMEOUT,
+                    crate::diagnostics::PROBE_CAP,
+                )
+                .await
+                .map_err(crate::internal_err)?;
+                if !out.success() {
+                    return Err(ErrorInfo::Internal {
+                        message: format!("{label} failed: {}", out.stderr.trim()),
+                    });
+                }
+                Ok(out.stdout)
+            }
+        };
+
+        let modules = exec(["php", "-m"].map(String::from).into()).await?;
+        let mut extensions: Vec<String> = modules
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('['))
+            .map(str::to_string)
+            .collect();
+        extensions.sort_by_key(|e| e.to_ascii_lowercase());
+        extensions.dedup();
+
+        let script = format!(
+            "foreach ([{}] as $k) echo $k, '=', ini_get($k), PHP_EOL;",
+            PHP_INI_KEYS.map(|k| format!("'{k}'")).join(",")
+        );
+        let raw =
+            exec(vec!["php".into(), "-r".into(), script]).await?;
+        let reported: std::collections::HashMap<&str, &str> =
+            raw.lines().filter_map(|l| l.split_once('=')).collect();
+        // Fixed order from the key list, not hash order — the dialog reads
+        // top-down the same way every time.
+        let ini = PHP_INI_KEYS
+            .iter()
+            .map(|key| mast_contract::PhpIniValue {
+                key: (*key).to_string(),
+                value: reported.get(key).unwrap_or(&"").trim().to_string(),
+            })
+            .collect();
+
+        // The vendored runtime's own files, when the standard layout holds —
+        // the dialog's edit buttons point straight at them.
+        let runtime_file = |name: &str| {
+            crate::php::runtime_context(&path)
+                .map(|context| format!("{}/{name}", context.trim_end_matches('/')))
+                .filter(|rel| path.join(rel).is_file())
+        };
+        Ok(mast_contract::PhpRuntimeReport {
+            extensions,
+            ini,
+            ini_file: runtime_file("php.ini"),
+            dockerfile: runtime_file("Dockerfile"),
+        })
+    }
+}
+
 pub(crate) fn app_service_of(dir: &Path) -> String {
     mast_compose::parse_env_file(&dir.join(".env"))
         .get("APP_SERVICE")

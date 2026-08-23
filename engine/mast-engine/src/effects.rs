@@ -57,6 +57,10 @@ async fn docker_loop(engine: Engine) {
                 *engine.inner.adapter.lock().unwrap() = Some(adapter.clone());
                 engine.update_docker_status(status);
                 engine.hint();
+                // First contact with the daemon: sweep share tunnels a
+                // previous engine left publishing. A tunnel with no live
+                // operation is unmanaged and invisible — and still public.
+                engine.cleanup_orphan_shares().await;
                 match adapter.events().await {
                     Ok(mut events) => {
                         while events.next().await.is_some() {
@@ -203,13 +207,27 @@ async fn reconcile(engine: &Engine) {
     let mut process_infos: HashMap<String, ProcessInfo> = HashMap::new();
     // Browsable address from .env, per project.
     let mut app_urls: HashMap<String, Option<String>> = HashMap::new();
+    // Sail PHP runtime info (current series + vendored alternatives).
+    let mut php_infos: HashMap<String, Option<mast_contract::PhpVersionInfo>> = HashMap::new();
+    // Content hash of the compose files at resolution time — the model must
+    // refresh on in-place edits, which change no part of the invocation.
+    let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
     for (id, dir) in &project_dirs {
         let env = process_env.clone();
         let dir = dir.clone();
-        let (resolved, project_warnings, redactor, ports, git, procs, app_url) =
+        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php) =
             tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
+                let fingerprint = resolved.as_ref().ok().map(|inv| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for file in &inv.files {
+                        file.path.hash(&mut h);
+                        std::fs::read(&file.path).unwrap_or_default().hash(&mut h);
+                    }
+                    h.finish()
+                });
                 // Which key moves which published port, read from the compose
                 // source — the resolved model only carries the numbers.
                 let port_keys: BTreeMap<u16, String> = resolved
@@ -241,44 +259,55 @@ async fn reconcile(engine: &Engine) {
                     .unwrap_or_else(|| "laravel.test".to_string());
                 (
                     resolved,
+                    fingerprint,
                     mast_project::project_warnings(&dir),
                     redactor,
                     (app_port, host_ports, port_keys),
                     git_info(&dir),
                     (detected, app_service),
                     mast_laravel::app_url(&env),
+                    crate::php::php_info(&dir),
                 )
             })
             .await
             .unwrap_or_else(|e| {
                 (
                     Err(e.to_string()),
+                    None,
                     Vec::new(),
                     crate::Redactor::default(),
                     (None, Vec::new(), BTreeMap::new()),
                     (None, None),
                     (Vec::new(), String::new()),
                     None,
+                    None,
                 )
             });
         resolutions.insert(id.clone(), resolved);
+        fingerprints.insert(id.clone(), fingerprint);
         warnings.insert(id.clone(), project_warnings);
         redactors.insert(id.clone(), redactor);
         app_ports.insert(id.clone(), ports);
         git_infos.insert(id.clone(), git);
         process_infos.insert(id.clone(), procs);
         app_urls.insert(id.clone(), app_url);
+        php_infos.insert(id.clone(), php);
     }
 
-    // Refresh resolved models only where the invocation changed (subprocess).
+    // Refresh resolved models where the invocation OR the file content
+    // changed (subprocess). Content matters: a catalog add, a retag, or an
+    // external edit rewrites the file without touching the invocation.
     let mut models: HashMap<String, Result<mast_compose::ResolvedModel, String>> = HashMap::new();
     for (id, resolution) in &resolutions {
         if let Ok(invocation) = resolution {
+            let fingerprint = fingerprints.get(id).copied().flatten();
             let needs_model = {
                 let st = engine.inner.state.lock().unwrap();
-                st.projects
-                    .get(id)
-                    .is_none_or(|e| e.invocation.as_ref() != Some(invocation) || e.model.is_none())
+                st.projects.get(id).is_none_or(|e| {
+                    e.invocation.as_ref() != Some(invocation)
+                        || e.model.is_none()
+                        || e.compose_fingerprint != fingerprint
+                })
             };
             if needs_model {
                 models.insert(
@@ -387,6 +416,8 @@ async fn reconcile(engine: &Engine) {
                     match models.get(&id) {
                         Some(Ok(model)) => {
                             entry.model = Some(model.clone());
+                            entry.compose_fingerprint =
+                                fingerprints.get(&id).copied().flatten();
                             entry.summary.resolution_error = None;
                         }
                         Some(Err(e)) => {
@@ -435,6 +466,9 @@ async fn reconcile(engine: &Engine) {
             }
             if let Some(url) = app_urls.get(&id) {
                 summary.app_url = url.clone();
+            }
+            if let Some(php) = php_infos.get(&id) {
+                summary.php = php.clone();
             }
             if let Some((detected, _)) = process_infos.get(&id) {
                 summary.processes = detected
@@ -637,6 +671,35 @@ fn observation_belongs_to(observation: &ContainerObservation, project_dir: &str)
 }
 
 /// Union of declared services (resolved model) and observed containers.
+/// Host-side dashboard URL and database port for a declared service, when
+/// the image is recognized and the container-side convention port is
+/// actually published. The mapping comes from `port_targets`, so a moved
+/// FORWARD_* port still lands on the right address.
+fn service_host_endpoints(
+    declared: &mast_compose::ResolvedService,
+) -> (Option<String>, Option<u16>) {
+    let Some(image) = declared.image.as_deref() else {
+        return (None, None);
+    };
+    let host_for = |container: u16| {
+        declared
+            .port_targets
+            .iter()
+            .find(|(_, target)| *target == container)
+            .map(|(host, _)| *host)
+    };
+    let ui_url = mast_compose::catalog::ui_port_for_image(image)
+        .and_then(host_for)
+        .map(|port| format!("http://localhost:{port}"));
+    let db_port = mast_laravel::db::db_image_series(image)
+        .map(|(kind, _)| match kind {
+            mast_laravel::db::DbKind::Pgsql => 5432,
+            _ => 3306,
+        })
+        .and_then(host_for);
+    (ui_url, db_port)
+}
+
 fn build_services(
     model: Option<&mast_compose::ResolvedModel>,
     observed: &[&ContainerObservation],
@@ -644,11 +707,14 @@ fn build_services(
     let mut services: Vec<ServiceState> = Vec::new();
     if let Some(model) = model {
         for declared in &model.services {
+            let (ui_url, db_port) = service_host_endpoints(declared);
             services.push(ServiceState {
                 name: declared.name.clone(),
                 container_id: None,
                 state: None,
                 health: mast_contract::ServiceHealth::Unknown,
+                ui_url,
+                db_port,
             });
         }
     }
@@ -665,6 +731,8 @@ fn build_services(
                 container_id: Some(container.id.clone()),
                 state,
                 health,
+                ui_url: None,
+                db_port: None,
             });
         }
     }
@@ -686,6 +754,8 @@ mod tests {
                     image: None,
                     aliases: Vec::new(),
                     published_ports: ports.to_vec(),
+                    volumes: Vec::new(),
+                    port_targets: Vec::new(),
                 })
                 .collect(),
             external_networks: Vec::new(),

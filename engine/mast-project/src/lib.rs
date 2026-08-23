@@ -70,8 +70,8 @@ pub fn project_warnings(dir: &Path) -> Vec<String> {
     if is_sail_flavored(dir) && !dir.join("vendor/bin/sail").is_file() {
         warnings.push(
             "Sail project without vendor/ — dependencies are not installed, so lifecycle \
-             runs through bare docker compose (WWWUSER/WWWGROUP will be empty). Run a \
-             containerized `composer install` (laravelsail/phpXX-composer) to bootstrap."
+             runs through bare docker compose (Mast fills in WWWUSER/WWWGROUP itself). Run \
+             the containerized `composer install` from Diagnostics to bootstrap."
                 .to_string(),
         );
     }
@@ -148,6 +148,9 @@ pub struct ProjectRecord {
     /// User-defined commands (M7.5): name → whitespace-split argv line.
     #[serde(default)]
     pub commands: Vec<ProjectCommandRecord>,
+    /// Local HTTPS domain served by the shared `mast-proxy` container.
+    #[serde(default)]
+    pub local_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +159,9 @@ pub struct ProjectCommandRecord {
     pub command: String,
     #[serde(default)]
     pub auto_start: bool,
+    /// Working directory override (relative to the project, or absolute).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// `Default` is what a machine with no `settings.json` starts from, so it has
@@ -357,6 +363,7 @@ impl MetadataStore {
             is_sail: is_sail_project(&canonical),
             path: canonical,
             commands: Vec::new(),
+            local_domain: None,
         };
         projects.push(record.clone());
         self.save_projects(&projects)?;
@@ -380,6 +387,12 @@ impl MetadataStore {
 
     pub fn backups_dir(&self) -> PathBuf {
         self.dir.join("backups")
+    }
+
+    /// Where the local-HTTPS proxy's generated Caddyfile and exported root
+    /// certificate live (owned by `mast-engine::proxy`).
+    pub fn proxy_dir(&self) -> PathBuf {
+        self.dir.join("proxy")
     }
 
     /// Image tags last read from the registry, keyed by repo as it appears in

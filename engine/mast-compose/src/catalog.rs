@@ -29,6 +29,10 @@ pub struct CatalogDef {
     pub volumes: &'static [&'static str],
     /// `.env` updates applied alongside the add (listed in the preview).
     pub env_sets: &'static [(&'static str, &'static str)],
+    /// Images earlier Mast releases installed for this entry. Three-way
+    /// removal accepts these as "ours" too, so a service added before an
+    /// image bump stays cleanly removable.
+    pub legacy_images: &'static [&'static str],
 }
 
 pub const CATALOG: &[CatalogDef] = &[
@@ -55,6 +59,7 @@ pub const CATALOG: &[CatalogDef] = &[
         ],
         volumes: &["sail-redis"],
         env_sets: &[("REDIS_HOST", "redis")],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mailpit",
@@ -75,6 +80,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("MAIL_HOST", "mailpit"),
             ("MAIL_PORT", "1025"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "meilisearch",
@@ -106,6 +112,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("SCOUT_DRIVER", "meilisearch"),
             ("MEILISEARCH_HOST", "http://meilisearch:7700"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "minio",
@@ -142,8 +149,13 @@ pub const CATALOG: &[CatalogDef] = &[
             ("AWS_DEFAULT_REGION", "us-east-1"),
             ("AWS_BUCKET", "local"),
             ("AWS_ENDPOINT", "http://minio:9000"),
+            // The endpoint only resolves inside the compose network; without
+            // a browser-reachable AWS_URL, Storage::url() hands the host a
+            // dead minio:9000 link (the classic MinIO split-brain).
+            ("AWS_URL", "http://localhost:9000/local"),
             ("AWS_USE_PATH_STYLE_ENDPOINT", "true"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "pgsql",
@@ -181,6 +193,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "pgsql"),
             ("DB_PORT", "5432"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mariadb",
@@ -217,16 +230,19 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "mariadb"),
             ("DB_PORT", "3306"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "mysql",
         title: "MySQL",
-        description: "MySQL 8 database (DB_* env pointed at it on add).",
+        description: "MySQL 8.4 database (DB_* env pointed at it on add).",
         service_key: "mysql",
         image_stems: &["mysql", "mysql/mysql-server"],
         role: "database",
         lines: &[
-            "image: 'mysql/mysql-server:8.0'",
+            // mysql/mysql-server was abandoned upstream (laravel/sail#829);
+            // Sail's own stub moved to mysql:8.4 (laravel/sail#834).
+            "image: 'mysql:8.4'",
             "ports:",
             "  - '${FORWARD_DB_PORT:-3306}:3306'",
             "environment:",
@@ -253,6 +269,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("DB_HOST", "mysql"),
             ("DB_PORT", "3306"),
         ],
+        legacy_images: &["mysql/mysql-server:8.0"],
     },
     CatalogDef {
         id: "typesense",
@@ -288,6 +305,7 @@ pub const CATALOG: &[CatalogDef] = &[
             ("TYPESENSE_PORT", "8108"),
             ("TYPESENSE_PROTOCOL", "http"),
         ],
+        legacy_images: &[],
     },
     CatalogDef {
         id: "rustfs",
@@ -315,10 +333,35 @@ pub const CATALOG: &[CatalogDef] = &[
             ("AWS_DEFAULT_REGION", "us-east-1"),
             ("AWS_BUCKET", "local"),
             ("AWS_ENDPOINT", "http://rustfs:9000"),
+            // Same split-brain as minio: signed for the network, served to
+            // the browser.
+            ("AWS_URL", "http://localhost:9000/local"),
             ("AWS_USE_PATH_STYLE_ENDPOINT", "true"),
         ],
+        legacy_images: &[],
     },
 ];
+
+/// Container-side port of the web UI a known dev service ships — the
+/// buried knowledge behind "which port is the Mailpit dashboard on?".
+pub fn ui_port_for_image(image: &str) -> Option<u16> {
+    const UI_PORTS: [(&str, u16); 5] = [
+        ("axllent/mailpit", 8025),
+        ("mailhog/mailhog", 8025),
+        ("mailhog", 8025),
+        ("getmeili/meilisearch", 7700),
+        ("rustfs/rustfs", 9001),
+    ];
+    // MinIO's console is a second mapping (8900 host-side in sail's stub),
+    // container port 8900 per the `--console-address` command line.
+    if image_matches(image, "minio/minio") {
+        return Some(8900);
+    }
+    UI_PORTS
+        .iter()
+        .find(|(stem, _)| image_matches(image, stem))
+        .map(|(_, port)| *port)
+}
 
 /// Does `image` run this catalog entry's software?
 pub fn def_matches_image(def: &CatalogDef, image: &str) -> bool {
@@ -373,19 +416,41 @@ fn has_sail_network(root: &Yaml) -> bool {
         .any(|(k, _)| matches!(k, Yaml::Value(saphyr::Scalar::String(s)) if s == "sail"))))
 }
 
-/// Parse the block we would render for `def` into a Yaml subtree (the "ours"
-/// document of the three-way comparison).
-fn expected_subtree(def: &CatalogDef, sail_network: bool) -> Result<Yaml<'static>, String> {
-    let mut doc = format!("{}:\n", def.service_key);
-    for line in service_lines(def, sail_network) {
+/// Parse a rendered service block into a Yaml subtree (the "ours" document of
+/// the three-way comparison).
+fn block_subtree(service_key: &str, lines: &[String]) -> Result<Yaml<'static>, String> {
+    let mut doc = format!("{service_key}:\n");
+    for line in lines {
         doc.push_str("  ");
-        doc.push_str(&line);
+        doc.push_str(line);
         doc.push('\n');
     }
     let parsed = Yaml::load_from_str(&doc).map_err(|e| e.to_string())?;
     let root = parsed.into_iter().next().ok_or("empty rendered block")?;
     let Yaml::Mapping(m) = root else { return Err("rendered block is not a mapping".into()) };
     m.into_iter().next().map(|(_, v)| v).ok_or_else(|| "rendered block is empty".into())
+}
+
+fn expected_subtree(def: &CatalogDef, sail_network: bool) -> Result<Yaml<'static>, String> {
+    block_subtree(def.service_key, &service_lines(def, sail_network))
+}
+
+/// Does the current block match what add would render — with today's image or
+/// one this entry installed in an earlier release?
+fn matches_ours(current: &Yaml, def: &CatalogDef, sail_network: bool) -> Result<bool, String> {
+    if *current == expected_subtree(def, sail_network)? {
+        return Ok(true);
+    }
+    let lines = service_lines(def, sail_network);
+    Ok(def.legacy_images.iter().any(|legacy| {
+        let substituted: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                if l.starts_with("image:") { format!("image: '{legacy}'") } else { l.clone() }
+            })
+            .collect();
+        block_subtree(def.service_key, &substituted).is_ok_and(|expected| *current == expected)
+    }))
 }
 
 pub fn plan_catalog_add(source: &str, def: &CatalogDef) -> Result<CatalogPlan, String> {
@@ -533,6 +598,29 @@ pub fn plan_service_remove(source: &str, service: &str) -> Result<CatalogPlan, S
 }
 
 
+/// One-click MailHog → Mailpit migration: remove the MailHog service exactly
+/// as it stands (no three-way baseline — Mast never added it) and add the
+/// catalog's Mailpit in the same transaction. Sail swapped the stub in 2023
+/// and upstream MailHog is abandoned; projects published before the swap
+/// keep silently rotting.
+pub fn plan_mailpit_migration(source: &str, mailhog_service: &str) -> Result<CatalogPlan, String> {
+    let mailpit = catalog_def("mailpit").expect("mailpit is a catalog entry");
+    let remove = plan_service_remove(source, mailhog_service)?;
+    let add = plan_catalog_add(source, mailpit).map_err(|e| {
+        format!("cannot add mailpit: {e} — remove \"{mailhog_service}\" from its service menu instead")
+    })?;
+    // Sequential application: the removal lands first, then the insert
+    // re-locates against the edited text (self-verifying splices).
+    let mut edits = remove.edits;
+    edits.extend(add.edits);
+    let mut summary = vec![format!(
+        "replace service {mailhog_service} (MailHog, abandoned upstream) with mailpit"
+    )];
+    summary.extend(add.summary.into_iter().filter(|s| !s.starts_with("add service")));
+    summary.push("dashboard moves from port 8025 (same default) — MAIL_* in .env updated".into());
+    Ok(CatalogPlan { edits, summary })
+}
+
 fn push_volume_edits<S: AsRef<str>>(
     root: &Yaml,
     volumes: &[S],
@@ -580,8 +668,7 @@ pub fn plan_catalog_remove(source: &str, def: &CatalogDef) -> Result<CatalogPlan
         .ok_or_else(|| format!("service \"{}\" is not in this file", def.service_key))?;
 
     let sail_network = has_sail_network(root);
-    let expected = expected_subtree(def, sail_network)?;
-    if *current != expected {
+    if !matches_ours(current, def, sail_network)? {
         return Err(format!(
             "service \"{}\" has been customized since it was added — refusing to remove it \
              automatically; edit the compose file directly",
@@ -634,6 +721,17 @@ mod tests {
     }
 
     #[test]
+    fn ui_ports_map_known_dashboards_and_nothing_else() {
+        assert_eq!(ui_port_for_image("axllent/mailpit:latest"), Some(8025));
+        assert_eq!(ui_port_for_image("mailhog/mailhog:v1.0.1"), Some(8025));
+        assert_eq!(ui_port_for_image("getmeili/meilisearch:latest"), Some(7700));
+        assert_eq!(ui_port_for_image("minio/minio:latest"), Some(8900));
+        assert_eq!(ui_port_for_image("rustfs/rustfs:latest"), Some(9001));
+        assert_eq!(ui_port_for_image("mysql:8.4"), None);
+        assert_eq!(ui_port_for_image("redis:alpine"), None);
+    }
+
+    #[test]
     fn add_redis_to_sail_file_joins_sail_network_and_validates() {
         let plan = plan_catalog_add(SAIL_DOC, def("redis")).unwrap();
         let out = apply_all(SAIL_DOC, &plan.edits).unwrap();
@@ -677,6 +775,37 @@ mod tests {
             let removal = plan_catalog_remove(&added, def(id)).unwrap();
             let restored = apply_all(&added, &removal.edits).unwrap();
             assert_eq!(restored, SAIL_DOC, "three-way removal must restore bytes for {id}");
+        }
+    }
+
+    /// A mysql service added by a release that installed
+    /// `mysql/mysql-server:8.0` must stay removable after the image bump to
+    /// `mysql:8.4` — the legacy image is still "ours", not a customization.
+    #[test]
+    fn remove_accepts_a_legacy_image_install() {
+        let plan = plan_catalog_add(SAIL_DOC, def("mysql")).unwrap();
+        let added = apply_all(SAIL_DOC, &plan.edits).unwrap();
+        let old_install = added.replace("image: 'mysql:8.4'", "image: 'mysql/mysql-server:8.0'");
+        assert_ne!(old_install, added, "the substitution must have applied");
+        let removal = plan_catalog_remove(&old_install, def("mysql")).unwrap();
+        let restored = apply_all(&old_install, &removal.edits).unwrap();
+        assert_eq!(restored, SAIL_DOC);
+    }
+
+    /// Object-storage entries must hand the browser a usable URL alongside
+    /// the in-network endpoint, or Storage::url() links at minio:9000 die on
+    /// the host (the MinIO split-brain).
+    #[test]
+    fn object_storage_entries_set_a_browser_facing_aws_url() {
+        for id in ["minio", "rustfs"] {
+            let d = def(id);
+            let url = d.env_sets.iter().find(|(k, _)| *k == "AWS_URL");
+            assert_eq!(
+                url,
+                Some(&("AWS_URL", "http://localhost:9000/local")),
+                "{id} must set AWS_URL"
+            );
+            assert!(d.env_sets.iter().any(|(k, _)| *k == "AWS_ENDPOINT"), "{id}");
         }
     }
 
@@ -749,6 +878,28 @@ mod tests {
         assert!(plan_service_remove(doc, "missing").unwrap_err().contains("not in this file"));
         let only = "services:\n  app:\n    image: alpine\n";
         assert!(plan_service_remove(only, "app").unwrap_err().contains("last service"));
+    }
+
+    #[test]
+    fn mailhog_migrates_to_mailpit_in_one_plan() {
+        let doc = "services:\n  laravel.test:\n    image: sail-8.4/app\n    networks:\n      - sail\n  mailhog:\n    image: 'mailhog/mailhog:latest'\n    ports:\n      - '${FORWARD_MAILHOG_PORT:-1025}:1025'\n      - '${FORWARD_MAILHOG_DASHBOARD_PORT:-8025}:8025'\nnetworks:\n  sail:\n    driver: bridge\n";
+        let plan = plan_mailpit_migration(doc, "mailhog").unwrap();
+        let out = apply_all(doc, &plan.edits).unwrap();
+        assert!(!out.contains("mailhog"), "{out}");
+        assert!(out.contains("  mailpit:\n    image: 'axllent/mailpit:latest'"), "{out}");
+        assert!(out.contains("    networks:\n      - sail"), "mailpit joins the sail network");
+        assert!(Yaml::load_from_str(&out).is_ok());
+        assert!(plan.summary.iter().any(|s| s.contains("MAIL_HOST=mailpit")), "{:?}", plan.summary);
+
+        // Mailpit already present: refuse with a pointer, don't half-migrate.
+        let both = format!("{doc}  mailpit:\n    image: 'axllent/mailpit:latest'\n");
+        // (append under networks would be invalid yaml — rebuild properly)
+        let both = both.replace(
+            "networks:\n  sail:\n    driver: bridge\n  mailpit:",
+            "  mailpit:",
+        );
+        let err = plan_mailpit_migration(&both, "mailhog");
+        assert!(err.is_err());
     }
 
     #[test]

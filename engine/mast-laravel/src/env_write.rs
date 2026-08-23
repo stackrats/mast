@@ -95,6 +95,72 @@ pub fn edit_env_file(
     Ok(backup)
 }
 
+/// Rewrite CRLF line endings to LF, same discipline as [`edit_env_file`]
+/// (symlink refusal, backup, atomic write, mode preserved). Returns the
+/// backup path, or `None` as a no-op when the file has no CRLF.
+///
+/// Why this matters at all: the sail script `source`s `.env` with bash, so
+/// CRLF appends an invisible `\r` to every value — `APP_SERVICE` becomes
+/// `laravel.test\r` and compose reports `service "laravel.test\r" is not
+/// running`. Only the `\r` of a CRLF pair is touched; a stray `\r` inside a
+/// value is left exactly where it was.
+pub fn normalize_env_line_endings(
+    path: &Path,
+    backup_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, EnvWriteError> {
+    let meta = std::fs::symlink_metadata(path).map_err(io_err(path))?;
+    if meta.file_type().is_symlink() {
+        return Err(EnvWriteError::SymlinkRefused(path.to_path_buf()));
+    }
+    let original = std::fs::read(path).map_err(io_err(path))?;
+    if !original.windows(2).any(|w| w == b"\r\n") {
+        return Ok(None);
+    }
+    let mut edited = Vec::with_capacity(original.len());
+    let mut i = 0;
+    while i < original.len() {
+        if original[i] == b'\r' && original.get(i + 1) == Some(&b'\n') {
+            i += 1; // drop the \r, keep the \n
+            continue;
+        }
+        edited.push(original[i]);
+        i += 1;
+    }
+
+    let backup = match backup_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(io_err(dir))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup_path = dir.join(format!(
+                "{}.{ts}.bak",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            std::fs::write(&backup_path, &original).map_err(io_err(&backup_path))?;
+            Some(backup_path)
+        }
+        None => None,
+    };
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.mast-write-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(io_err(&tmp))?;
+        f.write_all(&edited).map_err(io_err(&tmp))?;
+        f.sync_all().map_err(io_err(&tmp))?;
+    }
+    std::fs::set_permissions(&tmp, meta.permissions()).map_err(io_err(&tmp))?;
+    std::fs::rename(&tmp, path).map_err(io_err(path))?;
+    Ok(backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +186,23 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&env).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn crlf_normalizes_with_backup_and_values_stay_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = tmp.path().join(".env");
+        std::fs::write(&env, "APP_SERVICE=laravel.test\r\nDB_HOST=mysql\r\n").unwrap();
+        let backups = tmp.path().join("backups");
+        let backup = normalize_env_line_endings(&env, Some(&backups)).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            "APP_SERVICE=laravel.test\nDB_HOST=mysql\n"
+        );
+        assert!(std::fs::read_to_string(backup).unwrap().contains("\r\n"));
+
+        // Already clean: explicit no-op, no backup churn.
+        assert!(normalize_env_line_endings(&env, Some(&backups)).unwrap().is_none());
     }
 
     #[test]
