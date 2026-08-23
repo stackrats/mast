@@ -16,8 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
-    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
-    REPAIR_STORAGE_LINK,
+    REPAIR_ADD_HOST_GATEWAY, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -208,11 +208,16 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         .flat_map(|(name, aliases)| std::iter::once(name.clone()).chain(aliases.iter().cloned()))
         .collect();
     let mut db_target = None;
-    let env_error_count = if env_present {
+    let pairs: Vec<(String, String)> = if env_present {
         let src = std::fs::read_to_string(&env_path).unwrap_or_default();
-        let parsed = mast_laravel::EnvFile::parse(&src);
-        let pairs: Vec<(String, String)> =
-            parsed.entries().map(|e| (e.key.clone(), e.value.clone())).collect();
+        mast_laravel::EnvFile::parse(&src)
+            .entries()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let env_error_count = if env_present {
         db_target = crate::db_repair::resolve_db_target(&pairs, &seed.services);
         mast_laravel::validate(&pairs, &service_names)
             .iter()
@@ -221,12 +226,13 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
     } else {
         0
     };
+    let sail_flavored = mast_project::is_sail_flavored(&seed.path);
     let node = mast_project::inspect_node_project(&seed.path);
     let is_laravel = std::fs::read_to_string(seed.path.join("composer.json"))
         .map(|c| c.contains("laravel/framework"))
         .unwrap_or(false);
     let facts = ProjectFacts {
-        sail_flavored: mast_project::is_sail_flavored(&seed.path),
+        sail_flavored,
         is_laravel,
         has_compose: mast_project::has_compose_file(&seed.path),
         has_vendor: seed.path.join("vendor").is_dir(),
@@ -283,8 +289,59 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             && std::fs::read(&env_path)
                 .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
                 .unwrap_or(false),
+        xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
     };
     (facts, db_target)
+}
+
+/// The Xdebug doctor's per-project facts (no docker involved; the
+/// extension probe is the async half's job).
+fn xdebug_facts(
+    dir: &Path,
+    pairs: &[(String, String)],
+    env: &std::collections::HashMap<String, String>,
+) -> Option<mast_diagnostics::XdebugFacts> {
+    let xdebug = mast_laravel::xdebug::xdebug_env(pairs)?;
+    let mut compose_passes_mode = false;
+    let mut compose_has_host_gateway = false;
+    for name in [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+        "compose.override.yaml",
+        "compose.override.yml",
+        "docker-compose.override.yaml",
+        "docker-compose.override.yml",
+    ] {
+        if let Ok(source) = std::fs::read_to_string(dir.join(name)) {
+            compose_passes_mode |= source.contains("XDEBUG_MODE");
+            compose_has_host_gateway |= source.contains("host-gateway");
+        }
+    }
+    // The IDE's listener lives on THIS machine whatever client_host says —
+    // that variable is how the container finds us, not where the IDE binds.
+    let ide_listening = xdebug.wants_debug().then(|| {
+        use std::net::{SocketAddr, TcpStream};
+        ["127.0.0.1", "[::1]"].iter().any(|host| {
+            format!("{host}:{}", xdebug.client_port)
+                .parse::<SocketAddr>()
+                .is_ok_and(|addr| {
+                    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+                })
+        })
+    });
+    Some(mast_diagnostics::XdebugFacts {
+        app_service: env
+            .get("APP_SERVICE")
+            .cloned()
+            .unwrap_or_else(|| "laravel.test".to_string()),
+        env: xdebug,
+        compose_passes_mode,
+        compose_has_host_gateway,
+        ide_listening,
+        extension_loaded: None,
+    })
 }
 
 /// Bounded ownership scan over the paths Laravel must write (`storage/`,
@@ -559,6 +616,30 @@ impl Engine {
                 }
                 let Some(invocation) = invocations.get(&facts.id) else { continue };
                 facts.db = crate::db_repair::probe_db(invocation, &target).await;
+            }
+            // Xdebug extension probe: one `php -m` per running project that
+            // requests an Xdebug mode.
+            for (facts, _) in &mut inspected {
+                if !facts.running {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                let Some(xdebug) = facts.xdebug.as_mut() else { continue };
+                let argv = crate::db_repair::exec_env_argv(
+                    invocation,
+                    &xdebug.app_service,
+                    &[],
+                    &["php".into(), "-m".into()],
+                );
+                if let Ok(out) =
+                    run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                    && out.success()
+                {
+                    xdebug.extension_loaded = Some(
+                        out.stdout.lines().any(|l| l.trim().eq_ignore_ascii_case("xdebug")),
+                    );
+                }
             }
             // Volume-vs-image version scan — deliberately including stopped
             // projects: the point is warning before the crash-loop.
@@ -957,6 +1038,37 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_ADD_HOST_GATEWAY => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-host-gateway needs the app service name".into(),
+                    })?
+                    .to_string();
+                let (_invocation, file) = self.catalog_context(project)?;
+                tokio::task::spawn_blocking(move || {
+                    let before = std::fs::read_to_string(&file).map_err(crate::internal_err)?;
+                    let (edits, summary) =
+                        mast_compose::sail::plan_add_host_gateway(&before, &service)
+                            .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                    let after = mast_yaml_edit::apply_all(&before, &edits)
+                        .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: file.to_string_lossy().into_owned(),
+                            before,
+                            after,
+                            summary: summary.clone(),
+                            no_op: false,
+                        }),
+                        summary,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_NORMALIZE_ENV_EOL => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -1302,6 +1414,38 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_ADD_HOST_GATEWAY => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-host-gateway needs the app service name".into(),
+                    })?
+                    .to_string();
+                let (invocation, file) = self.catalog_context(project)?;
+                let source = tokio::task::spawn_blocking({
+                    let file = file.clone();
+                    move || std::fs::read_to_string(file)
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::internal_err)?;
+                let (edits, summary) = mast_compose::sail::plan_add_host_gateway(&source, &service)
+                    .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                self.write_compose(&invocation, &file, &edits, summary).await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "{service}: host.docker.internal now maps to the host — recreate \
+                             the container (Start) to apply it"
+                        ),
                         stderr: false,
                     },
                 );

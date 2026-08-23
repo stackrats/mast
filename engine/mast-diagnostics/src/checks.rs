@@ -4,9 +4,9 @@
 
 use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
-    REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE,
-    REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
-    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_NORMALIZE_ENV_EOL,
+    REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
+    REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_NORMALIZE_ENV_EOL,
     REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
     REPAIR_STORAGE_LINK,
 };
@@ -646,6 +646,100 @@ impl Check for ConfigCache {
     }
 }
 
+/// The Xdebug doctor. Every failure mode here looks identical from the
+/// browser — breakpoints never hit — which is why no single piece of advice
+/// in the tracker ever worked. The ladder names which rung actually broke:
+/// the compose file never passes the mode in, Linux can't resolve the
+/// default client_host, the image shipped without the extension, or nothing
+/// is listening for the connection.
+struct Xdebug;
+impl Check for Xdebug {
+    fn id(&self) -> &'static str {
+        "xdebug"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.xdebug.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for p in &ctx.projects {
+            let Some(x) = &p.xdebug else { continue };
+            if !x.compose_passes_mode {
+                findings.push(for_project(
+                    finding(
+                        self.id(),
+                        Severity::Error,
+                        format!(
+                            "{}: SAIL_XDEBUG_MODE is set but never reaches the container",
+                            p.name
+                        ),
+                        format!(
+                            "The compose file predates Sail's Xdebug wiring — nothing passes \
+                             XDEBUG_MODE through. Add under services.{}.environment:\n\
+                             XDEBUG_MODE: '${{SAIL_XDEBUG_MODE:-off}}'\n\
+                             XDEBUG_CONFIG: '${{SAIL_XDEBUG_CONFIG:-client_host=host.docker.internal}}'",
+                            x.app_service
+                        ),
+                    ),
+                    p,
+                ));
+                continue; // the rungs below assume the mode arrives at all
+            }
+            if x.env.wants_debug()
+                && ctx.system.linux
+                && x.env.client_host == "host.docker.internal"
+                && !x.compose_has_host_gateway
+            {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!(
+                        "{}: Xdebug's client_host cannot resolve on Linux",
+                        p.name
+                    ),
+                    "host.docker.internal does not exist on Linux unless the compose file \
+                     maps it (`extra_hosts: host.docker.internal:host-gateway`) — Xdebug \
+                     connects to nothing and breakpoints never hit. Files published before \
+                     Sail added the mapping are missing it.",
+                );
+                f.repair = repair_spec(REPAIR_ADD_HOST_GATEWAY, Some(&x.app_service));
+                findings.push(for_project(f, p));
+            }
+            if x.extension_loaded == Some(false) {
+                findings.push(for_project(
+                    finding(
+                        self.id(),
+                        Severity::Error,
+                        format!("{}: the app container has no xdebug extension", p.name),
+                        "php -m inside the container does not list xdebug. Rebuild without \
+                         cache; if it still fails, the PPA has not published the extension \
+                         for this PHP series yet (a recurring gap right after new PHP \
+                         releases).",
+                    ),
+                    p,
+                ));
+            }
+            if x.env.wants_debug() && x.ide_listening == Some(false) {
+                findings.push(for_project(
+                    finding(
+                        self.id(),
+                        Severity::Info,
+                        format!(
+                            "{}: no debugger is listening on port {}",
+                            p.name, x.env.client_port
+                        ),
+                        "Xdebug connects OUT to your IDE; until something listens \
+                         (PhpStorm: \"Start Listening for PHP Debug Connections\", VS Code: \
+                         a running launch config), breakpoints cannot hit.",
+                    ),
+                    p,
+                ));
+            }
+        }
+        findings
+    }
+}
+
 /// CRLF line endings in `.env`. Compose tolerates them for interpolation,
 /// but the sail script `source`s the file with bash, so every value grows an
 /// invisible `\r` — the "service \"laravel.test\r\" is not running" class of
@@ -1213,6 +1307,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
         Box::new(DockerDesktopLinux),
+        Box::new(Xdebug),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1296,6 +1391,22 @@ mod tests {
             drifted_services: Vec::new(),
             vite_hot: None,
             env_crlf: false,
+            xdebug: None,
+        }
+    }
+
+    fn xdebug_facts(mode: &str) -> crate::XdebugFacts {
+        crate::XdebugFacts {
+            env: mast_laravel::xdebug::xdebug_env(&[(
+                "SAIL_XDEBUG_MODE".to_string(),
+                mode.to_string(),
+            )])
+            .unwrap(),
+            app_service: "laravel.test".into(),
+            compose_passes_mode: true,
+            compose_has_host_gateway: true,
+            ide_listening: None,
+            extension_loaded: None,
         }
     }
 
@@ -1499,6 +1610,69 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn xdebug_ladder_names_the_broken_rung() {
+        // Compose never passes the mode: the fatal first rung, and the only
+        // finding (the rest assume the mode arrives).
+        let mut p = sail_project("a");
+        let mut x = xdebug_facts("develop,debug");
+        x.compose_passes_mode = false;
+        x.compose_has_host_gateway = false;
+        p.xdebug = Some(x);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let xdebug: Vec<_> = findings.iter().filter(|f| f.check == "xdebug").collect();
+        assert_eq!(xdebug.len(), 1, "{xdebug:?}");
+        assert!(xdebug[0].detail.contains("XDEBUG_MODE: '${SAIL_XDEBUG_MODE:-off}'"));
+
+        // Linux without host-gateway: Error with the one-click repair.
+        let mut p = sail_project("a");
+        let mut x = xdebug_facts("debug");
+        x.compose_has_host_gateway = false;
+        p.xdebug = Some(x);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings
+            .iter()
+            .find(|f| f.check == "xdebug" && f.title.contains("client_host"))
+            .unwrap();
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_ADD_HOST_GATEWAY);
+        assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
+
+        // …but not on macOS, and not when client_host was overridden.
+        let mut p = sail_project("a");
+        let mut x = xdebug_facts("debug");
+        x.compose_has_host_gateway = false;
+        p.xdebug = Some(x);
+        let mut c = ctx(vec![p]);
+        c.system.linux = false;
+        let (_, findings) = run_all(&c);
+        assert!(!findings.iter().any(|f| f.check == "xdebug"));
+
+        // Missing extension and silent IDE stack up as separate rungs.
+        let mut p = sail_project("a");
+        let mut x = xdebug_facts("develop,debug");
+        x.extension_loaded = Some(false);
+        x.ide_listening = Some(false);
+        p.xdebug = Some(x);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(findings.iter().any(|f| f.check == "xdebug" && f.title.contains("no xdebug")));
+        let ide = findings
+            .iter()
+            .find(|f| f.check == "xdebug" && f.title.contains("no debugger is listening"))
+            .unwrap();
+        assert_eq!(ide.severity, Severity::Info);
+        assert!(ide.title.contains("9003"));
+
+        // Everything wired: silence.
+        let mut p = sail_project("a");
+        let mut x = xdebug_facts("develop,debug");
+        x.ide_listening = Some(true);
+        x.extension_loaded = Some(true);
+        p.xdebug = Some(x);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(!findings.iter().any(|f| f.check == "xdebug"));
     }
 
     #[test]

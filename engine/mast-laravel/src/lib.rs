@@ -12,6 +12,7 @@ pub mod share;
 pub mod url;
 pub mod validate;
 pub mod vite;
+pub mod xdebug;
 
 pub use app_key::generate_app_key;
 pub use env::{EnvEntry, EnvError, EnvFile, EnvItem, Quoting};
