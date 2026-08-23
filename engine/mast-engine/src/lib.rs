@@ -481,6 +481,7 @@ impl Engine {
                 | Action::RevealInFileManager { .. }
                 | Action::OpenInBrowser { .. }
                 | Action::OpenUrl { .. }
+                | Action::OpenHostsFile
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -1032,6 +1033,12 @@ impl Engine {
                 self.spawn_operation(id, handle, async move {
                     integrations::open_in_browser(&url)
                         .map_err(|message| ErrorInfo::InvalidInput { message })
+                });
+            }
+            Action::OpenHostsFile => {
+                self.spawn_operation(id, handle, async move {
+                    integrations::open_path(std::path::Path::new(proxy::hosts_file_path()))
+                        .map_err(|message| ErrorInfo::Internal { message })
                 });
             }
             Action::SetEnvVar { id: project, key: env_key, value } => {

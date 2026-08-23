@@ -19,10 +19,51 @@ use crate::ops::OpHandle;
 use crate::{Engine, internal_err};
 
 pub(crate) const PROXY_CONTAINER: &str = "mast-proxy";
+/// Where Caddy's internal CA keeps its root inside the container.
+pub(crate) const CA_IN_CONTAINER: &str =
+    "mast-proxy:/data/caddy/pki/authorities/local/root.crt";
 const PROXY_IMAGE: &str = "caddy:2-alpine";
 /// Generous: the first enable pulls the caddy image.
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(180);
 const OUTPUT_CAP: usize = 256 * 1024;
+
+/// The platform's hosts file — what the add-hosts-entry repair appends to
+/// and what the manual "open it yourself" button shows.
+pub(crate) fn hosts_file_path() -> &'static str {
+    if cfg!(windows) { r"C:\Windows\System32\drivers\etc\hosts" } else { "/etc/hosts" }
+}
+
+/// `pkexec sh -c <script>` — polkit elevation, the Linux path.
+fn pkexec_argv(script: &str) -> Vec<String> {
+    ["pkexec", "sh", "-c", script].map(String::from).into()
+}
+
+/// `osascript … with administrator privileges` — the macOS password prompt.
+/// The script is embedded in an AppleScript string literal, so backslashes
+/// and quotes must be escaped for THAT layer.
+fn osascript_admin_argv(script: &str) -> Vec<String> {
+    let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
+    vec![
+        "osascript".into(),
+        "-e".into(),
+        format!("do shell script \"{escaped}\" with administrator privileges"),
+    ]
+}
+
+/// The elevated shell for this platform. Both builders stay compiled on
+/// every platform so the mac branch cannot rot unnoticed on Linux builds.
+pub(crate) fn privileged_shell_argv(script: &str) -> Vec<String> {
+    if cfg!(target_os = "macos") { osascript_admin_argv(script) } else { pkexec_argv(script) }
+}
+
+/// How the elevation prompt is described to the user before they consent.
+pub(crate) fn elevation_note() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "asks for your password (macOS administrator privileges)"
+    } else {
+        "asks for elevation via polkit (pkexec)"
+    }
+}
 
 /// The shapes a domain may take before it goes anywhere near `/etc/hosts`
 /// or a root shell: lowercase letters, digits and hyphens, ending in a TLD
@@ -189,6 +230,13 @@ impl Engine {
         let port =
             entries.iter().find(|(d, _)| *d == domain).map(|(_, p)| *p).unwrap_or(80);
         out(format!("https://{domain} → localhost:{port} is configured on the proxy"));
+        if let Some(ca) = self.export_proxy_ca().await {
+            out(format!(
+                "root certificate exported to {} — import that file wherever system \
+                 trust does not reach (Firefox, curl --cacert, NODE_EXTRA_CA_CERTS)",
+                ca.path
+            ));
+        }
 
         let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap_or_default();
         if !hosts_resolves(&hosts, &domain) {
@@ -211,6 +259,32 @@ impl Engine {
             out(format!("open https://{domain} — everything is in place"));
         }
         Ok(())
+    }
+
+    /// Export the proxy CA's root certificate to the data dir and return it
+    /// for manual trust (Firefox's import dialog, `curl --cacert`,
+    /// `NODE_EXTRA_CA_CERTS`). Freshly copied from the container when it is
+    /// up — retried briefly, because Caddy mints the CA on first boot — with
+    /// a previously exported file as the fallback. `None` when neither
+    /// exists yet.
+    pub async fn export_proxy_ca(&self) -> Option<mast_contract::ProxyCa> {
+        let dir = self.inner.deps.store.proxy_dir();
+        tokio::fs::create_dir_all(&dir).await.ok()?;
+        let crt = dir.join("root.crt");
+        let cp: Vec<String> = ["docker", "cp", CA_IN_CONTAINER, &crt.to_string_lossy()]
+            .map(String::from)
+            .into();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            match run_command(&cp, None, &[], Duration::from_secs(10), OUTPUT_CAP).await {
+                Ok(o) if o.success() => break,
+                _ => {}
+            }
+        }
+        let pem = tokio::fs::read_to_string(&crt).await.ok()?;
+        Some(mast_contract::ProxyCa { path: crt.to_string_lossy().into_owned(), pem })
     }
 
     fn offer_fix(
@@ -361,6 +435,24 @@ mod tests {
         ] {
             assert!(validate_local_domain(bad).is_err(), "accepted: {bad}");
         }
+    }
+
+    #[test]
+    fn privileged_argv_builders_escape_for_their_layer() {
+        assert_eq!(
+            pkexec_argv("printf 'x' >> /etc/hosts"),
+            vec!["pkexec", "sh", "-c", "printf 'x' >> /etc/hosts"]
+        );
+        let mac = osascript_admin_argv("install -m 644 'a \"b\"' /dest && refresh");
+        assert_eq!(mac[0], "osascript");
+        assert_eq!(mac[1], "-e");
+        // The shell script rides inside an AppleScript string literal: its
+        // quotes must arrive escaped, and the wrapper must close cleanly.
+        assert_eq!(
+            mac[2],
+            "do shell script \"install -m 644 'a \\\"b\\\"' /dest && refresh\" \
+             with administrator privileges"
+        );
     }
 
     #[test]

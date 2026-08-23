@@ -36,11 +36,17 @@ import {
   DropdownMenuTrigger,
 } from "reka-ui";
 
-import type { LaravelLogReport, ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
+import type {
+  LaravelLogReport,
+  ProjectCommand,
+  ProjectSummary,
+  ProxyCa,
+  ServiceState,
+} from "../bindings";
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
-import { envReport, laravelLog } from "../lib/transport";
+import { envReport, laravelLog, proxyCa } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -220,6 +226,38 @@ function setDomain(domain: string | null) {
     domain ? `Enable https://${domain}` : "Disable local domain",
     { type: "setLocalDomain", id: project.id, domain },
   );
+}
+
+/** The proxy CA's root certificate, for the trust that Fix buttons cannot
+ * reach: Firefox's import dialog wants the file, curl --cacert and
+ * NODE_EXTRA_CA_CERTS want the path, other tools want the PEM itself. */
+const caFile = ref<ProxyCa | null>(null);
+const manualCopied = ref<"path" | "pem" | "hosts" | null>(null);
+async function loadProxyCa() {
+  try {
+    caFile.value = await proxyCa();
+  } catch {
+    caFile.value = null;
+  }
+}
+watch(
+  () => [httpsOpen.value, domainOp.value?.terminal] as const,
+  ([open]) => {
+    if (open) void loadProxyCa();
+  },
+);
+/** The exact line the add-hosts-entry repair would append — shown so the
+ * manual route needs no guesswork. */
+const hostsLine = computed(() =>
+  project.localDomain ? `127.0.0.1\t${project.localDomain}` : null,
+);
+async function copyManual(kind: "path" | "pem" | "hosts") {
+  const value =
+    kind === "hosts" ? hostsLine.value : kind === "path" ? caFile.value?.path : caFile.value?.pem;
+  if (!value) return;
+  await navigator.clipboard.writeText(value);
+  manualCopied.value = kind;
+  setTimeout(() => (manualCopied.value = null), 1500);
 }
 
 // --- laravel.log viewer: the app's own log, parsed — an error and its
@@ -1249,10 +1287,66 @@ async function addCommand() {
           />
         </div>
         <p class="text-xs text-slate-400">
-          Two one-time system steps — the <span class="font-mono">/etc/hosts</span> line and
-          trusting the certificate authority — appear as Fix buttons after enabling, each with a
-          preview and a polkit prompt. Nothing touches your system without them.
+          Two one-time system steps — the hosts-file line and trusting the certificate authority —
+          appear as Fix buttons after enabling, each with a preview and an elevation prompt. Nothing
+          touches your system without them.
         </p>
+        <!-- The manual route, always available: elevation prompts are not an
+             option everywhere (no polkit agent, hardened machines, Firefox's
+             own store), so everything a person needs to do it by hand is
+             copyable right here. -->
+        <div
+          v-if="project.localDomain"
+          class="space-y-2 border-t border-slate-200 pt-3 dark:border-slate-700"
+        >
+          <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
+            Prefer to set it up yourself?
+          </p>
+          <p class="text-xs text-slate-500 dark:text-slate-400">
+            Add this line to your hosts file:
+          </p>
+          <p
+            class="flex items-baseline gap-1.5 font-mono text-xs select-all text-slate-900 dark:text-slate-100"
+          >
+            {{ hostsLine }}
+            <Tooltip text="Copy the hosts line.">
+              <button :class="['shrink-0', iconButtonClass]" @click="copyManual('hosts')">
+                <Check v-if="manualCopied === 'hosts'" class="h-3.5 w-3.5 text-emerald-600" />
+                <Copy v-else class="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
+          </p>
+          <div>
+            <Button variant="outline" size="sm" @click="store.run({ type: 'openHostsFile' })">
+              <FileCog class="h-3.5 w-3.5" /> Open hosts file
+            </Button>
+          </div>
+          <template v-if="caFile">
+            <p class="text-xs text-slate-500 dark:text-slate-400">
+              And trust the certificate authority where you need it — Firefox's import dialog,
+              <span class="font-mono">curl --cacert</span>,
+              <span class="font-mono">NODE_EXTRA_CA_CERTS</span>:
+            </p>
+            <p
+              class="flex items-baseline gap-1.5 font-mono text-xs break-all select-all text-slate-900 dark:text-slate-100"
+            >
+              {{ caFile.path }}
+              <Tooltip text="Copy the certificate file's path.">
+                <button :class="['shrink-0', iconButtonClass]" @click="copyManual('path')">
+                  <Check v-if="manualCopied === 'path'" class="h-3.5 w-3.5 text-emerald-600" />
+                  <Copy v-else class="h-3.5 w-3.5" />
+                </button>
+              </Tooltip>
+            </p>
+            <div>
+              <Button variant="outline" size="sm" @click="copyManual('pem')">
+                <Check v-if="manualCopied === 'pem'" class="h-3.5 w-3.5 text-emerald-600" />
+                <Copy v-else class="h-3.5 w-3.5" />
+                {{ manualCopied === "pem" ? "Copied" : "Copy certificate (PEM)" }}
+              </Button>
+            </div>
+          </template>
+        </div>
       </div>
     </Modal>
 
