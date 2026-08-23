@@ -319,6 +319,9 @@ impl Engine {
         image: &str,
     ) -> Result<FileEditPreview, ErrorInfo> {
         let (_invocation, file) = self.catalog_context(project)?;
+        // Version guard: retagging a database against its existing volume is
+        // how Sail's own stub bump walked users into crash-loops.
+        let guard = self.retag_version_verdict(project, service, image).await;
         let (service, image) = (service.to_string(), image.to_string());
         tokio::task::spawn_blocking(move || {
             let before = std::fs::read_to_string(&file).map_err(internal_err)?;
@@ -345,14 +348,31 @@ impl Engine {
             let edits = [mast_yaml_edit::Edit::SetScalar { path, value: quoted }];
             let after = mast_yaml_edit::apply_all(&before, &edits)
                 .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+            let mut summary = Vec::new();
+            match &guard {
+                Some((mast_laravel::db::VersionVerdict::WillNotStart { reason }, vol)) => {
+                    summary.push(format!("WILL NOT START: {reason}"));
+                    summary.push(format!(
+                        "applying this is refused — export the data on a {vol}-compatible \
+                         image first, or use the recreate-volume repair if the data is \
+                         disposable"
+                    ));
+                }
+                Some((mast_laravel::db::VersionVerdict::InPlaceUpgrade { note }, _)) => {
+                    summary.push(format!("WARNING: {note}"));
+                }
+                None => {}
+            }
+            summary.push(format!(
+                "{service}: image {} -> {image}",
+                current.trim().trim_matches('\'')
+            ));
+            summary.push("the running container keeps the old image until you rebuild".into());
             Ok(FileEditPreview {
                 file: file.to_string_lossy().into_owned(),
                 before,
                 after,
-                summary: vec![
-                    format!("{service}: image {} -> {image}", current.trim().trim_matches('\'')),
-                    "the running container keeps the old image until you rebuild".into(),
-                ],
+                summary,
                 no_op: false,
             })
         })
@@ -371,6 +391,27 @@ impl Engine {
         image: &str,
     ) -> Result<(), ErrorInfo> {
         let (invocation, file) = self.catalog_context(project)?;
+        match self.retag_version_verdict(project, service, image).await {
+            Some((mast_laravel::db::VersionVerdict::WillNotStart { reason }, vol)) => {
+                // A guaranteed crash-loop is refused; the compose file stays
+                // an escape hatch for anyone who really means it.
+                return Err(ErrorInfo::Conflict {
+                    message: format!(
+                        "{reason}. Export the data on a {vol}-compatible image first, use \
+                         the recreate-volume repair if it is disposable, or edit the \
+                         compose file directly to override."
+                    ),
+                });
+            }
+            Some((mast_laravel::db::VersionVerdict::InPlaceUpgrade { note }, _)) => {
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output { line: format!("note: {note}"), stderr: true },
+                );
+            }
+            None => {}
+        }
         let path = vec![
             mast_yaml_edit::key("services"),
             mast_yaml_edit::key(service),

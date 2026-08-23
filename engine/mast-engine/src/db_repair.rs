@@ -22,7 +22,7 @@ use mast_laravel::db::{
 };
 
 use crate::diagnostics::{PROBE_CAP, PROBE_TIMEOUT};
-use crate::{Engine, OperationEventKind, OperationId, internal_err};
+use crate::{Engine, OperationEventKind, OperationId};
 
 /// A probeable database: the compose service to exec into and the `.env`
 /// credentials to test.
@@ -156,18 +156,119 @@ pub(crate) async fn probe_db(
     Some(facts(Some(failure), admin))
 }
 
-/// Parse `docker volume ls --format '{{.Name}}\t{{.Label …}}'` rows into
-/// (daemon volume name, compose source name).
-pub(crate) fn parse_volume_rows(stdout: &str) -> Vec<(String, String)> {
+/// Parse `docker volume ls` three-column rows into
+/// (daemon volume name, compose project label, compose source label).
+pub(crate) fn parse_volume_rows(stdout: &str) -> Vec<(String, String, String)> {
     stdout
         .lines()
         .filter_map(|line| {
-            let (name, label) = line.split_once('\t')?;
-            let (name, label) = (name.trim(), label.trim());
-            (!name.is_empty() && !label.is_empty())
-                .then(|| (name.to_string(), label.to_string()))
+            let mut cols = line.split('\t');
+            let name = cols.next()?.trim();
+            let project = cols.next()?.trim();
+            let source = cols.next()?.trim();
+            (!name.is_empty() && !project.is_empty() && !source.is_empty())
+                .then(|| (name.to_string(), project.to_string(), source.to_string()))
         })
         .collect()
+}
+
+/// Every compose-created volume on the daemon, with its project and source
+/// labels — ground truth for mapping model volume sources to real volumes,
+/// with no name-derivation guessing.
+pub(crate) async fn daemon_volume_rows() -> Vec<(String, String, String)> {
+    let argv: Vec<String> = [
+        "docker",
+        "volume",
+        "ls",
+        "--format",
+        "{{.Name}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.volume\"}}",
+    ]
+    .map(String::from)
+    .into();
+    match run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP).await {
+        Ok(out) if out.success() => parse_volume_rows(&out.stdout),
+        _ => Vec::new(),
+    }
+}
+
+/// Read a data volume's version marker (`PG_VERSION` for postgres,
+/// `mysql_upgrade_info` for the mysql family) through a throwaway read-only
+/// container. `None` when unreadable or absent — say nothing rather than
+/// guess.
+pub(crate) async fn volume_version_marker(volume: &str) -> Option<String> {
+    let argv: Vec<String> = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        &format!("{volume}:/mast-volume:ro"),
+        "alpine:latest",
+        "sh",
+        "-c",
+        "cat /mast-volume/PG_VERSION /mast-volume/mysql_upgrade_info 2>/dev/null || true",
+    ]
+    .map(String::from)
+    .into();
+    // Generous timeout: the first use may pull alpine (a few MB).
+    let out = run_command(&argv, None, &[], Duration::from_secs(60), PROBE_CAP).await.ok()?;
+    out.stdout.lines().map(str::trim).find(|l| !l.is_empty()).map(String::from)
+}
+
+/// Per-project database-service shapes the diagnostics gather feeds into
+/// [`scan_db_versions`], extracted from the resolved model under the state
+/// lock.
+pub(crate) struct DbServiceMeta {
+    pub project_id: String,
+    /// Resolved compose project name — the volume label to match.
+    pub compose_name: String,
+    /// (service, image, named volume sources).
+    pub services: Vec<(String, String, Vec<String>)>,
+}
+
+/// Compare each database service's pinned image series against what its
+/// volume was written by. Only mismatches come back; a fresh volume, an
+/// unpinned tag, or an unreadable marker say nothing.
+pub(crate) async fn scan_db_versions(
+    metas: &[DbServiceMeta],
+) -> std::collections::HashMap<String, Vec<mast_diagnostics::DbVersionIssue>> {
+    let mut issues: std::collections::HashMap<String, Vec<mast_diagnostics::DbVersionIssue>> =
+        Default::default();
+    let any_db = metas
+        .iter()
+        .flat_map(|m| m.services.iter())
+        .any(|(_, image, volumes)| !volumes.is_empty() && db::db_image_series(image).is_some());
+    if !any_db {
+        return issues;
+    }
+    let rows = daemon_volume_rows().await;
+    for meta in metas {
+        for (service, image, sources) in &meta.services {
+            let Some((kind, image_series)) = db::db_image_series(image) else { continue };
+            let Some((volume, _, _)) = rows
+                .iter()
+                .find(|(_, project, source)| {
+                    *project == meta.compose_name && sources.contains(source)
+                })
+            else {
+                continue; // no volume yet — first start initializes cleanly
+            };
+            let Some(marker) = volume_version_marker(volume).await else { continue };
+            let Some(volume_series) = db::parse_volume_marker(&marker) else { continue };
+            let Some(verdict) = db::volume_version_verdict(kind, &image_series, &volume_series)
+            else {
+                continue;
+            };
+            issues.entry(meta.project_id.clone()).or_default().push(
+                mast_diagnostics::DbVersionIssue {
+                    service: service.clone(),
+                    image: image.clone(),
+                    volume_version: db::format_series(&volume_series),
+                    verdict,
+                },
+            );
+        }
+    }
+    issues
 }
 
 struct DbRepairCtx {
@@ -387,27 +488,39 @@ impl Engine {
                 ),
             });
         }
-        let argv: Vec<String> = [
-            "docker",
-            "volume",
-            "ls",
-            "--filter",
-            &format!("label=com.docker.compose.project={}", ctx.model.name),
-            "--format",
-            "{{.Name}}\t{{.Label \"com.docker.compose.volume\"}}",
-        ]
-        .map(String::from)
-        .into();
-        let out = run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+        Ok(daemon_volume_rows()
             .await
-            .map_err(internal_err)?;
-        if !out.success() {
-            return Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() });
-        }
-        Ok(parse_volume_rows(&out.stdout)
             .into_iter()
-            .filter(|(_, source)| sources.iter().any(|s| s == source))
+            .filter(|(_, project, source)| {
+                *project == ctx.model.name && sources.iter().any(|s| s == source)
+            })
+            .map(|(name, _, source)| (name, source))
             .collect())
+    }
+
+    /// What retagging `service` to `new_image` means for its existing data
+    /// volume, when both sides are knowable. `None` = nothing to warn about
+    /// (not a pinned db image, no volume yet, marker unreadable, same series).
+    pub(crate) async fn retag_version_verdict(
+        &self,
+        project: &ProjectId,
+        service: &str,
+        new_image: &str,
+    ) -> Option<(mast_laravel::db::VersionVerdict, String)> {
+        let (kind, image_series) = db::db_image_series(new_image)?;
+        let ctx = self.db_repair_ctx(project).ok()?;
+        let sources = ctx.model.services.iter().find(|s| s.name == service)?.volumes.clone();
+        if sources.is_empty() {
+            return None;
+        }
+        let rows = daemon_volume_rows().await;
+        let (volume, _, _) = rows
+            .iter()
+            .find(|(_, proj, source)| *proj == ctx.model.name && sources.contains(source))?;
+        let marker = volume_version_marker(volume).await?;
+        let volume_series = db::parse_volume_marker(&marker)?;
+        let verdict = db::volume_version_verdict(kind, &image_series, &volume_series)?;
+        Some((verdict, db::format_series(&volume_series)))
     }
 
     pub(crate) async fn db_recreate_preview(
@@ -605,13 +718,14 @@ mod tests {
     #[test]
     fn volume_rows_parse_names_and_labels() {
         let rows = parse_volume_rows(
-            "myapp_sail-mysql\tsail-mysql\nmyapp_sail-redis\tsail-redis\nunlabeled\t\n\n",
+            "myapp_sail-mysql\tmyapp\tsail-mysql\nmyapp_sail-redis\tmyapp\tsail-redis\n\
+             unlabeled\t\t\n\n",
         );
         assert_eq!(
             rows,
             vec![
-                ("myapp_sail-mysql".to_string(), "sail-mysql".to_string()),
-                ("myapp_sail-redis".to_string(), "sail-redis".to_string()),
+                ("myapp_sail-mysql".to_string(), "myapp".to_string(), "sail-mysql".to_string()),
+                ("myapp_sail-redis".to_string(), "myapp".to_string(), "sail-redis".to_string()),
             ]
         );
     }

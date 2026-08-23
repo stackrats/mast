@@ -43,6 +43,7 @@ pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
 pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
 pub const REPAIR_DB_RECREATE: &str = "db-recreate-volume";
+pub const REPAIR_CONFIG_CLEAR: &str = "config-clear";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -85,6 +86,8 @@ pub struct SystemFacts {
     pub docker_host_env: bool,
     /// `docker compose version --short`; `None` = command unavailable.
     pub compose_version: Option<String>,
+    /// Daemon version from `docker info` (`{{.ServerVersion}}`).
+    pub docker_server_version: Option<String>,
     pub socket: Option<SocketFacts>,
     pub rootless: Option<bool>,
     pub snap_docker: bool,
@@ -111,6 +114,18 @@ pub struct DbProbeFacts {
     /// (probed only after a failure) — the gate between a live reconcile
     /// and a destructive volume recreate.
     pub admin_access: bool,
+}
+
+/// A database service whose pinned image version disagrees with what its
+/// data volume was written by (engine-gathered from the volume's marker
+/// file; only mismatches are recorded).
+#[derive(Debug, Clone)]
+pub struct DbVersionIssue {
+    pub service: String,
+    pub image: String,
+    /// The version the volume's data was written by, e.g. "10.6.14".
+    pub volume_version: String,
+    pub verdict: mast_laravel::db::VersionVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +171,15 @@ pub struct ProjectFacts {
     /// Database credential probe outcome; `None` when nothing was probeable
     /// (stopped project, no Sail-shaped DB config, docker down).
     pub db: Option<DbProbeFacts>,
+    /// Database services whose image tag disagrees with their volume's data
+    /// version (checked even when stopped — the point is warning BEFORE the
+    /// crash-loop).
+    pub db_versions: Vec<DbVersionIssue>,
+    /// `bootstrap/cache/config.php` exists — Laravel is not reading `.env`.
+    pub config_cached: bool,
+    /// Compose service names containing a dot (`laravel.test`) — the shape
+    /// several compose releases have choked on.
+    pub dotted_services: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +286,15 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Creates the `public/storage → ../storage/app/public` symlink as a \
                           relative link, so it resolves both on the host and inside the \
                           container (artisan's default absolute link only works in one)."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_CONFIG_CLEAR => Some(RepairSpec {
+            id: REPAIR_CONFIG_CLEAR,
+            title: "Clear the cached configuration".into(),
+            risk: RiskTier::Safe,
+            description: "Deletes `bootstrap/cache/config.php` (what `artisan config:clear` \
+                          does), so Laravel reads `.env` again."
                 .into(),
             arg: None,
         }),

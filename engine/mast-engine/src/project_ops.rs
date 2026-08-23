@@ -139,6 +139,7 @@ impl Engine {
                     redactor: Redactor::default(),
                     app_port: None,
                     host_ports: Vec::new(),
+                    compose_fingerprint: None,
                 };
                 events.push(PatchEvent::ProjectAdded { project: entry.summary.clone() });
                 st.projects.insert(entry.record.id.clone(), entry);

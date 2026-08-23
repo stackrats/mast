@@ -14,9 +14,9 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY,
-    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
-    REPAIR_STORAGE_LINK,
+    REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
+    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -254,13 +254,21 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         external_networks: seed.external_networks,
         resolution_error: seed.resolution_error,
         db: None,
+        db_versions: Vec::new(),
+        config_cached: seed.path.join("bootstrap/cache/config.php").is_file(),
+        dotted_services: seed
+            .services
+            .iter()
+            .filter(|(name, _)| name.contains('.'))
+            .map(|(name, _)| name.clone())
+            .collect(),
     };
     (facts, db_target)
 }
 
 impl Engine {
     async fn gather_diag_ctx(&self) -> DiagCtx {
-        let (docker, seeds, invocations, workspace_issues, docker_host_env) = {
+        let (docker, seeds, invocations, db_metas, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
@@ -294,6 +302,26 @@ impl Engine {
                     .values()
                     .filter_map(|e| e.invocation.clone().map(|i| (e.record.id.clone(), i)))
                     .collect();
+            let db_metas: Vec<crate::db_repair::DbServiceMeta> = st
+                .projects
+                .values()
+                .filter_map(|e| {
+                    let model = e.model.as_ref()?;
+                    Some(crate::db_repair::DbServiceMeta {
+                        project_id: e.record.id.clone(),
+                        compose_name: model.name.clone(),
+                        services: model
+                            .services
+                            .iter()
+                            .filter_map(|s| {
+                                s.image
+                                    .clone()
+                                    .map(|image| (s.name.clone(), image, s.volumes.clone()))
+                            })
+                            .collect(),
+                    })
+                })
+                .collect();
             let issues = workspace_summaries(&st)
                 .into_iter()
                 .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
@@ -304,7 +332,7 @@ impl Engine {
                 .process_env
                 .get("DOCKER_HOST")
                 .is_some_and(|v| !v.is_empty());
-            (st.docker.clone(), seeds, invocations, issues, docker_host_env)
+            (st.docker.clone(), seeds, invocations, db_metas, issues, docker_host_env)
         };
 
         let compose_version = {
@@ -318,19 +346,30 @@ impl Engine {
                 .filter(|v| !v.is_empty())
         };
 
-        // Security options + data root in one daemon round trip.
-        let (rootless, docker_root) = {
-            let argv: Vec<String> =
-                ["docker", "info", "--format", "{{.SecurityOptions}}\t{{.DockerRootDir}}"]
-                    .map(String::from)
-                    .into();
+        // Security options, data root and server version in one round trip.
+        let (rootless, docker_root, docker_server_version) = {
+            let argv: Vec<String> = [
+                "docker",
+                "info",
+                "--format",
+                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}",
+            ]
+            .map(String::from)
+            .into();
             match run_command(&argv, None, &[], PROBE_TIMEOUT, PROBE_CAP).await {
                 Ok(out) if out.success() => {
                     let line = out.stdout.lines().next().unwrap_or_default();
-                    let (security, root) = line.split_once('\t').unwrap_or((line, ""));
-                    (Some(security.contains("rootless")), Some(root.trim().to_string()))
+                    let mut cols = line.split('\t');
+                    let security = cols.next().unwrap_or_default();
+                    let root = cols.next().unwrap_or_default();
+                    let server = cols.next().unwrap_or_default().trim();
+                    (
+                        Some(security.contains("rootless")),
+                        Some(root.trim().to_string()),
+                        (!server.is_empty()).then(|| server.to_string()),
+                    )
                 }
-                _ => (None, None),
+                _ => (None, None, None),
             }
         };
 
@@ -379,6 +418,14 @@ impl Engine {
                 let Some(invocation) = invocations.get(&facts.id) else { continue };
                 facts.db = crate::db_repair::probe_db(invocation, &target).await;
             }
+            // Volume-vs-image version scan — deliberately including stopped
+            // projects: the point is warning before the crash-loop.
+            let mut version_issues = crate::db_repair::scan_db_versions(&db_metas).await;
+            for (facts, _) in &mut inspected {
+                if let Some(issues) = version_issues.remove(&facts.id) {
+                    facts.db_versions = issues;
+                }
+            }
         }
         let projects: Vec<ProjectFacts> = inspected.into_iter().map(|(facts, _)| facts).collect();
 
@@ -390,6 +437,7 @@ impl Engine {
                 context_name: docker.context_name.clone(),
                 docker_host_env,
                 compose_version,
+                docker_server_version,
                 socket,
                 rootless,
                 snap_docker,
@@ -708,6 +756,24 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_CONFIG_CLEAR => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let cache = path.join("bootstrap/cache/config.php");
+                    let no_op = !cache.is_file();
+                    let summary = if no_op {
+                        vec!["no cached configuration — nothing to do".to_string()]
+                    } else {
+                        vec![
+                            format!("delete {}", cache.display()),
+                            "Laravel reads .env again on the next request".into(),
+                        ]
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_DB_RECONCILE => {
                 self.db_reconcile_preview(offer, self.require_project(project)?, arg).await
             }
@@ -960,6 +1026,33 @@ impl Engine {
                 let install = sail_install_argv(&path, uid, gid);
                 self.run_streamed_command(handle, op, &install, Some(&path), &redactor, timeout)
                     .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_CONFIG_CLEAR => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let removed = tokio::task::spawn_blocking(move || {
+                    let cache = path.join("bootstrap/cache/config.php");
+                    match std::fs::remove_file(&cache) {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(e) => Err(crate::internal_err(e)),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if removed {
+                            "removed bootstrap/cache/config.php — .env is live again".into()
+                        } else {
+                            "no cached configuration — already clear".into()
+                        },
+                        stderr: false,
+                    },
+                );
                 self.hint();
                 Ok(())
             }

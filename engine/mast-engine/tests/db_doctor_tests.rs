@@ -101,6 +101,20 @@ async fn run_action(engine: &Engine, action: Action) {
     }
 }
 
+/// Dispatch an action expected to FAIL; returns the failure message.
+async fn run_action_expect_failure(engine: &Engine, action: Action) -> String {
+    let id = engine.dispatch(action).unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Completed => panic!("operation unexpectedly succeeded"),
+            OperationEventKind::Failed { error } => return error,
+            _ => {}
+        }
+    }
+    panic!("operation stream ended without a terminal event");
+}
+
 /// `SELECT 1` inside the db container with explicit credentials; true when
 /// the server accepts them.
 async fn login_works(project: &Path, user: &str, password: &str, database: &str) -> bool {
@@ -267,6 +281,121 @@ async fn env_drift_is_found_reconciled_live_and_recreated_when_root_is_lost() {
         "{:?}",
         report.findings
     );
+
+    sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
+}
+
+/// The version guard: retagging a database service against an initialized
+/// volume warns on in-place upgrades, refuses guaranteed crash-loops, and the
+/// diagnostics scan catches a mismatched tag while the project is STOPPED —
+/// before the failed start, which is the whole point.
+#[tokio::test(flavor = "multi_thread")]
+async fn retagging_a_database_is_guarded_by_what_its_volume_holds() {
+    const OLD: &str = "mariadb:10.6";
+    if !preconditions_met().await
+        || !sh(&["docker", "image", "inspect", OLD], None).await.success()
+        || !sh(&["docker", "image", "inspect", "alpine:latest"], None).await.success()
+    {
+        eprintln!("skipping: docker daemon or {OLD}/alpine images not available");
+        return;
+    }
+    janitor().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let project = tmp.path().join(format!("mast-it-dbver{nanos}"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        format!(
+            "services:\n  mariadb:\n    image: '{OLD}'\n    environment:\n      \
+             MYSQL_ROOT_PASSWORD: '${{DB_PASSWORD}}'\n      MYSQL_DATABASE: \
+             '${{DB_DATABASE}}'\n      MYSQL_USER: '${{DB_USERNAME}}'\n      MYSQL_PASSWORD: \
+             '${{DB_PASSWORD}}'\n    volumes:\n      - 'dbdata:/var/lib/mysql'\nvolumes:\n  \
+             dbdata:\n    driver: local\n"
+        ),
+    )
+    .unwrap();
+    write_env(&project, "app", "sail", "secret1");
+
+    let engine = real_engine(tmp.path());
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", Duration::from_secs(30), |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = ProjectId(snap.projects[0].id.0.clone());
+
+    // Initialize the volume under the old major, then stop everything.
+    run_action(&engine, Action::StartProject { id: pid.clone() }).await;
+    wait_for_login(&project, "sail", "secret1", "app").await;
+    run_action(&engine, Action::StopProject { id: pid.clone() }).await;
+
+    // Matching tag: the scan is silent.
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.check == "db-volume-version"),
+        "{:?}",
+        report.findings
+    );
+
+    // A downgrade preview says so, and the apply refuses outright.
+    let preview =
+        engine.service_image_preview(&pid, "mariadb", "mariadb:10.5").await.unwrap();
+    assert!(
+        preview.summary.iter().any(|s| s.contains("WILL NOT START")),
+        "{:?}",
+        preview.summary
+    );
+    let error = run_action_expect_failure(
+        &engine,
+        Action::SetServiceImage {
+            id: pid.clone(),
+            service: "mariadb".into(),
+            image: "mariadb:10.5".into(),
+        },
+    )
+    .await;
+    assert!(error.contains("downgrade"), "{error}");
+    let file = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(file.contains(OLD), "refused retag must leave the file alone: {file}");
+
+    // An upgrade is allowed with a back-up-first warning…
+    let preview = engine.service_image_preview(&pid, "mariadb", "mariadb:11").await.unwrap();
+    assert!(
+        preview.summary.iter().any(|s| s.contains("MARIADB_AUTO_UPGRADE")),
+        "{:?}",
+        preview.summary
+    );
+    run_action(
+        &engine,
+        Action::SetServiceImage {
+            id: pid.clone(),
+            service: "mariadb".into(),
+            image: "mariadb:11".into(),
+        },
+    )
+    .await;
+
+    // …and with the tag now ahead of the volume, diagnostics flags the
+    // stopped project before its next start. The scan reads the resolved
+    // model, which refreshes on the debounced post-retag reconcile — poll
+    // the report until it lands.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (title, detail) = loop {
+        let report = engine.run_diagnostics().await.unwrap();
+        if let Some(f) = report.findings.iter().find(|f| f.check == "db-volume-version") {
+            break (f.title.clone(), f.detail.clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stopped-project version mismatch never surfaced: {:?}",
+            report.findings
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(title.contains("upgrade its data"), "{title}");
+    assert!(detail.contains("10.6"), "{detail}");
 
     sh(&["docker", "compose", "down", "-v", "--remove-orphans"], Some(&project)).await;
 }
