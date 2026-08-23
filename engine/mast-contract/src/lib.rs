@@ -140,6 +140,10 @@ pub struct ProjectSummary {
     /// builds from a Sail runtime shape.
     #[serde(default)]
     pub php: Option<PhpVersionInfo>,
+    /// Public URL of the live share tunnel ([`Action::ShareProject`]);
+    /// None while not sharing.
+    #[serde(default)]
+    pub share_url: Option<String>,
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
@@ -822,6 +826,12 @@ pub enum Action {
     /// project is running, and verifies `php -v` inside it — the exact
     /// sequence users half-do by hand (laravel/sail#442).
     SetPhpVersion { id: ProjectId, service: String, series: String },
+    /// Publish the running app through Sail's expose tunnel (`sail share`,
+    /// same image, flags and `.env` knobs). Long-running: the operation
+    /// stays live while the tunnel is up, cancelling it stops the share.
+    /// The public URL lands on [`ProjectSummary::share_url`] once the
+    /// tunnel reports it.
+    ShareProject { id: ProjectId },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -965,6 +975,7 @@ mod tests {
                 current: "8.4".into(),
                 available: vec!["8.3".into(), "8.4".into()],
             }),
+            share_url: None,
         }
     }
 

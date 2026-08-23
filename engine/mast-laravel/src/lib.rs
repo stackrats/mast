@@ -8,8 +8,10 @@ pub mod env;
 pub mod env_write;
 pub mod ports;
 pub mod processes;
+pub mod share;
 pub mod url;
 pub mod validate;
+pub mod vite;
 
 pub use app_key::generate_app_key;
 pub use env::{EnvEntry, EnvError, EnvFile, EnvItem, Quoting};

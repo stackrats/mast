@@ -47,6 +47,7 @@ pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
 pub const REPAIR_DB_RECREATE: &str = "db-recreate-volume";
 pub const REPAIR_CONFIG_CLEAR: &str = "config-clear";
 pub const REPAIR_CHOWN_STORAGE: &str = "chown-storage";
+pub const REPAIR_REMOVE_HOT: &str = "remove-hot-file";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -213,6 +214,16 @@ pub struct ProjectFacts {
     /// `config-hash` label vs current `config --hash`). A restart will NOT
     /// pick the changes up; only a recreate does.
     pub drifted_services: Vec<String>,
+    /// Vite's `public/hot` marker, when present: the dev-server URL it pins
+    /// and whether anything actually listens there (`None` = unknowable,
+    /// e.g. a non-loopback host).
+    pub vite_hot: Option<ViteHotFacts>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViteHotFacts {
+    pub url: String,
+    pub dev_server_listening: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +349,16 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Runs `chown -R <you>` over `storage/` and `bootstrap/cache` — and \
                           nothing else — inside a throwaway root container, so no sudo is \
                           needed on the host."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_REMOVE_HOT => Some(RepairSpec {
+            id: REPAIR_REMOVE_HOT,
+            title: "Remove the stale public/hot file".into(),
+            risk: RiskTier::Safe,
+            description: "Deletes `public/hot` so Blade serves built assets again. Refuses \
+                          if a Vite dev server has meanwhile started listening (a running \
+                          dev server owns that file)."
                 .into(),
             arg: None,
         }),

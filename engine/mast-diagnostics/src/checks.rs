@@ -6,8 +6,8 @@ use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
     REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE,
     REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
-    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -645,6 +645,45 @@ impl Check for ConfigCache {
     }
 }
 
+/// A `public/hot` file pointing at a Vite dev server that is not running.
+/// Left behind when the dev server is killed abruptly; while it exists,
+/// Blade renders dev-server asset URLs, pages load without CSS/JS, and —
+/// the confusion that wastes the afternoon — `npm run build` changes
+/// nothing, because Laravel never looks at the manifest.
+struct ViteHotStale;
+impl Check for ViteHotStale {
+    fn id(&self) -> &'static str {
+        "vite-hot-stale"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.vite_hot.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| p.vite_hot.as_ref().map(|hot| (p, hot)))
+            .filter(|(_, hot)| hot.dev_server_listening == Some(false))
+            .map(|(p, hot)| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: public/hot points at a dead Vite dev server", p.name),
+                    format!(
+                        "Nothing listens at {}, but while public/hot exists Laravel keeps \
+                         rendering dev-server asset URLs — pages load without CSS/JS, \
+                         `npm run build` changes nothing, and through a share tunnel the \
+                         browser reports Private Network Access/CORS errors. The file is \
+                         left behind when the dev server is killed abruptly.",
+                        hot.url
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_REMOVE_HOT, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// Containers running a configuration the files no longer describe. The
 /// classic ".env edits do nothing" trap (Sail closed it as an edge case):
 /// compose injects env at container CREATION, so `restart` keeps the old
@@ -1111,6 +1150,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(PhpRuntime),
         Box::new(StorageOwnership),
         Box::new(ConfigDrift),
+        Box::new(ViteHotStale),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1191,6 +1231,7 @@ mod tests {
             available_runtimes: Vec::new(),
             foreign_owned: None,
             drifted_services: Vec::new(),
+            vite_hot: None,
         }
     }
 
@@ -1394,6 +1435,30 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn stale_hot_file_warns_but_a_live_dev_server_does_not() {
+        let hot = |listening| crate::ViteHotFacts {
+            url: "http://[::1]:5173".into(),
+            dev_server_listening: listening,
+        };
+        let mut p = sail_project("a");
+        p.vite_hot = Some(hot(Some(false)));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "vite-hot-stale").unwrap();
+        assert!(f.detail.contains("npm run build` changes nothing"), "{}", f.detail);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_REMOVE_HOT);
+        assert_eq!(f.repair.as_ref().unwrap().risk, RiskTier::Safe);
+
+        // A running dev server owns its hot file; an unknowable host says
+        // nothing either.
+        for listening in [Some(true), None] {
+            let mut p = sail_project("a");
+            p.vite_hot = Some(hot(listening));
+            let (_, findings) = run_all(&ctx(vec![p]));
+            assert!(!findings.iter().any(|f| f.check == "vite-hot-stale"), "{listening:?}");
+        }
     }
 
     #[test]

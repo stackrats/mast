@@ -2177,6 +2177,100 @@ async fn php_switch_rewrites_context_and_tag_together_before_building() {
     assert!(!switched.contains("8.3"), "{switched}");
 }
 
+/// The stale `public/hot` trap: a killed Vite dev server leaves the file
+/// behind, Blade keeps rendering dev-server URLs, and `npm run build`
+/// changes nothing. Diagnostics finds it, the repair deletes it — and
+/// refuses while a live dev server owns the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_vite_hot_file_is_found_and_removed_but_a_live_one_is_respected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "hotapp");
+    std::fs::create_dir_all(project.join("public")).unwrap();
+    // A port that was just free: bind, read it, drop the listener.
+    let stale_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    std::fs::write(project.join("public/hot"), format!("http://127.0.0.1:{stale_port}"))
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.check == "vite-hot-stale")
+        .expect("stale hot file must be found");
+    assert!(finding.detail.contains("changes nothing"), "{}", finding.detail);
+    assert_eq!(finding.repair.as_ref().unwrap().id, "remove-hot-file");
+
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "remove-hot-file".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    assert!(!project.join("public/hot").exists());
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(!report.findings.iter().any(|f| f.check == "vite-hot-stale"));
+
+    // A hot file whose dev server IS listening is not stale: no finding, and
+    // the repair refuses rather than desyncing a healthy dev setup.
+    let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_port = live.local_addr().unwrap().port();
+    std::fs::write(project.join("public/hot"), format!("http://127.0.0.1:{live_port}")).unwrap();
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(!report.findings.iter().any(|f| f.check == "vite-hot-stale"));
+    let id = engine
+        .dispatch(Action::ApplyRepair {
+            repair: "remove-hot-file".into(),
+            arg: None,
+            project: Some(pid.clone()),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut failed = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { error } => {
+                failed = Some(error);
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let error = failed.expect("removing a live hot file must refuse");
+    assert!(error.contains("not stale"), "{error}");
+    assert!(project.join("public/hot").exists(), "the live file must survive");
+    drop(live);
+}
+
+/// Sharing tunnels the RUNNING app; a stopped project is refused up front
+/// with the reason, not a dead tunnel.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_refuses_a_stopped_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "shareapp");
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let denied = engine.dispatch(Action::ShareProject { id: snap.projects[0].id.clone() });
+    match denied {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("start the project"), "{message}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
 /// `docker compose config` runs without a daemon, but the CLI still has to be
 /// installed; tests that need a resolved model skip without it.
 async fn compose_cli_available() -> bool {

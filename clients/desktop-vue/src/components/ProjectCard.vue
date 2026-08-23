@@ -15,12 +15,14 @@ import {
   Play,
   RotateCw,
   ScrollText,
+  Share2,
   Square,
   SquareTerminal,
   Trash2,
   TriangleAlert,
   X,
 } from "lucide-vue-next";
+import { useQRCode } from "@vueuse/integrations/useQRCode";
 import {
   DropdownMenuContent,
   DropdownMenuItem,
@@ -34,7 +36,7 @@ import type { ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
 import { menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
-import { commandKey, useEngineStore } from "../stores/engine";
+import { commandKey, shareKey, useEngineStore } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
 import Badge from "./ui/Badge.vue";
@@ -117,6 +119,29 @@ const processHints: Record<string, string> = {
   queue: "Works queued jobs (php artisan queue:work).",
   schedule: "Runs scheduled tasks every minute (php artisan schedule:work).",
 };
+
+// --- sail share: the tunnel as a streamed op, URL + QR once expose reports
+// it, and the tunnel's own output in view — the debuggability sail lacks ---
+const shareOpen = ref(false);
+const shareOp = computed(() => store.operations[shareKey(project.id)]);
+const sharing = computed(() => shareOp.value != null && shareOp.value.terminal === null);
+const shareQr = useQRCode(computed(() => project.shareUrl ?? ""));
+const shareCopied = ref(false);
+function startShare() {
+  void store.runLifecycle(shareKey(project.id), "share", {
+    type: "shareProject",
+    id: project.id,
+  });
+}
+function stopShare() {
+  void store.cancelLifecycle(shareKey(project.id));
+}
+async function copyShareUrl() {
+  if (!project.shareUrl) return;
+  await navigator.clipboard.writeText(project.shareUrl);
+  shareCopied.value = true;
+  setTimeout(() => (shareCopied.value = false), 1500);
+}
 
 // --- PHP version switch: context + image tag + no-cache rebuild + recreate
 // as ONE operation (the four steps laravel/sail#442 victims half-do) ---
@@ -334,6 +359,18 @@ async function addCommand() {
           @click="store.run({ type: 'openInBrowser', id: project.id })"
         >
           <Globe class="h-3.5 w-3.5" /> Browser
+        </Button>
+      </Tooltip>
+      <Tooltip
+        :text="
+          sharing
+            ? 'The share tunnel is live — URL, QR code and tunnel output.'
+            : 'Publish the running app at a temporary public URL (sail share).'
+        "
+      >
+        <Button variant="ghost" size="sm" @click="shareOpen = true">
+          <Share2 class="h-3.5 w-3.5" /> Share
+          <span v-if="sharing" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
         </Button>
       </Tooltip>
     </div>
@@ -595,6 +632,96 @@ async function addCommand() {
     </div>
 
     <CatalogDialog v-model:open="catalogOpen" :project="project.id" />
+
+    <Modal v-model:open="shareOpen" title="Share publicly" wide>
+      <div class="space-y-3">
+        <template v-if="!sharing">
+          <p class="text-xs text-slate-500 dark:text-slate-400">
+            Runs Sail's expose tunnel (<span class="font-mono">sail share</span>): the running app
+            is published at a temporary public URL over plain HTTP. Anyone with the link reaches
+            your machine while the tunnel is up. Subdomain, server and dashboard port come from the
+            <span class="font-mono">SAIL_SHARE_*</span> keys in <span class="font-mono">.env</span>.
+          </p>
+          <p
+            v-if="project.status === 'stopped' || project.status === 'failed'"
+            class="text-xs text-amber-700 dark:text-amber-300"
+          >
+            The tunnel forwards the running app — start the project first.
+          </p>
+          <div class="flex justify-end">
+            <Button
+              :disabled="
+                store.readOnly || project.status === 'stopped' || project.status === 'failed'
+              "
+              @click="startShare"
+            >
+              <Share2 class="h-3.5 w-3.5" /> Start sharing
+            </Button>
+          </div>
+        </template>
+
+        <template v-else>
+          <div v-if="project.shareUrl" class="flex items-start gap-4">
+            <!-- White backing keeps the code scannable in dark mode. -->
+            <img
+              v-if="shareQr"
+              :src="shareQr"
+              alt="QR code for the share URL"
+              class="h-36 w-36 shrink-0 rounded-md bg-white p-2"
+            />
+            <div class="min-w-0 space-y-2">
+              <p class="text-xs text-slate-500 dark:text-slate-400">Public URL (HTTP only):</p>
+              <p class="font-mono text-sm break-all select-all text-slate-900 dark:text-slate-100">
+                {{ project.shareUrl }}
+              </p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" @click="copyShareUrl">
+                  {{ shareCopied ? "Copied" : "Copy URL" }}
+                </Button>
+              </div>
+              <p class="text-xs text-slate-500 dark:text-slate-400">
+                Scan the code to open it on your phone. The tunnel dashboard listens on
+                <span class="font-mono">SAIL_SHARE_DASHBOARD</span> (default
+                <span class="font-mono">http://localhost:4040</span>).
+              </p>
+            </div>
+          </div>
+          <p v-else class="text-xs text-slate-500 dark:text-slate-400">
+            Starting the tunnel — the URL appears here as soon as expose reports it…
+          </p>
+          <div class="flex justify-end">
+            <Button variant="destructive" size="sm" @click="stopShare">
+              <Square class="h-3.5 w-3.5" /> Stop sharing
+            </Button>
+          </div>
+        </template>
+
+        <!-- The tunnel's own output: where the classic failures (Vite dev
+             server through the tunnel, auth, DNS) explain themselves. -->
+        <div
+          v-if="shareOp && shareOp.lines.length > 0"
+          class="max-h-48 overflow-y-auto rounded-md border border-slate-200 bg-slate-50 p-2 font-mono text-[11px] leading-relaxed dark:border-slate-800 dark:bg-neutral-900"
+        >
+          <p
+            v-for="(line, i) in shareOp.lines"
+            :key="i"
+            :class="
+              line.stderr
+                ? 'text-amber-700 dark:text-amber-300'
+                : 'text-slate-600 dark:text-slate-300'
+            "
+          >
+            {{ line.line }}
+          </p>
+        </div>
+        <p
+          v-if="shareOp && shareOp.terminal === 'failed'"
+          class="text-xs text-red-700 dark:text-red-300"
+        >
+          Share failed: {{ shareOp.error }}
+        </p>
+      </div>
+    </Modal>
 
     <Modal v-model:open="phpConfirmOpen" title="Switch PHP version">
       <div class="space-y-3">

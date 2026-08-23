@@ -96,6 +96,13 @@ export function commandKey(project: string, name: string): string {
   return `${project}:cmd:${name}`;
 }
 
+/** Share-tunnel operations get their own op slot: the tunnel runs
+ * indefinitely, and parking it on the project key would block the lifecycle
+ * buttons (and their Cancel semantics) the whole time. */
+export function shareKey(project: string): string {
+  return `${project}:share`;
+}
+
 /** Operations-map key for a project being scaffolded — it has no id yet. */
 export function createKey(name: string): string {
   return `new:${name}`;
