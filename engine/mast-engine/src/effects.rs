@@ -203,13 +203,25 @@ async fn reconcile(engine: &Engine) {
     let mut process_infos: HashMap<String, ProcessInfo> = HashMap::new();
     // Browsable address from .env, per project.
     let mut app_urls: HashMap<String, Option<String>> = HashMap::new();
+    // Content hash of the compose files at resolution time — the model must
+    // refresh on in-place edits, which change no part of the invocation.
+    let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
     for (id, dir) in &project_dirs {
         let env = process_env.clone();
         let dir = dir.clone();
-        let (resolved, project_warnings, redactor, ports, git, procs, app_url) =
+        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url) =
             tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
+                let fingerprint = resolved.as_ref().ok().map(|inv| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for file in &inv.files {
+                        file.path.hash(&mut h);
+                        std::fs::read(&file.path).unwrap_or_default().hash(&mut h);
+                    }
+                    h.finish()
+                });
                 // Which key moves which published port, read from the compose
                 // source — the resolved model only carries the numbers.
                 let port_keys: BTreeMap<u16, String> = resolved
@@ -241,6 +253,7 @@ async fn reconcile(engine: &Engine) {
                     .unwrap_or_else(|| "laravel.test".to_string());
                 (
                     resolved,
+                    fingerprint,
                     mast_project::project_warnings(&dir),
                     redactor,
                     (app_port, host_ports, port_keys),
@@ -253,6 +266,7 @@ async fn reconcile(engine: &Engine) {
             .unwrap_or_else(|e| {
                 (
                     Err(e.to_string()),
+                    None,
                     Vec::new(),
                     crate::Redactor::default(),
                     (None, Vec::new(), BTreeMap::new()),
@@ -262,6 +276,7 @@ async fn reconcile(engine: &Engine) {
                 )
             });
         resolutions.insert(id.clone(), resolved);
+        fingerprints.insert(id.clone(), fingerprint);
         warnings.insert(id.clone(), project_warnings);
         redactors.insert(id.clone(), redactor);
         app_ports.insert(id.clone(), ports);
@@ -270,15 +285,20 @@ async fn reconcile(engine: &Engine) {
         app_urls.insert(id.clone(), app_url);
     }
 
-    // Refresh resolved models only where the invocation changed (subprocess).
+    // Refresh resolved models where the invocation OR the file content
+    // changed (subprocess). Content matters: a catalog add, a retag, or an
+    // external edit rewrites the file without touching the invocation.
     let mut models: HashMap<String, Result<mast_compose::ResolvedModel, String>> = HashMap::new();
     for (id, resolution) in &resolutions {
         if let Ok(invocation) = resolution {
+            let fingerprint = fingerprints.get(id).copied().flatten();
             let needs_model = {
                 let st = engine.inner.state.lock().unwrap();
-                st.projects
-                    .get(id)
-                    .is_none_or(|e| e.invocation.as_ref() != Some(invocation) || e.model.is_none())
+                st.projects.get(id).is_none_or(|e| {
+                    e.invocation.as_ref() != Some(invocation)
+                        || e.model.is_none()
+                        || e.compose_fingerprint != fingerprint
+                })
             };
             if needs_model {
                 models.insert(
@@ -387,6 +407,8 @@ async fn reconcile(engine: &Engine) {
                     match models.get(&id) {
                         Some(Ok(model)) => {
                             entry.model = Some(model.clone());
+                            entry.compose_fingerprint =
+                                fingerprints.get(&id).copied().flatten();
                             entry.summary.resolution_error = None;
                         }
                         Some(Err(e)) => {

@@ -4,11 +4,12 @@
 
 use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
-    REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE,
-    REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL,
-    REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
+    REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY,
+    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
+    REPAIR_STORAGE_LINK,
 };
-use mast_laravel::db::ProbeFailure;
+use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
 fn finding(
     check: &'static str,
@@ -563,6 +564,164 @@ impl Check for DbCredentials {
     }
 }
 
+/// A database image tag that disagrees with what its data volume holds —
+/// caught while the project is stopped, which is the whole point: the
+/// alternative is a crash-looping container after the next start.
+struct DbVolumeVersion;
+impl Check for DbVolumeVersion {
+    fn id(&self) -> &'static str {
+        "db-volume-version"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.db_versions.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for p in &ctx.projects {
+            for issue in &p.db_versions {
+                let f = match &issue.verdict {
+                    VersionVerdict::WillNotStart { reason } => {
+                        let mut f = finding(
+                            self.id(),
+                            Severity::Error,
+                            format!(
+                                "{}: \"{}\" will not start on its existing data",
+                                p.name, issue.service
+                            ),
+                            format!(
+                                "{reason}. If the data matters, revert the image to a \
+                                 {}-compatible tag first, export a dump, then retag. If it \
+                                 does not, recreate the volume.",
+                                issue.volume_version
+                            ),
+                        );
+                        f.repair = repair_spec(REPAIR_DB_RECREATE, Some(&issue.service));
+                        f
+                    }
+                    VersionVerdict::InPlaceUpgrade { note } => finding(
+                        self.id(),
+                        Severity::Warning,
+                        format!(
+                            "{}: \"{}\" will upgrade its data on next start",
+                            p.name, issue.service
+                        ),
+                        format!("{note}. (Volume holds {}.)", issue.volume_version),
+                    ),
+                };
+                findings.push(for_project(f, p));
+            }
+        }
+        findings
+    }
+}
+
+/// `bootstrap/cache/config.php` in a dev project: every `.env` edit —
+/// including the ones Mast itself writes — is silently ignored until the
+/// cache is cleared. The classic "changed .env, nothing happened" multiplier.
+struct ConfigCache;
+impl Check for ConfigCache {
+    fn id(&self) -> &'static str {
+        "config-cache"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.is_laravel)
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.is_laravel && p.config_cached)
+            .map(|p| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: configuration is cached — .env edits are not live", p.name),
+                    "bootstrap/cache/config.php exists, so Laravel reads the cached values \
+                     and ignores .env entirely (config:cache is meant for production).",
+                );
+                f.repair = repair_spec(REPAIR_CONFIG_CLEAR, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+fn version_series(text: &str) -> Vec<u32> {
+    text.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map_while(|part| {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok()
+        })
+        .collect()
+}
+
+/// Known-bad Docker/Compose version combinations that break Sail's default
+/// file shapes — each one a real regression wave from the issue tracker.
+struct ComposeQuirks;
+impl Check for ComposeQuirks {
+    fn id(&self) -> &'static str {
+        "compose-quirks"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.system.compose_version.is_some() || ctx.system.docker_server_version.is_some()
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let dotted: Vec<String> = ctx
+            .projects
+            .iter()
+            .flat_map(|p| p.dotted_services.iter().map(move |s| format!("{} ({s})", p.name)))
+            .collect();
+
+        if let Some(compose) = ctx.system.compose_version.as_deref() {
+            let v = version_series(compose);
+            // compose 2.24.0/2.24.1 rejected dotted service names outright
+            // (docker/compose#11336) — Sail's default is `laravel.test`.
+            if (v == [2, 24] || v == [2, 24, 0] || v == [2, 24, 1]) && !dotted.is_empty() {
+                findings.push(finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("Compose {compose} rejects dotted service names"),
+                    format!(
+                        "This compose release refuses names like Sail's `laravel.test` \
+                         (\"expected a map\" errors). Affected: {}. Upgrade to compose \
+                         2.24.2 or newer.",
+                        dotted.join(", ")
+                    ),
+                ));
+            }
+            // Buildx Bake (default in Docker Desktop 4.40 / compose ≥ 2.34)
+            // mangled dotted names until 2.37.1.
+            if v >= vec![2, 34] && v < vec![2, 37, 1] && !dotted.is_empty() {
+                findings.push(finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("Compose {compose} + Bake can reject dotted service names"),
+                    format!(
+                        "If builds fail with `invalid name; only [a-zA-Z0-9_-]+ allowed`, \
+                         set COMPOSE_BAKE=false or upgrade compose to 2.37.1+. Affected: {}.",
+                        dotted.join(", ")
+                    ),
+                ));
+            }
+        }
+        if let Some(server) = ctx.system.docker_server_version.as_deref() {
+            let v = version_series(server);
+            if !v.is_empty() && v < vec![20, 10] {
+                findings.push(finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("Docker Engine {server} predates host-gateway"),
+                    "`extra_hosts: host.docker.internal:host-gateway` (which Sail's Xdebug \
+                     and share recipes rely on) needs Engine 20.10+.",
+                ));
+            }
+        }
+        findings
+    }
+}
+
 struct WwwUserParity;
 impl Check for WwwUserParity {
     fn id(&self) -> &'static str {
@@ -804,6 +963,9 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(AppKeyMissing),
         Box::new(StorageLinkMissing),
         Box::new(DbCredentials),
+        Box::new(DbVolumeVersion),
+        Box::new(ConfigCache),
+        Box::new(ComposeQuirks),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -842,6 +1004,7 @@ mod tests {
             context_name: Some("default".into()),
             docker_host_env: false,
             compose_version: Some("2.29.0".into()),
+            docker_server_version: Some("29.7.2".into()),
             socket: None,
             rootless: Some(false),
             snap_docker: false,
@@ -876,6 +1039,9 @@ mod tests {
             external_networks: Vec::new(),
             resolution_error: None,
             db: None,
+            db_versions: Vec::new(),
+            config_cached: false,
+            dotted_services: Vec::new(),
         }
     }
 
@@ -1030,6 +1196,100 @@ mod tests {
         p.db = Some(db_facts(None, false));
         let (_, findings) = run_all(&ctx(vec![p]));
         assert!(!findings.iter().any(|f| f.check == "db-credentials"));
+    }
+
+    #[test]
+    fn db_volume_version_mismatches_split_by_severity() {
+        let mut p = sail_project("a");
+        p.db_versions = vec![
+            crate::DbVersionIssue {
+                service: "pgsql".into(),
+                image: "postgres:17".into(),
+                volume_version: "16".into(),
+                verdict: VersionVerdict::WillNotStart { reason: "never in place".into() },
+            },
+            crate::DbVersionIssue {
+                service: "mysql".into(),
+                image: "mysql:8.4".into(),
+                volume_version: "8.0.32".into(),
+                verdict: VersionVerdict::InPlaceUpgrade { note: "irreversible".into() },
+            },
+        ];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let fatal = findings
+            .iter()
+            .find(|f| f.check == "db-volume-version" && f.severity == Severity::Error)
+            .unwrap();
+        assert!(fatal.title.contains("will not start"), "{}", fatal.title);
+        assert_eq!(fatal.repair.as_ref().unwrap().id, REPAIR_DB_RECREATE);
+        assert_eq!(fatal.repair.as_ref().unwrap().arg.as_deref(), Some("pgsql"));
+        assert!(fatal.detail.contains("revert the image"), "{}", fatal.detail);
+        let upgrade = findings
+            .iter()
+            .find(|f| f.check == "db-volume-version" && f.severity == Severity::Warning)
+            .unwrap();
+        assert!(upgrade.repair.is_none(), "an in-place upgrade is a heads-up, not a repair");
+    }
+
+    #[test]
+    fn cached_config_warns_with_the_clear_repair() {
+        let mut p = sail_project("a");
+        p.config_cached = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "config-cache").unwrap();
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_CONFIG_CLEAR);
+        assert_eq!(f.repair.as_ref().unwrap().risk, RiskTier::Safe);
+
+        let mut q = sail_project("b");
+        q.config_cached = true;
+        q.is_laravel = false;
+        let (_, findings) = run_all(&ctx(vec![q]));
+        assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn compose_quirks_fire_only_on_known_bad_combinations() {
+        let dotted = || {
+            let mut p = sail_project("a");
+            p.dotted_services = vec!["laravel.test".into()];
+            p
+        };
+        // 2.24.0 + dotted name = the docker/compose#11336 wave.
+        let mut c = ctx(vec![dotted()]);
+        c.system.compose_version = Some("2.24.0".into());
+        let (_, findings) = run_all(&c);
+        let f = findings
+            .iter()
+            .find(|f| f.check == "compose-quirks" && f.severity == Severity::Error)
+            .unwrap();
+        assert!(f.detail.contains("laravel.test"), "{}", f.detail);
+
+        // Bake window: warning with the COMPOSE_BAKE escape hatch.
+        let mut c = ctx(vec![dotted()]);
+        c.system.compose_version = Some("2.35.1".into());
+        let (_, findings) = run_all(&c);
+        let f = findings.iter().find(|f| f.check == "compose-quirks").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.detail.contains("COMPOSE_BAKE=false"), "{}", f.detail);
+
+        // Same versions without dotted names: silence.
+        let mut c = ctx(vec![sail_project("a")]);
+        c.system.compose_version = Some("2.24.0".into());
+        let (_, findings) = run_all(&c);
+        assert!(!findings.iter().any(|f| f.check == "compose-quirks"));
+
+        // Fixed versions with dotted names: silence.
+        let mut c = ctx(vec![dotted()]);
+        c.system.compose_version = Some("2.37.1".into());
+        let (_, findings) = run_all(&c);
+        assert!(!findings.iter().any(|f| f.check == "compose-quirks"));
+
+        // Ancient engine: host-gateway heads-up.
+        let mut c = ctx(vec![]);
+        c.system.docker_server_version = Some("19.03.15".into());
+        let (_, findings) = run_all(&c);
+        let f = findings.iter().find(|f| f.check == "compose-quirks").unwrap();
+        assert!(f.detail.contains("host-gateway"), "{}", f.detail);
     }
 
     #[test]

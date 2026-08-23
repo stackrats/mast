@@ -129,6 +129,10 @@ pub(crate) struct ProjectEntry {
     /// Host-side port-forward declarations from `.env` (key → port), for
     /// cross-project conflict detection inside workspaces.
     pub host_ports: Vec<(String, u16)>,
+    /// Hash of the compose files' bytes when `model` was last resolved. An
+    /// in-place edit (catalog add, retag, external editor) changes content
+    /// without changing the invocation — the model must refresh then too.
+    pub compose_fingerprint: Option<u64>,
 }
 
 pub(crate) struct EngineState {
@@ -279,6 +283,7 @@ impl Engine {
                     redactor: Redactor::default(),
                     app_port: None,
                     host_ports: Vec::new(),
+                    compose_fingerprint: None,
                 };
                 (entry.record.id.clone(), entry)
             })

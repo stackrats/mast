@@ -346,6 +346,138 @@ pub fn pg_create_database_sql(creds: &DbCreds) -> Result<String, String> {
     Ok(format!("CREATE DATABASE \"{}\" OWNER \"{}\"", creds.database, creds.username))
 }
 
+// ---------- volume-vs-image version guard ----------
+//
+// The second half of the init-once trap: a major-version bump on a database
+// image against an existing volume. Postgres refuses to start outright;
+// MySQL auto-upgrades forward only (and only one series at a time); MariaDB
+// starts but its system tables need mariadb-upgrade. Sail's stub bumps
+// (mysql/mysql-server:8.0 → mysql:8.4) walked users straight into this.
+
+/// A dotted version prefix ("8.0", "11.4", "16") for component-wise compare.
+pub type Series = Vec<u32>;
+
+fn parse_series(text: &str) -> Series {
+    text.trim()
+        .split('.')
+        .map_while(|part| {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok()
+        })
+        .collect()
+}
+
+pub fn format_series(series: &Series) -> String {
+    series.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(".")
+}
+
+/// Which database engine an image runs, and the series its tag pins.
+/// `None` for non-database images, stem-only references, or floating tags.
+pub fn db_image_series(image: &str) -> Option<(DbKind, Series)> {
+    let (repo, tag) = match image.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => (repo, tag),
+        _ => return None,
+    };
+    let stem_is = |stem: &str| repo == stem || repo.ends_with(&format!("/{stem}"));
+    let kind = if stem_is("mysql") || stem_is("mysql/mysql-server") {
+        DbKind::Mysql
+    } else if stem_is("mariadb") {
+        DbKind::Mariadb
+    } else if stem_is("postgres") {
+        DbKind::Pgsql
+    } else {
+        return None;
+    };
+    let series = parse_series(tag);
+    (!series.is_empty()).then_some((kind, series))
+}
+
+/// Parse a volume's version marker file: `PG_VERSION` ("16") or
+/// `mysql_upgrade_info` ("8.0.32", "11.4.2-MariaDB").
+pub fn parse_volume_marker(contents: &str) -> Option<Series> {
+    let series = parse_series(contents.lines().next()?.trim());
+    (!series.is_empty()).then_some(series)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionVerdict {
+    /// The container will crash-loop on this data.
+    WillNotStart { reason: String },
+    /// Starting will migrate the data forward — irreversible, back up first.
+    InPlaceUpgrade { note: String },
+}
+
+fn cmp_series(a: &Series, b: &Series) -> std::cmp::Ordering {
+    let len = a.len().min(b.len());
+    a[..len].cmp(&b[..len])
+}
+
+/// Compare the image's pinned series against what the data volume holds.
+/// `None` = same series, nothing to say.
+pub fn volume_version_verdict(
+    kind: DbKind,
+    image_series: &Series,
+    volume_series: &Series,
+) -> Option<VersionVerdict> {
+    use std::cmp::Ordering::*;
+    let (img, vol) = (format_series(image_series), format_series(volume_series));
+    match kind {
+        DbKind::Pgsql => match cmp_series(image_series, volume_series) {
+            Equal => None,
+            _ => Some(VersionVerdict::WillNotStart {
+                reason: format!(
+                    "postgres never upgrades a data directory in place — the volume holds \
+                     version {vol}, the image runs {img}, and the container will refuse to \
+                     start"
+                ),
+            }),
+        },
+        DbKind::Mysql => match cmp_series(image_series, volume_series) {
+            Equal => None,
+            Less => Some(VersionVerdict::WillNotStart {
+                reason: format!(
+                    "the volume was written by MySQL {vol}; {img} is a downgrade and MySQL \
+                     never downgrades a data directory"
+                ),
+            }),
+            Greater => {
+                // 5.x data can only go to 8.0; skipping the step corrupts.
+                if volume_series.first() < Some(&8) && image_series[..] > [8, 0][..] {
+                    Some(VersionVerdict::WillNotStart {
+                        reason: format!(
+                            "MySQL {vol} data must upgrade through 8.0 before {img} — \
+                             starting {img} directly will fail"
+                        ),
+                    })
+                } else {
+                    Some(VersionVerdict::InPlaceUpgrade {
+                        note: format!(
+                            "MySQL will upgrade the {vol} data to {img} in place on first \
+                             start — irreversible; export a backup first"
+                        ),
+                    })
+                }
+            }
+        },
+        DbKind::Mariadb => match cmp_series(image_series, volume_series) {
+            Equal => None,
+            Less => Some(VersionVerdict::WillNotStart {
+                reason: format!(
+                    "the volume was written by MariaDB {vol}; {img} is a downgrade and \
+                     MariaDB never downgrades a data directory"
+                ),
+            }),
+            Greater => Some(VersionVerdict::InPlaceUpgrade {
+                note: format!(
+                    "MariaDB {img} will start on the {vol} data, but its system tables \
+                     need upgrading — set MARIADB_AUTO_UPGRADE=1 on the service or run \
+                     mariadb-upgrade afterwards, and export a backup first"
+                ),
+            }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +614,62 @@ mod tests {
         // Sail's create-testing-database.sh shape — fixes parallel testing too.
         assert!(sql.contains("GRANT ALL PRIVILEGES ON `testing%`.* TO 'sail'@'%';"));
         assert!(sql.ends_with("FLUSH PRIVILEGES;"));
+    }
+
+    #[test]
+    fn image_series_recognizes_databases_and_skips_the_rest() {
+        assert_eq!(db_image_series("mysql:8.4"), Some((DbKind::Mysql, vec![8, 4])));
+        assert_eq!(db_image_series("mysql/mysql-server:8.0"), Some((DbKind::Mysql, vec![8, 0])));
+        assert_eq!(db_image_series("mariadb:11"), Some((DbKind::Mariadb, vec![11])));
+        assert_eq!(db_image_series("postgres:17"), Some((DbKind::Pgsql, vec![17])));
+        assert_eq!(db_image_series("docker.io/postgres:16.2"), Some((DbKind::Pgsql, vec![16, 2])));
+        assert_eq!(db_image_series("redis:7"), None);
+        assert_eq!(db_image_series("mysql"), None, "untagged pins nothing");
+        assert_eq!(db_image_series("mariadb:latest"), None, "floating tag pins nothing");
+        // A registry port is not a tag.
+        assert_eq!(db_image_series("localhost:5000/mysql"), None);
+    }
+
+    #[test]
+    fn volume_markers_parse_both_families() {
+        assert_eq!(parse_volume_marker("16\n"), Some(vec![16]));
+        assert_eq!(parse_volume_marker("8.0.32"), Some(vec![8, 0, 32]));
+        assert_eq!(parse_volume_marker("11.4.2-MariaDB"), Some(vec![11, 4, 2]));
+        assert_eq!(parse_volume_marker(""), None);
+        assert_eq!(parse_volume_marker("none"), None);
+    }
+
+    #[test]
+    fn version_verdicts_follow_each_engines_upgrade_rules() {
+        let verdict = |kind, img: &[u32], vol: &[u32]| {
+            volume_version_verdict(kind, &img.to_vec(), &vol.to_vec())
+        };
+        let will_not_start = |v: &Option<VersionVerdict>| {
+            matches!(v, Some(VersionVerdict::WillNotStart { .. }))
+        };
+        let upgrade =
+            |v: &Option<VersionVerdict>| matches!(v, Some(VersionVerdict::InPlaceUpgrade { .. }));
+
+        // Postgres: any mismatch is fatal, either direction.
+        assert!(will_not_start(&verdict(DbKind::Pgsql, &[17], &[16])));
+        assert!(will_not_start(&verdict(DbKind::Pgsql, &[16], &[17])));
+        assert_eq!(verdict(DbKind::Pgsql, &[17], &[17, 2]), None, "prefix match is same series");
+
+        // MySQL: forward auto-upgrades (the sail 8.0→8.4 stub bump), back never.
+        assert!(upgrade(&verdict(DbKind::Mysql, &[8, 4], &[8, 0, 32])));
+        assert!(will_not_start(&verdict(DbKind::Mysql, &[8, 0], &[8, 4, 1])));
+        // 5.7 data cannot jump the 8.0 step.
+        assert!(will_not_start(&verdict(DbKind::Mysql, &[8, 4], &[5, 7, 44])));
+        assert!(upgrade(&verdict(DbKind::Mysql, &[8, 0], &[5, 7, 44])));
+        assert_eq!(verdict(DbKind::Mysql, &[8, 4], &[8, 4, 3]), None);
+
+        // MariaDB: forward starts but needs mariadb-upgrade; back never.
+        let up = verdict(DbKind::Mariadb, &[11], &[10, 6, 14]);
+        assert!(upgrade(&up));
+        if let Some(VersionVerdict::InPlaceUpgrade { note }) = up {
+            assert!(note.contains("MARIADB_AUTO_UPGRADE"), "{note}");
+        }
+        assert!(will_not_start(&verdict(DbKind::Mariadb, &[10, 6], &[11, 4, 2])));
     }
 
     #[test]
