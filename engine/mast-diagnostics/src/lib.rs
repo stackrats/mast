@@ -10,9 +10,11 @@
 
 mod checks;
 mod history;
+pub mod signatures;
 
 pub use checks::{all_checks, run_all};
 pub use history::{DiagnosticsDb, DiagnosticsError, RepairAudit, RunSummary};
+pub use signatures::{ErrorSignature, classify_line};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -128,6 +130,21 @@ pub struct DbVersionIssue {
     pub verdict: mast_laravel::db::VersionVerdict,
 }
 
+/// One Sail-shaped `build:` service from the compose source, with the facts
+/// the PHP-runtime consistency check needs.
+#[derive(Debug, Clone)]
+pub struct SailBuildFacts {
+    pub service: String,
+    /// The `build.context` as spelled in the file.
+    pub context: String,
+    /// The PHP series the context path pins ("8.4").
+    pub context_series: String,
+    /// The context directory exists on disk.
+    pub context_exists: bool,
+    /// The PHP series the `image:` tag pins (`sail-8.2/app` → "8.2").
+    pub image_series: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectFacts {
     pub id: String,
@@ -180,6 +197,11 @@ pub struct ProjectFacts {
     /// Compose service names containing a dot (`laravel.test`) — the shape
     /// several compose releases have choked on.
     pub dotted_services: Vec<String>,
+    /// Sail-shaped build services (context + image series) for the
+    /// PHP-runtime consistency check.
+    pub sail_builds: Vec<SailBuildFacts>,
+    /// PHP series present under `vendor/laravel/sail/runtimes/`.
+    pub available_runtimes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

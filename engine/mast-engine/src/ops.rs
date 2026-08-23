@@ -20,6 +20,11 @@ pub(crate) struct OpHandle {
     /// Full history so late subscribers replay from the first event.
     pub(crate) events: Mutex<Vec<OperationEvent>>,
     pub(crate) events_tx: broadcast::Sender<(usize, OperationEvent)>,
+    /// Error signatures spotted in this operation's output (first-seen
+    /// order, deduped). A failing operation ends with their explanations, so
+    /// the known failure waves — GPG outages, port squatters, version-locked
+    /// volumes — read as sentences instead of scrollback.
+    pub(crate) signatures: Mutex<Vec<&'static mast_diagnostics::ErrorSignature>>,
 }
 
 impl Engine {
@@ -30,12 +35,21 @@ impl Engine {
             cancel: CancellationToken::new(),
             events: Mutex::new(Vec::new()),
             events_tx,
+            signatures: Mutex::new(Vec::new()),
         });
         self.inner.ops.lock().unwrap().insert(id.0, handle.clone());
         (id, handle)
     }
 
     pub(crate) fn emit_op(&self, handle: &OpHandle, id: OperationId, kind: OperationEventKind) {
+        if let OperationEventKind::Output { line, .. } = &kind
+            && let Some(sig) = mast_diagnostics::classify_line(line)
+        {
+            let mut seen = handle.signatures.lock().unwrap();
+            if !seen.iter().any(|s| s.id == sig.id) {
+                seen.push(sig);
+            }
+        }
         let event = OperationEvent { operation: id, kind };
         // Push + broadcast under the history lock so index order is total.
         let mut events = handle.events.lock().unwrap();
@@ -71,6 +85,26 @@ impl Engine {
                     engine.emit_op(&handle, id, OperationEventKind::Cancelled)
                 }
                 Err(e) => {
+                    let matched: Vec<_> =
+                        handle.signatures.lock().unwrap().iter().take(3).copied().collect();
+                    for sig in matched {
+                        engine.emit_op(
+                            &handle,
+                            id,
+                            OperationEventKind::Output {
+                                line: format!("likely cause: {}", sig.explanation),
+                                stderr: false,
+                            },
+                        );
+                        engine.emit_op(
+                            &handle,
+                            id,
+                            OperationEventKind::Output {
+                                line: format!("  fix: {}", sig.advice),
+                                stderr: false,
+                            },
+                        );
+                    }
                     engine.emit_op(&handle, id, OperationEventKind::Failed { error: e.to_string() })
                 }
             }
