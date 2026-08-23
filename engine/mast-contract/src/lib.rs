@@ -92,6 +92,10 @@ pub struct PhpVersionInfo {
     pub current: String,
     /// Series available under `vendor/laravel/sail/runtimes/`.
     pub available: Vec<String>,
+    /// Node major the runtime's Dockerfile pins (`ARG NODE_VERSION=…`);
+    /// None when the Dockerfile is absent or carries no pin.
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 /// A user-defined per-project command (M7.5): argv-only (whitespace-split,
@@ -986,6 +990,7 @@ mod tests {
                 service: "laravel.test".into(),
                 current: "8.4".into(),
                 available: vec!["8.3".into(), "8.4".into()],
+                node: Some("24".into()),
             }),
             share_url: None,
             share_dashboard_url: None,

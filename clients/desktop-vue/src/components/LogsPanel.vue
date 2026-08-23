@@ -52,6 +52,7 @@ import {
   saveLogsHeight,
   saveLogsWrap,
 } from "../lib/prefs";
+import { iconButtonClass } from "../lib/menu";
 import { useEngineStore } from "../stores/engine";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
@@ -64,10 +65,7 @@ import TabsList from "./ui/TabsList.vue";
 import TabsTrigger from "./ui/TabsTrigger.vue";
 import Tooltip from "./ui/Tooltip.vue";
 
-// The sidebar's inline icon-button recipe. `Button size="iconSm"` is 24px,
-// which would set the height of these dense rows.
-const ICON_BUTTON_CLASS =
-  "rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-slate-200";
+const ICON_BUTTON_CLASS = iconButtonClass;
 
 const store = useEngineStore();
 const scroller = ref<HTMLElement | null>(null);

@@ -55,13 +55,25 @@ pub(crate) fn available_runtimes(dir: &Path) -> Vec<String> {
 }
 
 /// What the PHP version picker shows: the first Sail-shaped build service's
-/// pinned series and the vendored alternatives.
+/// pinned series and the vendored alternatives, plus the Node major the
+/// runtime's Dockerfile pins alongside PHP.
 pub(crate) fn php_info(dir: &Path) -> Option<PhpVersionInfo> {
     let build = sail_build_facts(dir).into_iter().next()?;
+    let node = std::fs::read_to_string(
+        dir.join(build.context.trim_start_matches("./")).join("Dockerfile"),
+    )
+    .ok()
+    .and_then(|dockerfile| {
+        dockerfile.lines().find_map(|line| {
+            line.trim().strip_prefix("ARG NODE_VERSION=").map(|v| v.trim().to_string())
+        })
+    })
+    .filter(|v| !v.is_empty());
     Some(PhpVersionInfo {
         service: build.service,
         current: build.context_series,
         available: available_runtimes(dir),
+        node,
     })
 }
 

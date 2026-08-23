@@ -3,7 +3,9 @@ import { computed, ref, watch } from "vue";
 import {
   Camera,
   ChartColumn,
+  Check,
   ChevronDown,
+  Copy,
   Cpu,
   FileCog,
   Globe,
@@ -33,7 +35,7 @@ import {
 } from "reka-ui";
 
 import type { ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
-import { menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
+import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
 import { envReport } from "../lib/transport";
@@ -132,35 +134,49 @@ const shareCopied = ref(false);
 
 /** The effective SAIL_SHARE_* settings (sail's own defaults filled in), so
  * the dialog says exactly what would be shared BEFORE anything starts. */
-const shareSettings = ref<{ label: string; value: string; key: string }[] | null>(null);
+const shareSettings = ref<
+  { label: string; value: string; key: string; isDefault: boolean }[] | null
+>(null);
 watch(shareOpen, async (open) => {
   if (!open) return;
   shareSettings.value = null;
   try {
     const report = await envReport(project.id);
     const env = (key: string) => report.entries.find((e) => e.key === key)?.value?.trim() || null;
-    const serverHost = env("SAIL_SHARE_SERVER_HOST") ?? "laravel-sail.site";
+    // Every knob the sail script reads, with its default — set ones stand
+    // out, defaults stay dim, so "what exactly am I sharing" has one answer.
+    const row = (label: string, key: string, set: string | null, fallback: string) => ({
+      label,
+      key,
+      value: set ?? fallback,
+      isDefault: set == null,
+    });
+    const serverHost = env("SAIL_SHARE_SERVER_HOST");
+    const token = env("SAIL_SHARE_TOKEN");
     shareSettings.value = [
-      {
-        label: "Forwards",
-        value: `localhost:${env("APP_PORT") ?? "80"} (APP_PORT)`,
-        key: "APP_PORT",
-      },
-      {
-        label: "Subdomain",
-        value: env("SAIL_SHARE_SUBDOMAIN") ?? "(random)",
-        key: "SAIL_SHARE_SUBDOMAIN",
-      },
-      {
-        label: "Domain",
-        value: `${env("SAIL_SHARE_DOMAIN") ?? serverHost}:${env("SAIL_SHARE_SERVER_PORT") ?? "8080"}`,
-        key: "SAIL_SHARE_DOMAIN",
-      },
-      {
-        label: "Dashboard",
-        value: `localhost:${env("SAIL_SHARE_DASHBOARD") ?? "4040"}`,
-        key: "SAIL_SHARE_DASHBOARD",
-      },
+      row(
+        "Forwards",
+        "APP_PORT",
+        env("APP_PORT") && `localhost:${env("APP_PORT")}`,
+        "localhost:80",
+      ),
+      row("Subdomain", "SAIL_SHARE_SUBDOMAIN", env("SAIL_SHARE_SUBDOMAIN"), "(random)"),
+      row("Server host", "SAIL_SHARE_SERVER_HOST", serverHost, "laravel-sail.site"),
+      row("Server port", "SAIL_SHARE_SERVER_PORT", env("SAIL_SHARE_SERVER_PORT"), "8080"),
+      row(
+        "Domain",
+        "SAIL_SHARE_DOMAIN",
+        env("SAIL_SHARE_DOMAIN"),
+        serverHost ?? "laravel-sail.site",
+      ),
+      row("Server", "SAIL_SHARE_SERVER", env("SAIL_SHARE_SERVER"), "(relay default)"),
+      row("Auth token", "SAIL_SHARE_TOKEN", token && "•••", "(none)"),
+      row(
+        "Dashboard",
+        "SAIL_SHARE_DASHBOARD",
+        env("SAIL_SHARE_DASHBOARD") && `localhost:${env("SAIL_SHARE_DASHBOARD")}`,
+        "localhost:4040",
+      ),
     ];
   } catch {
     shareSettings.value = null; // no .env yet — the op will say so
@@ -563,6 +579,12 @@ async function addCommand() {
         <Chip v-else tip="No other PHP runtimes are vendored to switch to.">
           PHP {{ project.php.current }}
         </Chip>
+        <Chip
+          v-if="project.php.node"
+          tip="Node inside the app container — pinned by the Sail runtime's Dockerfile (ARG NODE_VERSION)."
+        >
+          Node {{ project.php.node }}
+        </Chip>
       </div>
     </div>
 
@@ -695,8 +717,13 @@ async function addCommand() {
               class="flex items-baseline gap-2 text-xs"
             >
               <span class="w-20 shrink-0 text-slate-400">{{ setting.label }}</span>
-              <span class="font-mono text-slate-700 dark:text-slate-200">{{ setting.value }}</span>
-              <span class="font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
+              <span
+                class="font-mono"
+                :class="setting.isDefault ? 'text-slate-400' : 'text-slate-700 dark:text-slate-200'"
+                >{{ setting.value
+                }}<span v-if="setting.isDefault" class="ml-1 text-[10px]">default</span></span
+              >
+              <span class="ml-auto font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
             </div>
             <p class="mt-1 text-[11px] text-slate-400">
               Change these via the <span class="font-mono">SAIL_SHARE_*</span> keys in the Env
@@ -732,15 +759,20 @@ async function addCommand() {
             />
             <div class="min-w-0 space-y-2">
               <p class="text-xs text-slate-500 dark:text-slate-400">Public URL (HTTP only):</p>
-              <p class="font-mono text-sm break-all select-all text-slate-900 dark:text-slate-100">
+              <p
+                class="flex items-baseline gap-1.5 font-mono text-sm break-all select-all text-slate-900 dark:text-slate-100"
+              >
                 {{ project.shareUrl }}
+                <Tooltip text="Copy the URL.">
+                  <button :class="['shrink-0', iconButtonClass]" @click="copyShareUrl">
+                    <Check v-if="shareCopied" class="h-3.5 w-3.5 text-emerald-600" />
+                    <Copy v-else class="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
               </p>
               <div class="flex flex-wrap gap-2">
                 <Button size="sm" @click="store.run({ type: 'openUrl', url: project.shareUrl! })">
                   <Globe class="h-3.5 w-3.5" /> Open
-                </Button>
-                <Button variant="outline" size="sm" @click="copyShareUrl">
-                  {{ shareCopied ? "Copied" : "Copy URL" }}
                 </Button>
                 <Button
                   v-if="project.shareDashboardUrl"
