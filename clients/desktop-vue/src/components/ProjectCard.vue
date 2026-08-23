@@ -792,15 +792,17 @@ async function addCommand() {
               >
               <span class="ml-auto font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
             </div>
-            <button
-              class="mt-1 cursor-pointer text-[11px] text-slate-400 underline decoration-slate-300 underline-offset-2 hover:text-slate-600 dark:decoration-slate-600 dark:hover:text-slate-200"
+            <Button
+              variant="ghost"
+              size="sm"
+              class="-ml-2"
               @click="
                 shareOpen = false;
                 showEnv = true;
               "
             >
-              Change these in the Env panel
-            </button>
+              <FileCog class="h-3.5 w-3.5" /> Change these in the Env panel
+            </Button>
           </div>
           <p
             v-if="project.status === 'stopped' || project.status === 'failed'"
