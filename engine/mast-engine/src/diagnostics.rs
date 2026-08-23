@@ -263,8 +263,8 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             .filter(|(name, _)| name.contains('.'))
             .map(|(name, _)| name.clone())
             .collect(),
-        sail_builds: sail_build_facts(&seed.path),
-        available_runtimes: available_runtimes(&seed.path),
+        sail_builds: crate::php::sail_build_facts(&seed.path),
+        available_runtimes: crate::php::available_runtimes(&seed.path),
         foreign_owned: if is_laravel {
             foreign_owned_scan(&seed.path, uid_gid().0)
         } else {
@@ -376,44 +376,6 @@ fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
     argv.push(format!("{uid}:{gid}"));
     argv.extend(targets);
     Some(argv)
-}
-
-/// Sail-shaped build services from the project's base compose file.
-fn sail_build_facts(dir: &Path) -> Vec<mast_diagnostics::SailBuildFacts> {
-    let Some(source) = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
-        .iter()
-        .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())
-    else {
-        return Vec::new();
-    };
-    mast_compose::sail::sail_builds(&source)
-        .into_iter()
-        .filter_map(|b| {
-            let context = b.context?;
-            let context_series = mast_compose::sail::runtime_series(&context)?;
-            Some(mast_diagnostics::SailBuildFacts {
-                context_exists: dir.join(context.trim_start_matches("./")).is_dir(),
-                image_series: b.image.as_deref().and_then(mast_compose::sail::image_series),
-                service: b.service,
-                context,
-                context_series,
-            })
-        })
-        .collect()
-}
-
-fn available_runtimes(dir: &Path) -> Vec<String> {
-    let mut series: Vec<String> = std::fs::read_dir(dir.join("vendor/laravel/sail/runtimes"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    series.sort();
-    series
 }
 
 impl Engine {

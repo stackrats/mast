@@ -373,6 +373,14 @@ export type Action =
  */
 { type: "rebuildService"; id: ProjectId; service: string } | 
 /**
+ * Switch a Sail-built service to another vendored PHP runtime, as ONE
+ * operation: rewrites `build.context` and the `sail-X.Y/app` image tag
+ * together, rebuilds without cache, recreates the container when the
+ * project is running, and verifies `php -v` inside it — the exact
+ * sequence users half-do by hand (laravel/sail#442).
+ */
+{ type: "setPhpVersion"; id: ProjectId; service: string; series: string } | 
+/**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
  * sail:install --php=…` — each run in the official composer image inside
@@ -675,6 +683,23 @@ export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } |
  */
 export type PatchStreamItem = { streamId: number; item: SubscriptionItem }
 /**
+ * The app's Sail PHP runtime: what `build.context` currently pins and which
+ * vendored runtimes it could switch to (drives the PHP version picker).
+ */
+export type PhpVersionInfo = { 
+/**
+ * The Sail-built compose service (usually the app).
+ */
+service: string; 
+/**
+ * PHP series the build context pins ("8.4").
+ */
+current: string; 
+/**
+ * Series available under `vendor/laravel/sail/runtimes/`.
+ */
+available: string[] }
+/**
  * A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
  * long-running artisan command inside the app container. Detected from
  * composer.json/.env; `running` comes from an in-container cmdline scan.
@@ -726,6 +751,11 @@ gitDirty?: boolean | null;
  * `APP_PORT`); None when `.env` gives no http(s) address.
  */
 appUrl?: string | null; 
+/**
+ * The Sail PHP runtime and its alternatives; None when no service
+ * builds from a Sail runtime shape.
+ */
+php?: PhpVersionInfo | null; 
 /**
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …

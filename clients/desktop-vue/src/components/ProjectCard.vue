@@ -118,6 +118,31 @@ const processHints: Record<string, string> = {
   schedule: "Runs scheduled tasks every minute (php artisan schedule:work).",
 };
 
+// --- PHP version switch: context + image tag + no-cache rebuild + recreate
+// as ONE operation (the four steps laravel/sail#442 victims half-do) ---
+const phpChoices = computed(() =>
+  (project.php?.available ?? []).filter((s) => s !== project.php?.current),
+);
+const pendingPhp = ref<string | null>(null);
+const phpConfirmOpen = computed({
+  get: () => pendingPhp.value != null,
+  set: (value: boolean) => {
+    if (!value) pendingPhp.value = null;
+  },
+});
+function switchPhp() {
+  const php = project.php;
+  const series = pendingPhp.value;
+  if (!php || !series) return;
+  pendingPhp.value = null;
+  void store.runLifecycle(project.id, `switch to PHP ${series}`, {
+    type: "setPhpVersion",
+    id: project.id,
+    service: php.service,
+    series,
+  });
+}
+
 // --- user-defined commands, shown as chips like services/processes ---
 const commands = computed(() => project.commands ?? []);
 const addCommandOpen = ref(false);
@@ -196,6 +221,38 @@ async function addCommand() {
               <span v-if="project.gitDirty" class="h-1.5 w-1.5 rounded-full bg-amber-500" />
             </Badge>
           </Tooltip>
+          <template v-if="project.php">
+            <DropdownMenuRoot v-if="phpChoices.length > 0 && !store.readOnly && !opRunning">
+              <DropdownMenuTrigger as-child>
+                <Chip
+                  tip="The PHP runtime the app builds from. Pick another vendored series — build context, image tag, no-cache rebuild and container recreate happen as one operation."
+                >
+                  PHP {{ project.php.current }}
+                  <ChevronDown class="h-3 w-3 text-slate-400" />
+                </Chip>
+              </DropdownMenuTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+                  <DropdownMenuItem
+                    v-for="s in phpChoices"
+                    :key="s"
+                    :class="menuItemClass"
+                    @select="pendingPhp = s"
+                  >
+                    Switch to PHP {{ s }}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenuPortal>
+            </DropdownMenuRoot>
+            <Tooltip
+              v-else
+              text="The PHP runtime the app builds from (vendor/laravel/sail/runtimes)."
+            >
+              <Badge variant="outline" class="shrink-0 normal-case">
+                PHP {{ project.php.current }}
+              </Badge>
+            </Tooltip>
+          </template>
         </div>
         <p class="mt-0.5 font-mono text-xs break-all text-slate-400">{{ project.path }}</p>
       </div>
@@ -538,6 +595,23 @@ async function addCommand() {
     </div>
 
     <CatalogDialog v-model:open="catalogOpen" :project="project.id" />
+
+    <Modal v-model:open="phpConfirmOpen" title="Switch PHP version">
+      <div class="space-y-3">
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          Rebuilds <span class="font-mono">{{ project.php?.service }}</span> from the PHP
+          {{ pendingPhp }} runtime: the build context and
+          <span class="font-mono">sail-{{ pendingPhp }}/app</span> image tag move together, the
+          image rebuilds without cache (several minutes on a first build), and the container is
+          recreated if the project is running — then <span class="font-mono">php -v</span> is
+          checked inside it.
+        </p>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="pendingPhp = null">Cancel</Button>
+          <Button @click="switchPhp">Switch to PHP {{ pendingPhp }}</Button>
+        </div>
+      </div>
+    </Modal>
 
     <Modal v-model:open="addCommandOpen" title="Add command">
       <div class="space-y-3">

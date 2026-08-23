@@ -203,13 +203,15 @@ async fn reconcile(engine: &Engine) {
     let mut process_infos: HashMap<String, ProcessInfo> = HashMap::new();
     // Browsable address from .env, per project.
     let mut app_urls: HashMap<String, Option<String>> = HashMap::new();
+    // Sail PHP runtime info (current series + vendored alternatives).
+    let mut php_infos: HashMap<String, Option<mast_contract::PhpVersionInfo>> = HashMap::new();
     // Content hash of the compose files at resolution time — the model must
     // refresh on in-place edits, which change no part of the invocation.
     let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
     for (id, dir) in &project_dirs {
         let env = process_env.clone();
         let dir = dir.clone();
-        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url) =
+        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php) =
             tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
@@ -260,6 +262,7 @@ async fn reconcile(engine: &Engine) {
                     git_info(&dir),
                     (detected, app_service),
                     mast_laravel::app_url(&env),
+                    crate::php::php_info(&dir),
                 )
             })
             .await
@@ -273,6 +276,7 @@ async fn reconcile(engine: &Engine) {
                     (None, None),
                     (Vec::new(), String::new()),
                     None,
+                    None,
                 )
             });
         resolutions.insert(id.clone(), resolved);
@@ -283,6 +287,7 @@ async fn reconcile(engine: &Engine) {
         git_infos.insert(id.clone(), git);
         process_infos.insert(id.clone(), procs);
         app_urls.insert(id.clone(), app_url);
+        php_infos.insert(id.clone(), php);
     }
 
     // Refresh resolved models where the invocation OR the file content
@@ -457,6 +462,9 @@ async fn reconcile(engine: &Engine) {
             }
             if let Some(url) = app_urls.get(&id) {
                 summary.app_url = url.clone();
+            }
+            if let Some(php) = php_infos.get(&id) {
+                summary.php = php.clone();
             }
             if let Some((detected, _)) = process_infos.get(&id) {
                 summary.processes = detected

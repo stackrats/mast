@@ -523,7 +523,7 @@ impl Engine {
     /// Every compose write goes through here: the 8-gate transaction plus the
     /// history record, so a config change Mast made is as visible as a command
     /// it ran — including the ones the transaction refused.
-    async fn write_compose(
+    pub(crate) async fn write_compose(
         &self,
         invocation: &mast_compose::ComposeInvocation,
         file: &std::path::Path,
