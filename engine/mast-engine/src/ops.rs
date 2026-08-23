@@ -85,30 +85,33 @@ impl Engine {
                     engine.emit_op(&handle, id, OperationEventKind::Cancelled)
                 }
                 Err(e) => {
-                    let matched: Vec<_> =
-                        handle.signatures.lock().unwrap().iter().take(3).copied().collect();
-                    for sig in matched {
-                        engine.emit_op(
-                            &handle,
-                            id,
-                            OperationEventKind::Output {
-                                line: format!("likely cause: {}", sig.explanation),
-                                stderr: false,
-                            },
-                        );
-                        engine.emit_op(
-                            &handle,
-                            id,
-                            OperationEventKind::Output {
-                                line: format!("  fix: {}", sig.advice),
-                                stderr: false,
-                            },
-                        );
-                    }
+                    engine.flush_signature_explanations(&handle, id);
                     engine.emit_op(&handle, id, OperationEventKind::Failed { error: e.to_string() })
                 }
             }
         });
+    }
+
+    /// Emit the explanations owed for this operation's matched error
+    /// signatures (see [`Self::emit_op`]) — called just before a Failed
+    /// terminal event, from every path that emits one.
+    pub(crate) fn flush_signature_explanations(&self, handle: &OpHandle, id: OperationId) {
+        let matched: Vec<_> = handle.signatures.lock().unwrap().iter().take(3).copied().collect();
+        for sig in matched {
+            self.emit_op(
+                handle,
+                id,
+                OperationEventKind::Output {
+                    line: format!("likely cause: {}", sig.explanation),
+                    stderr: false,
+                },
+            );
+            self.emit_op(
+                handle,
+                id,
+                OperationEventKind::Output { line: format!("  fix: {}", sig.advice), stderr: false },
+            );
+        }
     }
 
     /// Progress/cancellation exerciser; touches no state.

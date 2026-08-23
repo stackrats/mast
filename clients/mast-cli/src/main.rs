@@ -437,6 +437,7 @@ mod tests {
             git_branch: None,
             git_dirty: None,
             app_url: None,
+            php: None,
         }
     }
 

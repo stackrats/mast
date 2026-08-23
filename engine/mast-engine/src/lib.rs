@@ -14,6 +14,7 @@ mod lifecycle;
 mod lock;
 mod catalog_ops;
 mod ops;
+mod php;
 mod ports;
 mod project_ops;
 mod snapshot_ops;
@@ -226,6 +227,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         git_branch: None,
         git_dirty: None,
         app_url: None,
+        php: None,
     }
 }
 
@@ -508,6 +510,9 @@ impl Engine {
                     LifecycleVerb::Rebuild,
                     Some(service.clone()),
                 );
+            }
+            Action::SetPhpVersion { id, service, series } => {
+                return self.dispatch_php_switch(id.clone(), service.clone(), series.clone());
             }
             _ => {}
         }
@@ -1073,7 +1078,8 @@ impl Engine {
             | Action::StartService { .. }
             | Action::StopService { .. }
             | Action::RestartService { .. }
-            | Action::RebuildService { .. } => unreachable!("handled above"),
+            | Action::RebuildService { .. }
+            | Action::SetPhpVersion { .. } => unreachable!("handled above"),
         }
         Ok(id)
     }

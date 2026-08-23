@@ -2082,6 +2082,101 @@ async fn failing_operations_explain_known_error_signatures() {
     );
 }
 
+/// The PHP switch: refuses series that are not vendored, rewrites build
+/// context and image tag TOGETHER through the write transaction, and only
+/// then rebuilds — so a failed build leaves a coherent file that `up` or a
+/// rebuild can still make good on, never a context/tag mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn php_switch_rewrites_context_and_tag_together_before_building() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("phpapp");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.3'\n      dockerfile: Dockerfile\n    image: 'sail-8.3/app'\n",
+    )
+    .unwrap();
+    // Two vendored runtimes, deliberately WITHOUT Dockerfiles: the build step
+    // must fail, proving the compose edit lands first and stays coherent.
+    for series in ["8.3", "8.4"] {
+        std::fs::create_dir_all(project.join("vendor/laravel/sail/runtimes").join(series))
+            .unwrap();
+    }
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    // The picker's data arrives on the summary via reconcile.
+    let snap = wait_until(&engine, "php info on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.is_some() && p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let php = snap.projects[0].php.as_ref().unwrap();
+    assert_eq!(php.service, "laravel.test");
+    assert_eq!(php.current, "8.3");
+    assert_eq!(php.available, vec!["8.3", "8.4"]);
+
+    // A series that is not vendored is refused before anything is touched.
+    let id = engine
+        .dispatch(Action::SetPhpVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            series: "9.9".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut error = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { error: e } => {
+                error = Some(e);
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let error = error.expect("unvendored series must fail");
+    assert!(error.contains("not vendored"), "{error}");
+    let untouched = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(untouched.contains("runtimes/8.3"), "{untouched}");
+
+    // A vendored switch edits BOTH fields, then fails at the build (no
+    // Dockerfile here) — the file must already be coherent on 8.4.
+    let id = engine
+        .dispatch(Action::SetPhpVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            series: "8.4".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut failed = false;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { .. } => {
+                failed = true;
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "the Dockerfile-less build must fail");
+    let switched = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(switched.contains("context: './vendor/laravel/sail/runtimes/8.4'"), "{switched}");
+    assert!(switched.contains("image: 'sail-8.4/app'"), "{switched}");
+    assert!(!switched.contains("8.3"), "{switched}");
+}
+
 /// `docker compose config` runs without a daemon, but the CLI still has to be
 /// installed; tests that need a resolved model skip without it.
 async fn compose_cli_available() -> bool {

@@ -81,6 +81,19 @@ pub struct ProcessState {
     pub running: bool,
 }
 
+/// The app's Sail PHP runtime: what `build.context` currently pins and which
+/// vendored runtimes it could switch to (drives the PHP version picker).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpVersionInfo {
+    /// The Sail-built compose service (usually the app).
+    pub service: String,
+    /// PHP series the build context pins ("8.4").
+    pub current: String,
+    /// Series available under `vendor/laravel/sail/runtimes/`.
+    pub available: Vec<String>,
+}
+
 /// A user-defined per-project command (M7.5): argv-only (whitespace-split,
 /// no shell), `sail` prefix resolves to `vendor/bin/sail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -123,6 +136,10 @@ pub struct ProjectSummary {
     /// `APP_PORT`); None when `.env` gives no http(s) address.
     #[serde(default)]
     pub app_url: Option<String>,
+    /// The Sail PHP runtime and its alternatives; None when no service
+    /// builds from a Sail runtime shape.
+    #[serde(default)]
+    pub php: Option<PhpVersionInfo>,
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
@@ -799,6 +816,12 @@ pub enum Action {
     /// Pull the service's image and recreate just that container, so a retag
     /// (or any edited service block) takes effect.
     RebuildService { id: ProjectId, service: String },
+    /// Switch a Sail-built service to another vendored PHP runtime, as ONE
+    /// operation: rewrites `build.context` and the `sail-X.Y/app` image tag
+    /// together, rebuilds without cache, recreates the container when the
+    /// project is running, and verifies `php -v` inside it — the exact
+    /// sequence users half-do by hand (laravel/sail#442).
+    SetPhpVersion { id: ProjectId, service: String, series: String },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -937,6 +960,11 @@ mod tests {
             git_branch: Some("main".into()),
             git_dirty: Some(false),
             app_url: Some("http://localhost:8080".into()),
+            php: Some(PhpVersionInfo {
+                service: "laravel.test".into(),
+                current: "8.4".into(),
+                available: vec!["8.3".into(), "8.4".into()],
+            }),
         }
     }
 
