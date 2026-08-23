@@ -144,6 +144,10 @@ pub struct ProjectSummary {
     /// None while not sharing.
     #[serde(default)]
     pub share_url: Option<String>,
+    /// The live tunnel's local dashboard (SAIL_SHARE_DASHBOARD, possibly
+    /// auto-moved off a busy port); None while not sharing.
+    #[serde(default)]
+    pub share_dashboard_url: Option<String>,
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
@@ -777,6 +781,9 @@ pub enum Action {
     /// Open the project's `.env` address (`ProjectSummary::app_url`) in the
     /// default browser.
     OpenInBrowser { id: ProjectId },
+    /// Open an http(s) URL Mast itself surfaced (share URL, tunnel
+    /// dashboard) in the default browser. Non-http schemes are refused.
+    OpenUrl { url: String },
     /// Persist external-tool preferences.
     SetIntegrations { integrations: IntegrationSettings },
     /// Set a LITERAL value in the project's .env (lossless model; creates
@@ -981,6 +988,7 @@ mod tests {
                 available: vec!["8.3".into(), "8.4".into()],
             }),
             share_url: None,
+            share_dashboard_url: None,
         }
     }
 

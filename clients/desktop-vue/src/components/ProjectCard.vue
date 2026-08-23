@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import {
   Camera,
   ChartColumn,
@@ -36,6 +36,7 @@ import type { ProjectCommand, ProjectSummary, ServiceState } from "../bindings";
 import { menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
+import { envReport } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -128,6 +129,43 @@ const shareOp = computed(() => store.operations[shareKey(project.id)]);
 const sharing = computed(() => shareOp.value != null && shareOp.value.terminal === null);
 const shareQr = useQRCode(computed(() => project.shareUrl ?? ""));
 const shareCopied = ref(false);
+
+/** The effective SAIL_SHARE_* settings (sail's own defaults filled in), so
+ * the dialog says exactly what would be shared BEFORE anything starts. */
+const shareSettings = ref<{ label: string; value: string; key: string }[] | null>(null);
+watch(shareOpen, async (open) => {
+  if (!open) return;
+  shareSettings.value = null;
+  try {
+    const report = await envReport(project.id);
+    const env = (key: string) => report.entries.find((e) => e.key === key)?.value?.trim() || null;
+    const serverHost = env("SAIL_SHARE_SERVER_HOST") ?? "laravel-sail.site";
+    shareSettings.value = [
+      {
+        label: "Forwards",
+        value: `localhost:${env("APP_PORT") ?? "80"} (APP_PORT)`,
+        key: "APP_PORT",
+      },
+      {
+        label: "Subdomain",
+        value: env("SAIL_SHARE_SUBDOMAIN") ?? "(random)",
+        key: "SAIL_SHARE_SUBDOMAIN",
+      },
+      {
+        label: "Domain",
+        value: `${env("SAIL_SHARE_DOMAIN") ?? serverHost}:${env("SAIL_SHARE_SERVER_PORT") ?? "8080"}`,
+        key: "SAIL_SHARE_DOMAIN",
+      },
+      {
+        label: "Dashboard",
+        value: `localhost:${env("SAIL_SHARE_DASHBOARD") ?? "4040"}`,
+        key: "SAIL_SHARE_DASHBOARD",
+      },
+    ];
+  } catch {
+    shareSettings.value = null; // no .env yet — the op will say so
+  }
+});
 function startShare() {
   void store.runLifecycle(shareKey(project.id), "share", {
     type: "shareProject",
@@ -247,38 +285,6 @@ async function addCommand() {
               <span v-if="project.gitDirty" class="h-1.5 w-1.5 rounded-full bg-amber-500" />
             </Badge>
           </Tooltip>
-          <template v-if="project.php">
-            <DropdownMenuRoot v-if="phpChoices.length > 0 && !store.readOnly && !opRunning">
-              <DropdownMenuTrigger as-child>
-                <Chip
-                  tip="The PHP runtime the app builds from. Pick another vendored series — build context, image tag, no-cache rebuild and container recreate happen as one operation."
-                >
-                  PHP {{ project.php.current }}
-                  <ChevronDown class="h-3 w-3 text-slate-400" />
-                </Chip>
-              </DropdownMenuTrigger>
-              <DropdownMenuPortal>
-                <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
-                  <DropdownMenuItem
-                    v-for="s in phpChoices"
-                    :key="s"
-                    :class="menuItemClass"
-                    @select="pendingPhp = s"
-                  >
-                    Switch to PHP {{ s }}
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenuPortal>
-            </DropdownMenuRoot>
-            <Tooltip
-              v-else
-              text="The PHP runtime the app builds from (vendor/laravel/sail/runtimes)."
-            >
-              <Badge variant="outline" class="shrink-0 normal-case">
-                PHP {{ project.php.current }}
-              </Badge>
-            </Tooltip>
-          </template>
         </div>
         <p class="mt-0.5 font-mono text-xs break-all text-slate-400">{{ project.path }}</p>
       </div>
@@ -523,6 +529,43 @@ async function addCommand() {
       </div>
     </div>
 
+    <!-- The Sail PHP runtime, same chip pattern as services: the chip opens
+         a menu of the other vendored series, and a switch runs context +
+         image tag + no-cache rebuild + recreate as one confirmed operation. -->
+    <div v-if="project.php" class="mt-3">
+      <div class="flex items-center gap-1.5">
+        <p :class="rowLabelClass">Runtimes</p>
+        <Hint
+          text="The PHP runtime the app builds from (vendor/laravel/sail/runtimes). Picking another series rewrites the build context and image tag together, rebuilds without cache, and verifies php -v — the four steps that go wrong when done by hand."
+        />
+      </div>
+      <div class="mt-1.5 flex flex-wrap gap-2">
+        <DropdownMenuRoot v-if="phpChoices.length > 0 && !store.readOnly && !opRunning">
+          <DropdownMenuTrigger as-child>
+            <Chip>
+              PHP {{ project.php.current }}
+              <ChevronDown class="h-3 w-3 text-slate-400" />
+            </Chip>
+          </DropdownMenuTrigger>
+          <DropdownMenuPortal>
+            <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+              <DropdownMenuItem
+                v-for="s in phpChoices"
+                :key="s"
+                :class="menuItemClass"
+                @select="pendingPhp = s"
+              >
+                Switch to PHP {{ s }}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenuPortal>
+        </DropdownMenuRoot>
+        <Chip v-else tip="No other PHP runtimes are vendored to switch to.">
+          PHP {{ project.php.current }}
+        </Chip>
+      </div>
+    </div>
+
     <!-- Laravel app processes (Reverb/Horizon/…): in-container artisan
          daemons, same chip+menu pattern as services. -->
     <div v-if="processes.length > 0" class="mt-3">
@@ -640,9 +683,26 @@ async function addCommand() {
           <p class="text-xs text-slate-500 dark:text-slate-400">
             Runs Sail's expose tunnel (<span class="font-mono">sail share</span>): the running app
             is published at a temporary public URL over plain HTTP. Anyone with the link reaches
-            your machine while the tunnel is up. Subdomain, server and dashboard port come from the
-            <span class="font-mono">SAIL_SHARE_*</span> keys in <span class="font-mono">.env</span>.
+            your machine while the tunnel is up.
           </p>
+          <div
+            v-if="shareSettings"
+            class="rounded-md border border-slate-200 bg-slate-50 p-2 dark:border-slate-800 dark:bg-neutral-900"
+          >
+            <div
+              v-for="setting in shareSettings"
+              :key="setting.key"
+              class="flex items-baseline gap-2 text-xs"
+            >
+              <span class="w-20 shrink-0 text-slate-400">{{ setting.label }}</span>
+              <span class="font-mono text-slate-700 dark:text-slate-200">{{ setting.value }}</span>
+              <span class="font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
+            </div>
+            <p class="mt-1 text-[11px] text-slate-400">
+              Change these via the <span class="font-mono">SAIL_SHARE_*</span> keys in the Env
+              panel.
+            </p>
+          </div>
           <p
             v-if="project.status === 'stopped' || project.status === 'failed'"
             class="text-xs text-amber-700 dark:text-amber-300"
@@ -675,15 +735,33 @@ async function addCommand() {
               <p class="font-mono text-sm break-all select-all text-slate-900 dark:text-slate-100">
                 {{ project.shareUrl }}
               </p>
-              <div class="flex gap-2">
+              <div class="flex flex-wrap gap-2">
+                <Button size="sm" @click="store.run({ type: 'openUrl', url: project.shareUrl! })">
+                  <Globe class="h-3.5 w-3.5" /> Open
+                </Button>
                 <Button variant="outline" size="sm" @click="copyShareUrl">
                   {{ shareCopied ? "Copied" : "Copy URL" }}
                 </Button>
+                <Button
+                  v-if="project.shareDashboardUrl"
+                  variant="outline"
+                  size="sm"
+                  @click="store.run({ type: 'openUrl', url: project.shareDashboardUrl! })"
+                >
+                  <ChartColumn class="h-3.5 w-3.5" /> Dashboard
+                </Button>
               </div>
               <p class="text-xs text-slate-500 dark:text-slate-400">
-                Scan the code to open it on your phone. The tunnel dashboard listens on
-                <span class="font-mono">SAIL_SHARE_DASHBOARD</span> (default
-                <span class="font-mono">http://localhost:4040</span>).
+                Scan the code to open it on your phone. The dashboard shows every request through
+                the tunnel<template v-if="project.shareDashboardUrl">
+                  ({{ project.shareDashboardUrl }})</template
+                >.
+              </p>
+              <p class="text-xs text-slate-400">
+                HTTPS is not available on the public
+                <span class="font-mono">laravel-sail.site</span> relay — a known Sail limitation,
+                use the HTTP link. For HTTPS, run your own expose server with TLS and point
+                <span class="font-mono">SAIL_SHARE_SERVER_HOST</span> at it.
               </p>
             </div>
           </div>

@@ -2447,6 +2447,33 @@ async fn mailhog_migrates_to_mailpit_in_one_repair() {
     assert!(env.contains("MAIL_HOST=mailpit"), "{env}");
 }
 
+/// `OpenUrl` powers the share dialog's Open/Dashboard buttons — and must
+/// refuse anything that is not plain http(s), since the URL travels through
+/// the generic action pipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_url_refuses_non_http_schemes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    for url in ["javascript:alert(1)", "file:///etc/passwd", "ftp://x", "http://"] {
+        let id = engine.dispatch(Action::OpenUrl { url: url.into() }).unwrap();
+        let mut events = engine.operation_events(id).unwrap();
+        let mut failed = false;
+        while let Some(event) = events.next().await {
+            match event.kind {
+                OperationEventKind::Failed { .. } => {
+                    failed = true;
+                    break;
+                }
+                OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+                _ => {}
+            }
+        }
+        assert!(failed, "{url} must be refused");
+    }
+}
+
 /// Sharing tunnels the RUNNING app; a stopped project is refused up front
 /// with the reason, not a dead tunnel.
 #[tokio::test(flavor = "multi_thread")]

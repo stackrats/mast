@@ -230,6 +230,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         app_url: None,
         php: None,
         share_url: None,
+        share_dashboard_url: None,
     }
 }
 
@@ -473,6 +474,7 @@ impl Engine {
                 | Action::OpenInEditor { .. }
                 | Action::RevealInFileManager { .. }
                 | Action::OpenInBrowser { .. }
+                | Action::OpenUrl { .. }
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -1012,6 +1014,12 @@ impl Engine {
                     };
                     integrations::open_in_browser(&url)
                         .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::OpenUrl { url } => {
+                self.spawn_operation(id, handle, async move {
+                    integrations::open_in_browser(&url)
+                        .map_err(|message| ErrorInfo::InvalidInput { message })
                 });
             }
             Action::SetEnvVar { id: project, key: env_key, value } => {
