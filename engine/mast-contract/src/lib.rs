@@ -68,6 +68,15 @@ pub struct ServiceState {
     pub container_id: Option<String>,
     pub state: Option<ContainerState>,
     pub health: ServiceHealth,
+    /// Host-reachable address of this service's web dashboard (Mailpit,
+    /// Meilisearch, MinIO console, …) when the image is recognized and the
+    /// container port is published — powers "Open UI" on the service chip.
+    #[serde(default)]
+    pub ui_url: Option<String>,
+    /// Host-side port of a recognized database service — what a GUI client
+    /// on the host connects to (with the credentials from `.env`).
+    #[serde(default)]
+    pub db_port: Option<u16>,
 }
 
 /// A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
@@ -970,6 +979,8 @@ mod tests {
             container_id: Some("abc123".into()),
             state: Some(ContainerState::Running),
             health: ServiceHealth::Healthy,
+            ui_url: None,
+            db_port: None,
         }
     }
 

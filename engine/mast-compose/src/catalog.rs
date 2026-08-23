@@ -342,6 +342,27 @@ pub const CATALOG: &[CatalogDef] = &[
     },
 ];
 
+/// Container-side port of the web UI a known dev service ships — the
+/// buried knowledge behind "which port is the Mailpit dashboard on?".
+pub fn ui_port_for_image(image: &str) -> Option<u16> {
+    const UI_PORTS: [(&str, u16); 5] = [
+        ("axllent/mailpit", 8025),
+        ("mailhog/mailhog", 8025),
+        ("mailhog", 8025),
+        ("getmeili/meilisearch", 7700),
+        ("rustfs/rustfs", 9001),
+    ];
+    // MinIO's console is a second mapping (8900 host-side in sail's stub),
+    // container port 8900 per the `--console-address` command line.
+    if image_matches(image, "minio/minio") {
+        return Some(8900);
+    }
+    UI_PORTS
+        .iter()
+        .find(|(stem, _)| image_matches(image, stem))
+        .map(|(_, port)| *port)
+}
+
 /// Does `image` run this catalog entry's software?
 pub fn def_matches_image(def: &CatalogDef, image: &str) -> bool {
     def.image_stems.iter().any(|stem| image_matches(image, stem))
@@ -697,6 +718,17 @@ mod tests {
 
     fn def(id: &str) -> &'static CatalogDef {
         catalog_def(id).unwrap()
+    }
+
+    #[test]
+    fn ui_ports_map_known_dashboards_and_nothing_else() {
+        assert_eq!(ui_port_for_image("axllent/mailpit:latest"), Some(8025));
+        assert_eq!(ui_port_for_image("mailhog/mailhog:v1.0.1"), Some(8025));
+        assert_eq!(ui_port_for_image("getmeili/meilisearch:latest"), Some(7700));
+        assert_eq!(ui_port_for_image("minio/minio:latest"), Some(8900));
+        assert_eq!(ui_port_for_image("rustfs/rustfs:latest"), Some(9001));
+        assert_eq!(ui_port_for_image("mysql:8.4"), None);
+        assert_eq!(ui_port_for_image("redis:alpine"), None);
     }
 
     #[test]
