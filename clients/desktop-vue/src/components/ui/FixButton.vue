@@ -3,7 +3,7 @@
 // signature in the output to a concrete repair. Clicking never applies
 // anything — it opens the repair's preview (exactly what will change),
 // with the same risk badge and consent rules as the Diagnostics dialog.
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { Wrench } from "lucide-vue-next";
 
 import type { ProjectId, RepairOffer, RepairPlan } from "../../bindings";
@@ -50,6 +50,14 @@ async function show() {
   }
 }
 
+// Emitted only when the dialog CLOSES after a successful apply: the parent
+// may dismiss the failed operation on this event, which unmounts this
+// component — firing it at apply time would tear the dialog away while the
+// user is reading "Applied".
+watch(open, (isOpen) => {
+  if (!isOpen && applied.value) emit("applied");
+});
+
 async function apply() {
   if (!plan.value || plan.value.noOp) return;
   applying.value = true;
@@ -61,7 +69,6 @@ async function apply() {
       (line) => lines.value.push(line),
     );
     applied.value = true;
-    emit("applied");
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   } finally {

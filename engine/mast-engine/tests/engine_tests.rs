@@ -2256,27 +2256,19 @@ async fn node_switch_pins_the_build_arg_before_building() {
     assert_eq!(php.node, None, "no Dockerfile ARG and no override yet");
     assert!(php.node_available.contains(&"20".to_string()), "{:?}", php.node_available);
 
-    // Garbage majors are refused before anything is touched.
-    let id = engine
-        .dispatch(Action::SetNodeVersion {
-            id: pid.clone(),
-            service: "laravel.test".into(),
-            major: "v20".into(),
-        })
-        .unwrap();
-    let mut events = engine.operation_events(id).unwrap();
-    let mut failed = false;
-    while let Some(event) = events.next().await {
-        match event.kind {
-            OperationEventKind::Failed { .. } => {
-                failed = true;
-                break;
-            }
-            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
-            _ => {}
+    // Garbage majors are refused at dispatch — before the op lock, before
+    // any operation exists, before anything is touched.
+    let denied = engine.dispatch(Action::SetNodeVersion {
+        id: pid.clone(),
+        service: "laravel.test".into(),
+        major: "v20".into(),
+    });
+    match denied {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("not a Node major"), "{message}");
         }
+        other => panic!("expected InvalidInput, got {other:?}"),
     }
-    assert!(failed, "v20 is not a major");
     assert!(
         !std::fs::read_to_string(project.join("compose.yaml")).unwrap().contains("NODE_VERSION"),
         "refusal must leave the file alone"
