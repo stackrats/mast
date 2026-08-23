@@ -518,6 +518,9 @@ impl Engine {
             Action::SetPhpVersion { id, service, series } => {
                 return self.dispatch_php_switch(id.clone(), service.clone(), series.clone());
             }
+            Action::SetNodeVersion { id, service, major } => {
+                return self.dispatch_node_switch(id.clone(), service.clone(), major.clone());
+            }
             Action::ShareProject { id } => {
                 return self.dispatch_share(id.clone());
             }
@@ -1093,6 +1096,7 @@ impl Engine {
             | Action::RestartService { .. }
             | Action::RebuildService { .. }
             | Action::SetPhpVersion { .. }
+            | Action::SetNodeVersion { .. }
             | Action::ShareProject { .. } => unreachable!("handled above"),
         }
         Ok(id)
