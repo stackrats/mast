@@ -167,6 +167,10 @@ pub struct ProjectSummary {
     /// auto-moved off a busy port); None while not sharing.
     #[serde(default)]
     pub share_dashboard_url: Option<String>,
+    /// Stable local HTTPS address ([`Action::SetLocalDomain`]) served by the
+    /// shared `mast-proxy` Caddy container; None when not claimed.
+    #[serde(default)]
+    pub local_domain: Option<String>,
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
@@ -863,6 +867,13 @@ pub enum Action {
     /// The public URL lands on [`ProjectSummary::share_url`] once the
     /// tunnel reports it.
     ShareProject { id: ProjectId },
+    /// Claim (or clear, with `domain: None`) a stable `https://…test`
+    /// address for this project. Mast keeps one shared Caddy container
+    /// (`mast-proxy`, ports 80/443) whose internal CA signs the
+    /// certificate; the two host-side steps it cannot do silently — the
+    /// `/etc/hosts` line and trusting that CA — surface as high-risk Fix
+    /// buttons on the operation.
+    SetLocalDomain { id: ProjectId, domain: Option<String> },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -1017,6 +1028,7 @@ mod tests {
             }),
             share_url: None,
             share_dashboard_url: None,
+            local_domain: None,
         }
     }
 

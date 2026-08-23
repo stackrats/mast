@@ -52,6 +52,8 @@ pub const REPAIR_NORMALIZE_ENV_EOL: &str = "normalize-env-eol";
 pub const REPAIR_ADD_HOST_GATEWAY: &str = "add-host-gateway";
 pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
+pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
+pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -496,6 +498,33 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             risk: RiskTier::HighRisk,
             description: "Runs `pkexec usermod -aG docker <you>`. Docker-group membership \
                           is equivalent to root; you must log out and back in afterwards."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_HOSTS_ENTRY => Some(RepairSpec {
+            id: REPAIR_HOSTS_ENTRY,
+            title: match arg {
+                Some(domain) => format!("Point {domain} at this machine (/etc/hosts)"),
+                None => "Add the /etc/hosts entry".into(),
+            },
+            risk: RiskTier::HighRisk,
+            description: "Appends one `127.0.0.1` line to /etc/hosts so the browser \
+                          resolves the local domain. Runs via polkit (pkexec) — you \
+                          will be asked for elevation, and the preview shows the exact \
+                          line."
+                .into(),
+            arg: arg.map(str::to_string),
+        }),
+        REPAIR_TRUST_PROXY_CA => Some(RepairSpec {
+            id: REPAIR_TRUST_PROXY_CA,
+            title: "Trust the local HTTPS certificate authority".into(),
+            risk: RiskTier::HighRisk,
+            description: "Copies the proxy's own root certificate out of the \
+                          `mast-proxy` container and installs it into the system \
+                          trust store (via pkexec) and, when `certutil` exists, into \
+                          ~/.pki/nssdb for Chrome/Chromium. It only ever signs \
+                          certificates for your local domains and never leaves this \
+                          machine."
                 .into(),
             arg: None,
         }),

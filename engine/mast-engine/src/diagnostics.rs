@@ -15,7 +15,8 @@ use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
-    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
+    REPAIR_REASSIGN_PORTS, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -1272,6 +1273,77 @@ impl Engine {
             REPAIR_DB_RECREATE => {
                 self.db_recreate_preview(offer, self.require_project(project)?, arg).await
             }
+            REPAIR_HOSTS_ENTRY => {
+                let domain = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-hosts-entry needs the domain".into(),
+                    })?
+                    .to_ascii_lowercase();
+                // Validated again here: the arg travels through the UI and
+                // ends up interpolated into a root shell.
+                crate::proxy::validate_local_domain(&domain)?;
+                tokio::task::spawn_blocking(move || {
+                    let before = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+                    let no_op = crate::proxy::hosts_resolves(&before, &domain);
+                    let line = format!("127.0.0.1\t{domain}\t# mast local domain");
+                    let after = if no_op {
+                        before.clone()
+                    } else {
+                        let sep = if before.ends_with('\n') || before.is_empty() { "" } else { "\n" };
+                        format!("{before}{sep}{line}\n")
+                    };
+                    let summary = if no_op {
+                        vec![format!("/etc/hosts already resolves {domain} — nothing to do")]
+                    } else {
+                        vec![
+                            format!("append \"{line}\" to /etc/hosts"),
+                            "asks for elevation via polkit (pkexec)".into(),
+                        ]
+                    };
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: "/etc/hosts".into(),
+                            after,
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_TRUST_PROXY_CA => {
+                let no_op = tokio::task::spawn_blocking(|| {
+                    std::path::Path::new("/usr/local/share/ca-certificates/mast-proxy.crt")
+                        .exists()
+                        || std::path::Path::new("/etc/pki/ca-trust/source/anchors/mast-proxy.crt")
+                            .exists()
+                })
+                .await
+                .map_err(crate::internal_err)?;
+                let summary = if no_op {
+                    vec!["the proxy CA is already in the system trust store — nothing to do"
+                        .to_string()]
+                } else {
+                    vec![
+                        "copy the proxy's root certificate out of the mast-proxy container"
+                            .into(),
+                        "install it into the system trust store via pkexec \
+                         (update-ca-certificates or update-ca-trust)"
+                            .into(),
+                        "add it to ~/.pki/nssdb for Chrome/Chromium when certutil is available"
+                            .into(),
+                        "Firefox keeps its own store — import the certificate manually or \
+                         enable security.enterprise_roots.enabled"
+                            .into(),
+                    ]
+                };
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
+            }
             REPAIR_DOCKER_GROUP => {
                 let user = self.current_username()?;
                 Ok(RepairPlan {
@@ -1848,6 +1920,146 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: "created public/storage → ../storage/app/public".into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_HOSTS_ENTRY => {
+                let domain = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "add-hosts-entry needs the domain".into(),
+                    })?
+                    .to_ascii_lowercase();
+                crate::proxy::validate_local_domain(&domain)?;
+                let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap_or_default();
+                if crate::proxy::hosts_resolves(&hosts, &domain) {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: format!("/etc/hosts already resolves {domain}"),
+                            stderr: false,
+                        },
+                    );
+                    return Ok(());
+                }
+                // The domain passed the strict character validation above,
+                // so it is safe as a printf argument word.
+                let script = format!(
+                    "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> /etc/hosts"
+                );
+                let argv: Vec<String> =
+                    ["pkexec", "sh", "-c", script.as_str()].map(String::from).into();
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    None,
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("{domain} now resolves to 127.0.0.1 on this machine"),
+                        stderr: false,
+                    },
+                );
+                Ok(())
+            }
+            REPAIR_TRUST_PROXY_CA => {
+                let dir = self.inner.deps.store.proxy_dir();
+                tokio::fs::create_dir_all(&dir).await.map_err(crate::internal_err)?;
+                let crt = dir.join("root.crt");
+                let crt_str = crt.to_string_lossy().into_owned();
+                if crt_str.contains('\'') {
+                    return Err(ErrorInfo::Internal {
+                        message: "data directory path contains a quote — cannot build a \
+                                  safe elevated command"
+                            .into(),
+                    });
+                }
+                let cp: Vec<String> = [
+                    "docker",
+                    "cp",
+                    "mast-proxy:/data/caddy/pki/authorities/local/root.crt",
+                    crt_str.as_str(),
+                ]
+                .map(String::from)
+                .into();
+                let copied = run_command(&cp, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !copied.success() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: "the proxy has not generated its certificate authority \
+                                  yet — enable a local domain first, then retry"
+                            .into(),
+                    });
+                }
+                let (dest, refresh) =
+                    if std::path::Path::new("/usr/local/share/ca-certificates").is_dir() {
+                        ("/usr/local/share/ca-certificates/mast-proxy.crt", "update-ca-certificates")
+                    } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir() {
+                        ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                    } else {
+                        return Err(ErrorInfo::Internal {
+                            message: "no known system trust store on this machine — install \
+                                      the certificate manually (it was exported next to the \
+                                      generated Caddyfile)"
+                                .into(),
+                        });
+                    };
+                let script = format!("install -m 644 '{crt_str}' {dest} && {refresh}");
+                let argv: Vec<String> =
+                    ["pkexec", "sh", "-c", script.as_str()].map(String::from).into();
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    None,
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                // Chrome/Chromium read NSS, not the system store; best-effort,
+                // and its absence only means a browser warning remains.
+                let nssdb =
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"));
+                if let Some(nssdb) = nssdb {
+                    let _ = tokio::fs::create_dir_all(&nssdb).await;
+                    let db = format!("sql:{}", nssdb.display());
+                    let add: Vec<String> = [
+                        "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
+                        "Mast local HTTPS (Caddy)", "-i", crt_str.as_str(),
+                    ]
+                    .map(String::from)
+                    .into();
+                    let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+                    let line = match nss {
+                        Ok(o) if o.success() => {
+                            "added to ~/.pki/nssdb — Chrome/Chromium trust it after a restart"
+                                .to_string()
+                        }
+                        _ => "certutil not available — Chrome/Chromium may still warn; \
+                              install libnss3-tools and re-apply, or import the certificate \
+                              in the browser"
+                            .to_string(),
+                    };
+                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                }
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "system trust store updated — restart the browser; Firefox \
+                               needs the certificate imported manually or \
+                               security.enterprise_roots.enabled"
+                            .into(),
                         stderr: false,
                     },
                 );

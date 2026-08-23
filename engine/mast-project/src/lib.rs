@@ -148,6 +148,9 @@ pub struct ProjectRecord {
     /// User-defined commands (M7.5): name → whitespace-split argv line.
     #[serde(default)]
     pub commands: Vec<ProjectCommandRecord>,
+    /// Local HTTPS domain served by the shared `mast-proxy` container.
+    #[serde(default)]
+    pub local_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +360,7 @@ impl MetadataStore {
             is_sail: is_sail_project(&canonical),
             path: canonical,
             commands: Vec::new(),
+            local_domain: None,
         };
         projects.push(record.clone());
         self.save_projects(&projects)?;
@@ -380,6 +384,12 @@ impl MetadataStore {
 
     pub fn backups_dir(&self) -> PathBuf {
         self.dir.join("backups")
+    }
+
+    /// Where the local-HTTPS proxy's generated Caddyfile and exported root
+    /// certificate live (owned by `mast-engine::proxy`).
+    pub fn proxy_dir(&self) -> PathBuf {
+        self.dir.join("proxy")
     }
 
     /// Image tags last read from the registry, keyed by repo as it appears in

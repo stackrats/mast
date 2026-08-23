@@ -16,6 +16,7 @@ mod catalog_ops;
 mod ops;
 mod php;
 mod ports;
+mod proxy;
 mod project_ops;
 mod share;
 mod snapshot_ops;
@@ -234,6 +235,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         php: None,
         share_url: None,
         share_dashboard_url: None,
+        local_domain: record.local_domain.clone(),
     }
 }
 
@@ -527,6 +529,9 @@ impl Engine {
             }
             Action::ShareProject { id } => {
                 return self.dispatch_share(id.clone());
+            }
+            Action::SetLocalDomain { id, domain } => {
+                return self.dispatch_set_local_domain(id.clone(), domain.clone());
             }
             _ => {}
         }
@@ -1101,7 +1106,8 @@ impl Engine {
             | Action::RebuildService { .. }
             | Action::SetPhpVersion { .. }
             | Action::SetNodeVersion { .. }
-            | Action::ShareProject { .. } => unreachable!("handled above"),
+            | Action::ShareProject { .. }
+            | Action::SetLocalDomain { .. } => unreachable!("handled above"),
         }
         Ok(id)
     }
