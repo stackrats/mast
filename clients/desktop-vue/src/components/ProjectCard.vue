@@ -792,6 +792,11 @@ async function addCommand() {
               >
               <span class="ml-auto font-mono text-[10px] text-slate-400">{{ setting.key }}</span>
             </div>
+          </div>
+          <!-- Outside the card: the card holds facts, the action stands on
+               its own. -ml-2 lines the label up with the content edge, the
+               same trick as the op panel's "Show the command" button. -->
+          <div>
             <Button
               variant="ghost"
               size="sm"
