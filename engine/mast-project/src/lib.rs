@@ -159,6 +159,9 @@ pub struct ProjectCommandRecord {
     pub command: String,
     #[serde(default)]
     pub auto_start: bool,
+    /// Working directory override (relative to the project, or absolute).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// `Default` is what a machine with no `settings.json` starts from, so it has

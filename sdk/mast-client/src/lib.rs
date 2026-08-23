@@ -67,6 +67,10 @@ pub trait MastClient: Send + Sync {
     /// first). On demand only — log bodies routinely carry user data.
     async fn laravel_log(&self, project: ProjectId) -> Result<LaravelLogReport, ClientError>;
 
+    /// `php -m` inside the running app container — the extensions the
+    /// runtime actually loaded. Fails when the app service is not running.
+    async fn php_extensions(&self, project: ProjectId) -> Result<Vec<String>, ClientError>;
+
     /// The local HTTPS proxy's root certificate, exported for manual trust
     /// (Firefox import, `curl --cacert`); None until a domain has been
     /// enabled and the proxy has minted its CA.

@@ -122,6 +122,12 @@ pub struct ProjectCommand {
     pub command: String,
     /// Run automatically once the project reaches Running.
     pub auto_start: bool,
+    /// Working directory: relative to the project (`../frontend`) or
+    /// absolute. None = the project directory. Lets a Sail project drive a
+    /// sibling repo's dev server; `sail …` commands refuse it, since the
+    /// wrapper only works from the project root.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -922,6 +928,14 @@ pub enum Action {
     /// possible or not wanted. Opens read-only for most users; the dialog
     /// shows the exact line to add.
     OpenHostsFile,
+    /// Truncate `storage/logs/laravel.log` — a fresh slate for the App log
+    /// viewer. The file is kept (empty), so running processes keep their
+    /// open handle and Laravel appends as before.
+    ClearLaravelLog { id: ProjectId },
+    /// Open a directory in the file manager. Restricted to paths Mast
+    /// already knows — a watched directory or an imported project's root —
+    /// so the surface stays as narrow as the buttons that use it.
+    RevealPath { path: String },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -1058,6 +1072,7 @@ mod tests {
                 name: "dev".into(),
                 command: "sail npm run dev".into(),
                 auto_start: true,
+                cwd: None,
             }],
             processes: vec![ProcessState {
                 id: "horizon".into(),
@@ -1273,6 +1288,7 @@ mod tests {
                     name: "dev".into(),
                     command: "sail npm run dev".into(),
                     auto_start: true,
+                cwd: None,
                 }],
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },

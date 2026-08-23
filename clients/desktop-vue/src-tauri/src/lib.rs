@@ -136,6 +136,15 @@ async fn proxy_ca(state: State<'_, AppState>) -> Result<Option<ProxyCa>, String>
     state.client.proxy_ca().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+#[specta::specta]
+async fn php_extensions(
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<Vec<String>, String> {
+    state.client.php_extensions(project).await.map_err(|e| e.to_string())
+}
+
 /// The effect-history backlog (M9): what Mast has run and written, oldest
 /// first. Fetched once at connect; [`start_history_stream`] keeps it current.
 #[tauri::command]
@@ -379,6 +388,7 @@ fn specta_builder() -> tauri_specta::Builder {
             env_report,
             laravel_log,
             proxy_ca,
+            php_extensions,
             network_attach_preview,
             list_snapshots,
             snapshot_report,
