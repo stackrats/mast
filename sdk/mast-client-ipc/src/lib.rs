@@ -219,6 +219,10 @@ impl MastClient for IpcClient {
         self.call("laravelLog", json!({"project": project})).await
     }
 
+    async fn proxy_ca(&self) -> Result<Option<mast_contract::ProxyCa>, ClientError> {
+        self.call("proxyCa", json!({})).await
+    }
+
     async fn history_recent(&self) -> Result<Vec<mast_contract::HistoryEntry>, ClientError> {
         self.call("historyRecent", json!({})).await
     }

@@ -6,7 +6,7 @@
 
 use futures::stream::BoxStream;
 use mast_contract::{
-    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport,
+    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport, ProxyCa,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
@@ -66,6 +66,11 @@ pub trait MastClient: Send + Sync {
     /// The tail of `storage/logs/laravel.log`, parsed and grouped (newest
     /// first). On demand only — log bodies routinely carry user data.
     async fn laravel_log(&self, project: ProjectId) -> Result<LaravelLogReport, ClientError>;
+
+    /// The local HTTPS proxy's root certificate, exported for manual trust
+    /// (Firefox import, `curl --cacert`); None until a domain has been
+    /// enabled and the proxy has minted its CA.
+    async fn proxy_ca(&self) -> Result<Option<ProxyCa>, ClientError>;
 
     /// Recent effect history, oldest first: every command Mast spawned and
     /// every config file it wrote, with outcomes.

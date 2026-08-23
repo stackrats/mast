@@ -401,6 +401,19 @@ pub struct LaravelLogReport {
     pub truncated: bool,
 }
 
+/// The local HTTPS proxy's root certificate, exported for manual trust —
+/// Firefox's import dialog wants the file, `curl --cacert` and
+/// `NODE_EXTRA_CA_CERTS` want the path, and pasting into another tool wants
+/// the PEM text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCa {
+    /// Where the exported `root.crt` lives on this machine.
+    pub path: String,
+    /// The certificate itself, PEM-encoded.
+    pub pem: String,
+}
+
 // ---------- service catalog (M7) ----------
 
 /// One installable companion service (Redis, Mailpit, …). `installed` means
@@ -904,6 +917,11 @@ pub enum Action {
     /// `/etc/hosts` line and trusting that CA — surface as high-risk Fix
     /// buttons on the operation.
     SetLocalDomain { id: ProjectId, domain: Option<String> },
+    /// Open the platform's hosts file in the desktop's default editor — the
+    /// manual fallback when the elevated add-hosts-entry repair is not
+    /// possible or not wanted. Opens read-only for most users; the dialog
+    /// shows the exact line to add.
+    OpenHostsFile,
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside

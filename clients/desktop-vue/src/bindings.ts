@@ -62,6 +62,14 @@ async laravelLog(project: ProjectId) : Promise<Result<LaravelLogReport, string>>
     else return { status: "error", error: e  as any };
 }
 },
+async proxyCa() : Promise<Result<ProxyCa | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("proxy_ca") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async networkAttachPreview(workspace: WorkspaceId, project: ProjectId) : Promise<Result<FileEditPreview, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("network_attach_preview", { workspace, project }) };
@@ -417,6 +425,13 @@ export type Action =
  * buttons on the operation.
  */
 { type: "setLocalDomain"; id: ProjectId; domain: string | null } | 
+/**
+ * Open the platform's hosts file in the desktop's default editor — the
+ * manual fallback when the elevated add-hosts-entry repair is not
+ * possible or not wanted. Opens read-only for most users; the dialog
+ * shows the exact line to add.
+ */
+{ type: "openHostsFile" } | 
 /**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
@@ -865,6 +880,21 @@ localDomain?: string | null;
  * missing .env, both compose-file families present, …
  */
 warnings: string[] }
+/**
+ * The local HTTPS proxy's root certificate, exported for manual trust —
+ * Firefox's import dialog wants the file, `curl --cacert` and
+ * `NODE_EXTRA_CA_CERTS` want the path, and pasting into another tool wants
+ * the PEM text.
+ */
+export type ProxyCa = { 
+/**
+ * Where the exported `root.crt` lives on this machine.
+ */
+path: string; 
+/**
+ * The certificate itself, PEM-encoded.
+ */
+pem: string }
 export type RepairAuditEntry = { appliedUnix: number; repair: string; projectName: string | null; risk: string; outcome: string }
 /**
  * A repair a finding offers. `arg` disambiguates the target when the id

@@ -1283,7 +1283,8 @@ impl Engine {
                 // ends up interpolated into a root shell.
                 crate::proxy::validate_local_domain(&domain)?;
                 tokio::task::spawn_blocking(move || {
-                    let before = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+                    let hosts_path = crate::proxy::hosts_file_path();
+                    let before = std::fs::read_to_string(hosts_path).unwrap_or_default();
                     let no_op = crate::proxy::hosts_resolves(&before, &domain);
                     let line = format!("127.0.0.1\t{domain}\t# mast local domain");
                     let after = if no_op {
@@ -1293,17 +1294,22 @@ impl Engine {
                         format!("{before}{sep}{line}\n")
                     };
                     let summary = if no_op {
-                        vec![format!("/etc/hosts already resolves {domain} — nothing to do")]
+                        vec![format!("{hosts_path} already resolves {domain} — nothing to do")]
                     } else {
                         vec![
-                            format!("append \"{line}\" to /etc/hosts"),
-                            "asks for elevation via polkit (pkexec)".into(),
+                            format!("append \"{line}\" to {hosts_path}"),
+                            crate::proxy::elevation_note().into(),
+                            format!(
+                                "prefer to do it yourself? add that line to {hosts_path} in \
+                                 any editor — the HTTPS dialog has a copy button and an \
+                                 Open hosts file button"
+                            ),
                         ]
                     };
                     Ok(RepairPlan {
                         repair: offer,
                         file_preview: Some(FileEditPreview {
-                            file: "/etc/hosts".into(),
+                            file: hosts_path.into(),
                             after,
                             before,
                             summary: summary.clone(),
@@ -1325,21 +1331,42 @@ impl Engine {
                 })
                 .await
                 .map_err(crate::internal_err)?;
+                let exported = self.inner.deps.store.proxy_dir().join("root.crt");
                 let summary = if no_op {
                     vec!["the proxy CA is already in the system trust store — nothing to do"
                         .to_string()]
+                } else if cfg!(target_os = "macos") {
+                    vec![
+                        "copy the proxy's root certificate out of the mast-proxy container"
+                            .into(),
+                        "add it to the System keychain as a trusted root \
+                         (security add-trusted-cert)"
+                            .into(),
+                        crate::proxy::elevation_note().into(),
+                        format!(
+                            "the certificate file itself lands at {} — Firefox keeps its \
+                             own store, so import that file there; the HTTPS dialog can \
+                             also copy the path or the PEM for any other tool",
+                            exported.display()
+                        ),
+                    ]
                 } else {
                     vec![
                         "copy the proxy's root certificate out of the mast-proxy container"
                             .into(),
-                        "install it into the system trust store via pkexec \
+                        "install it into the system trust store \
                          (update-ca-certificates or update-ca-trust)"
                             .into(),
+                        crate::proxy::elevation_note().into(),
                         "add it to ~/.pki/nssdb for Chrome/Chromium when certutil is available"
                             .into(),
-                        "Firefox keeps its own store — import the certificate manually or \
-                         enable security.enterprise_roots.enabled"
-                            .into(),
+                        format!(
+                            "the certificate file itself lands at {} — Firefox keeps its \
+                             own store, so import that file there (or enable \
+                             security.enterprise_roots.enabled); the HTTPS dialog can \
+                             also copy the path or the PEM for any other tool",
+                            exported.display()
+                        ),
                     ]
                 };
                 Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
@@ -1350,6 +1377,10 @@ impl Engine {
                     summary: vec![
                         format!("run: pkexec usermod -aG docker {user}"),
                         "asks for elevation via polkit".into(),
+                        format!(
+                            "prefer to do it yourself? run `sudo usermod -aG docker {user}` \
+                             in any terminal — same effect"
+                        ),
                         "log out and back in for group membership to apply".into(),
                     ],
                     repair: offer,
@@ -1933,13 +1964,14 @@ impl Engine {
                     })?
                     .to_ascii_lowercase();
                 crate::proxy::validate_local_domain(&domain)?;
-                let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap_or_default();
+                let hosts_path = crate::proxy::hosts_file_path();
+                let hosts = tokio::fs::read_to_string(hosts_path).await.unwrap_or_default();
                 if crate::proxy::hosts_resolves(&hosts, &domain) {
                     self.emit_op(
                         handle,
                         op,
                         OperationEventKind::Output {
-                            line: format!("/etc/hosts already resolves {domain}"),
+                            line: format!("{hosts_path} already resolves {domain}"),
                             stderr: false,
                         },
                     );
@@ -1947,11 +1979,15 @@ impl Engine {
                 }
                 // The domain passed the strict character validation above,
                 // so it is safe as a printf argument word.
-                let script = format!(
-                    "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> /etc/hosts"
+                let mut script = format!(
+                    "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> {hosts_path}"
                 );
-                let argv: Vec<String> =
-                    ["pkexec", "sh", "-c", script.as_str()].map(String::from).into();
+                if cfg!(target_os = "macos") {
+                    // macOS caches negative lookups; without a flush the
+                    // fresh entry can take minutes to be seen.
+                    script.push_str(" && dscacheutil -flushcache");
+                }
+                let argv = crate::proxy::privileged_shell_argv(&script);
                 self.run_streamed_command(
                     handle,
                     op,
@@ -1983,14 +2019,10 @@ impl Engine {
                             .into(),
                     });
                 }
-                let cp: Vec<String> = [
-                    "docker",
-                    "cp",
-                    "mast-proxy:/data/caddy/pki/authorities/local/root.crt",
-                    crt_str.as_str(),
-                ]
-                .map(String::from)
-                .into();
+                let cp: Vec<String> =
+                    ["docker", "cp", crate::proxy::CA_IN_CONTAINER, crt_str.as_str()]
+                        .map(String::from)
+                        .into();
                 let copied = run_command(&cp, None, &[], PROBE_TIMEOUT, PROBE_CAP)
                     .await
                     .map_err(crate::internal_err)?;
@@ -2001,22 +2033,32 @@ impl Engine {
                             .into(),
                     });
                 }
-                let (dest, refresh) =
-                    if std::path::Path::new("/usr/local/share/ca-certificates").is_dir() {
+                let script = if cfg!(target_os = "macos") {
+                    format!(
+                        "security add-trusted-cert -d -r trustRoot \
+                         -k /Library/Keychains/System.keychain '{crt_str}'"
+                    )
+                } else {
+                    let (dest, refresh) = if std::path::Path::new(
+                        "/usr/local/share/ca-certificates",
+                    )
+                    .is_dir()
+                    {
                         ("/usr/local/share/ca-certificates/mast-proxy.crt", "update-ca-certificates")
                     } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir() {
                         ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
                     } else {
                         return Err(ErrorInfo::Internal {
-                            message: "no known system trust store on this machine — install \
-                                      the certificate manually (it was exported next to the \
-                                      generated Caddyfile)"
-                                .into(),
+                            message: format!(
+                                "no known system trust store on this machine — the \
+                                 certificate was exported to {crt_str}; install it \
+                                 manually (the HTTPS dialog can copy the path or PEM)"
+                            ),
                         });
                     };
-                let script = format!("install -m 644 '{crt_str}' {dest} && {refresh}");
-                let argv: Vec<String> =
-                    ["pkexec", "sh", "-c", script.as_str()].map(String::from).into();
+                    format!("install -m 644 '{crt_str}' {dest} && {refresh}")
+                };
+                let argv = crate::proxy::privileged_shell_argv(&script);
                 self.run_streamed_command(
                     handle,
                     op,
@@ -2026,10 +2068,14 @@ impl Engine {
                     Duration::from_secs(5 * 60),
                 )
                 .await?;
-                // Chrome/Chromium read NSS, not the system store; best-effort,
-                // and its absence only means a browser warning remains.
-                let nssdb =
-                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"));
+                // Chrome/Chromium on Linux read NSS, not the system store;
+                // best-effort, and its absence only means a browser warning
+                // remains. On macOS the keychain covers them already.
+                let nssdb = if cfg!(target_os = "macos") {
+                    None
+                } else {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
+                };
                 if let Some(nssdb) = nssdb {
                     let _ = tokio::fs::create_dir_all(&nssdb).await;
                     let db = format!("sql:{}", nssdb.display());
@@ -2052,16 +2098,17 @@ impl Engine {
                     };
                     self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
                 }
+                let done = if cfg!(target_os = "macos") {
+                    "added to the System keychain — restart the browser; Firefox needs \
+                     the certificate imported manually"
+                } else {
+                    "system trust store updated — restart the browser; Firefox needs \
+                     the certificate imported manually or security.enterprise_roots.enabled"
+                };
                 self.emit_op(
                     handle,
                     op,
-                    OperationEventKind::Output {
-                        line: "system trust store updated — restart the browser; Firefox \
-                               needs the certificate imported manually or \
-                               security.enterprise_roots.enabled"
-                            .into(),
-                        stderr: false,
-                    },
+                    OperationEventKind::Output { line: done.into(), stderr: false },
                 );
                 self.hint();
                 Ok(())

@@ -235,6 +235,7 @@ async fn handle_request(
             let project: ProjectId = param(&params, "project")?;
             ok(engine.laravel_log(&project).await?)
         }
+        "proxyCa" => ok(engine.export_proxy_ca().await),
         "historyRecent" => ok(engine.history_recent()),
         "subscribeHistory" => {
             let stream_id: u64 = param(&params, "stream")?;
