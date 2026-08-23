@@ -2221,6 +2221,95 @@ async fn php_switch_rewrites_context_and_tag_together_before_building() {
     assert!(!switched.contains("8.3"), "{switched}");
 }
 
+/// The Node switch pins `build.args.NODE_VERSION` (existing args intact)
+/// BEFORE the rebuild, refuses garbage majors without touching the file,
+/// and the summary's effective Node follows the override.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_switch_pins_the_build_arg_before_building() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("nodeapp");
+    std::fs::create_dir_all(project.join("vendor/laravel/sail/runtimes/8.3")).unwrap();
+    // No Dockerfile on purpose: the build step must fail, proving the compose
+    // edit lands first — and no real `sail-8.3/app` image ever gets clobbered.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.3'\n      dockerfile: Dockerfile\n      args:\n        WWWGROUP: '${WWWGROUP}'\n    image: 'sail-8.3/app'\n",
+    )
+    .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "php info on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.is_some() && p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let php = snap.projects[0].php.as_ref().unwrap();
+    assert_eq!(php.node, None, "no Dockerfile ARG and no override yet");
+    assert!(php.node_available.contains(&"20".to_string()), "{:?}", php.node_available);
+
+    // Garbage majors are refused before anything is touched.
+    let id = engine
+        .dispatch(Action::SetNodeVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            major: "v20".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut failed = false;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Failed { .. } => {
+                failed = true;
+                break;
+            }
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "v20 is not a major");
+    assert!(
+        !std::fs::read_to_string(project.join("compose.yaml")).unwrap().contains("NODE_VERSION"),
+        "refusal must leave the file alone"
+    );
+
+    // The real switch: the arg lands (existing args intact), the Dockerfile-
+    // less build then fails — a coherent file a plain rebuild makes good on.
+    let id = engine
+        .dispatch(Action::SetNodeVersion {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            major: "20".into(),
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    while let Some(event) = events.next().await {
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+    let edited = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(edited.contains("NODE_VERSION: '20'"), "{edited}");
+    assert!(edited.contains("WWWGROUP: '${WWWGROUP}'"), "{edited}");
+
+    // The effective Node on the summary follows the override.
+    wait_until(&engine, "node override on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.as_ref().is_some_and(|php| php.node.as_deref() == Some("20")))
+    })
+    .await;
+}
+
 /// The stale `public/hot` trap: a killed Vite dev server leaves the file
 /// behind, Blade keeps rendering dev-server URLs, and `npm run build`
 /// changes nothing. Diagnostics finds it, the repair deletes it — and

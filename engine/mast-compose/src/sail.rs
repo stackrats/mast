@@ -15,11 +15,17 @@ pub struct SailBuild {
     /// `build` as a string, or `build.context` from the mapping form.
     pub context: Option<String>,
     pub image: Option<String>,
+    /// `build.args.NODE_VERSION`, when the file overrides the runtime
+    /// Dockerfile's default.
+    pub node_arg: Option<String>,
+    /// `build` uses the mapping form — the only shape that can carry args.
+    pub build_is_mapping: bool,
 }
 
 fn scalar_string(node: &Yaml) -> Option<String> {
     match node {
         Yaml::Value(Scalar::String(s)) => Some(s.to_string()),
+        Yaml::Value(Scalar::Integer(i)) => Some(i.to_string()),
         _ => None,
     }
 }
@@ -44,7 +50,11 @@ pub fn sail_builds(source: &str) -> Vec<SailBuild> {
             let context = scalar_string(build)
                 .or_else(|| mapping_get(build, "context").and_then(scalar_string));
             let image = mapping_get(def, "image").and_then(scalar_string);
-            Some(SailBuild { service, context, image })
+            let node_arg = mapping_get(build, "args")
+                .and_then(|args| mapping_get(args, "NODE_VERSION"))
+                .and_then(scalar_string);
+            let build_is_mapping = matches!(build, Yaml::Mapping(_));
+            Some(SailBuild { service, context, image, node_arg, build_is_mapping })
         })
         .collect()
 }
@@ -75,6 +85,60 @@ pub fn image_series(image: &str) -> Option<String> {
     let rest = image.strip_prefix("sail-")?;
     let (series, tail) = rest.split_once('/')?;
     (tail == "app" && series_like(series)).then(|| series.to_string())
+}
+
+/// Plan pinning `build.args.NODE_VERSION` — Sail's documented way to change
+/// the Node the runtime image installs (the Dockerfile's ARG default rules
+/// otherwise). Handles every stub shape: an existing NODE_VERSION is
+/// updated, an existing `args` mapping gains the key, a mapping build
+/// without `args` gains the block. The rare string-form `build:` is refused
+/// rather than restructured.
+pub fn plan_set_node_version(
+    source: &str,
+    service: &str,
+    major: &str,
+) -> Result<(Vec<Edit>, Vec<String>), String> {
+    if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("\"{major}\" is not a Node major like 22"));
+    }
+    let docs = Yaml::load_from_str(source).map_err(|e| e.to_string())?;
+    let root = docs.first().ok_or("empty compose file")?;
+    let services = mapping_get(root, "services").ok_or("no services mapping in this file")?;
+    let svc = mapping_get(services, service)
+        .ok_or_else(|| format!("service \"{service}\" is not in this file"))?;
+    let build = mapping_get(svc, "build")
+        .ok_or_else(|| format!("service \"{service}\" has no build: to pin Node in"))?;
+    if !matches!(build, Yaml::Mapping(_)) {
+        return Err(format!(
+            "service \"{service}\" uses the short `build: <path>` form — convert it to the \
+             mapping form (context/args) to pin a Node version"
+        ));
+    }
+    let value = format!("'{major}'");
+    let summary = vec![format!("{service}: build arg NODE_VERSION -> {major}")];
+    let edit = match mapping_get(build, "args") {
+        Some(args) if mapping_get(args, "NODE_VERSION").is_some() => Edit::SetScalar {
+            path: vec![
+                key("services"),
+                key(service),
+                key("build"),
+                key("args"),
+                key("NODE_VERSION"),
+            ],
+            value,
+        },
+        Some(_) => Edit::InsertMapKey {
+            path: vec![key("services"), key(service), key("build"), key("args")],
+            key: "NODE_VERSION".to_string(),
+            value,
+        },
+        None => Edit::InsertMapBlock {
+            path: vec![key("services"), key(service), key("build")],
+            key: "args".to_string(),
+            lines: vec![format!("NODE_VERSION: {value}")],
+        },
+    };
+    Ok((vec![edit], summary))
 }
 
 /// Plan adding the `host.docker.internal:host-gateway` mapping to a service
@@ -114,6 +178,49 @@ pub fn plan_add_host_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_version_plan_covers_every_stub_shape() {
+        // The stock stub: args exists (WWWGROUP), NODE_VERSION does not.
+        let stock = "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.4'\n      dockerfile: Dockerfile\n      args:\n        WWWGROUP: '${WWWGROUP}'\n    image: 'sail-8.4/app'\n";
+        let (edits, summary) = plan_set_node_version(stock, "laravel.test", "20").unwrap();
+        let out = mast_yaml_edit::apply_all(stock, &edits).unwrap();
+        assert!(out.contains("NODE_VERSION: '20'"), "{out}");
+        assert!(out.contains("WWWGROUP: '${WWWGROUP}'"), "existing args survive: {out}");
+        assert!(Yaml::load_from_str(&out).is_ok());
+        assert!(summary[0].contains("NODE_VERSION -> 20"));
+        assert_eq!(
+            sail_builds(&out)[0].node_arg.as_deref(),
+            Some("20"),
+            "the parser reads back what the plan wrote"
+        );
+
+        // Already pinned: the value updates in place.
+        let repinned = mast_yaml_edit::apply_all(
+            &out,
+            &plan_set_node_version(&out, "laravel.test", "22").unwrap().0,
+        )
+        .unwrap();
+        assert!(repinned.contains("NODE_VERSION: '22'"), "{repinned}");
+        assert!(!repinned.contains("NODE_VERSION: '20'"), "{repinned}");
+
+        // No args mapping at all: the block is created.
+        let bare = "services:\n  laravel.test:\n    build:\n      context: './docker/8.4'\n";
+        let out = mast_yaml_edit::apply_all(
+            bare,
+            &plan_set_node_version(bare, "laravel.test", "24").unwrap().0,
+        )
+        .unwrap();
+        assert!(out.contains("args:"), "{out}");
+        assert!(out.contains("NODE_VERSION: '24'"), "{out}");
+        assert!(Yaml::load_from_str(&out).is_ok());
+
+        // Short-form build and garbage majors are refused.
+        let short = "services:\n  laravel.test:\n    build: ./docker/8.4\n";
+        assert!(plan_set_node_version(short, "laravel.test", "20").unwrap_err().contains("short"));
+        assert!(plan_set_node_version(stock, "laravel.test", "v20").is_err());
+        assert!(plan_set_node_version(stock, "nope", "20").unwrap_err().contains("not in this file"));
+    }
 
     #[test]
     fn host_gateway_plan_inserts_and_refuses_existing() {

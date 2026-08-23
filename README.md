@@ -258,11 +258,13 @@ Mast matches services against your existing Compose file and can expose availabl
 
 ---
 
-## Switch PHP versions
+## Switch PHP and Node versions
 
-Pick another vendored PHP runtime from the project header and Mast runs the whole switch as one operation: the build context and the `sail-X.Y/app` image tag move together, the image rebuilds without cache, the container is recreated if it was running — and `php -v` inside the container has the last word.
+Pick another PHP runtime from the project's Runtimes row and Mast runs the whole switch as one operation: the build context and the `sail-X.Y/app` image tag move together, the image rebuilds without cache, the container is recreated if it was running — and `php -v` inside the container has the last word.
 
-A series that isn't vendored is refused up front, naming the ones that are.
+Node gets the same treatment: pick a major, Mast pins the build argument, rebuilds, and `node -v` confirms it.
+
+A version that can't work is refused up front, naming the ones that can.
 
 ---
 

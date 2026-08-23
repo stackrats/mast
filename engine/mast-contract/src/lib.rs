@@ -92,10 +92,16 @@ pub struct PhpVersionInfo {
     pub current: String,
     /// Series available under `vendor/laravel/sail/runtimes/`.
     pub available: Vec<String>,
-    /// Node major the runtime's Dockerfile pins (`ARG NODE_VERSION=…`);
-    /// None when the Dockerfile is absent or carries no pin.
+    /// Effective Node major: the compose `build.args.NODE_VERSION` override
+    /// when present, else the runtime Dockerfile's `ARG NODE_VERSION`
+    /// default. None when neither is readable.
     #[serde(default)]
     pub node: Option<String>,
+    /// Node majors the picker offers (nodesource release lines the runtime
+    /// Dockerfile can install). Empty when the build shape cannot take an
+    /// override — the chip stays read-only then.
+    #[serde(default)]
+    pub node_available: Vec<String>,
 }
 
 /// A user-defined per-project command (M7.5): argv-only (whitespace-split,
@@ -837,6 +843,11 @@ pub enum Action {
     /// project is running, and verifies `php -v` inside it — the exact
     /// sequence users half-do by hand (laravel/sail#442).
     SetPhpVersion { id: ProjectId, service: String, series: String },
+    /// Pin the app's Node major (`build.args.NODE_VERSION`, Sail's
+    /// documented override of the runtime Dockerfile's default) and run the
+    /// same verified switch as PHP: rebuild without cache, recreate when
+    /// running, confirm `node -v` inside the container.
+    SetNodeVersion { id: ProjectId, service: String, major: String },
     /// Publish the running app through Sail's expose tunnel (`sail share`,
     /// same image, flags and `.env` knobs). Long-running: the operation
     /// stays live while the tunnel is up, cancelling it stops the share.
@@ -991,6 +1002,7 @@ mod tests {
                 current: "8.4".into(),
                 available: vec!["8.3".into(), "8.4".into()],
                 node: Some("24".into()),
+                node_available: vec!["18".into(), "20".into(), "22".into(), "24".into()],
             }),
             share_url: None,
             share_dashboard_url: None,

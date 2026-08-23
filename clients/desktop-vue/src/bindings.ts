@@ -386,6 +386,13 @@ export type Action =
  */
 { type: "setPhpVersion"; id: ProjectId; service: string; series: string } | 
 /**
+ * Pin the app's Node major (`build.args.NODE_VERSION`, Sail's
+ * documented override of the runtime Dockerfile's default) and run the
+ * same verified switch as PHP: rebuild without cache, recreate when
+ * running, confirm `node -v` inside the container.
+ */
+{ type: "setNodeVersion"; id: ProjectId; service: string; major: string } | 
+/**
  * Publish the running app through Sail's expose tunnel (`sail share`,
  * same image, flags and `.env` knobs). Long-running: the operation
  * stays live while the tunnel is up, cancelling it stops the share.
@@ -720,10 +727,17 @@ current: string;
  */
 available: string[]; 
 /**
- * Node major the runtime's Dockerfile pins (`ARG NODE_VERSION=…`);
- * None when the Dockerfile is absent or carries no pin.
+ * Effective Node major: the compose `build.args.NODE_VERSION` override
+ * when present, else the runtime Dockerfile's `ARG NODE_VERSION`
+ * default. None when neither is readable.
  */
-node?: string | null }
+node?: string | null; 
+/**
+ * Node majors the picker offers (nodesource release lines the runtime
+ * Dockerfile can install). Empty when the build shape cannot take an
+ * override — the chip stays read-only then.
+ */
+nodeAvailable?: string[] }
 /**
  * A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
  * long-running artisan command inside the app container. Detected from

@@ -223,6 +223,30 @@ function switchPhp() {
   });
 }
 
+// --- Node switch: same verified rebuild as PHP, pinning build.args ---
+const nodeChoices = computed(() =>
+  (project.php?.nodeAvailable ?? []).filter((m) => m !== project.php?.node),
+);
+const pendingNode = ref<string | null>(null);
+const nodeConfirmOpen = computed({
+  get: () => pendingNode.value != null,
+  set: (value: boolean) => {
+    if (!value) pendingNode.value = null;
+  },
+});
+function switchNode() {
+  const php = project.php;
+  const major = pendingNode.value;
+  if (!php || !major) return;
+  pendingNode.value = null;
+  void store.runLifecycle(project.id, `switch to Node ${major}`, {
+    type: "setNodeVersion",
+    id: project.id,
+    service: php.service,
+    major,
+  });
+}
+
 // --- user-defined commands, shown as chips like services/processes ---
 const commands = computed(() => project.commands ?? []);
 const addCommandOpen = ref(false);
@@ -579,12 +603,34 @@ async function addCommand() {
         <Chip v-else tip="No other PHP runtimes are vendored to switch to.">
           PHP {{ project.php.current }}
         </Chip>
-        <Chip
-          v-if="project.php.node"
-          tip="Node inside the app container — pinned by the Sail runtime's Dockerfile (ARG NODE_VERSION)."
-        >
-          Node {{ project.php.node }}
-        </Chip>
+        <template v-if="project.php.node">
+          <DropdownMenuRoot v-if="nodeChoices.length > 0 && !store.readOnly && !opRunning">
+            <DropdownMenuTrigger as-child>
+              <Chip>
+                Node {{ project.php.node }}
+                <ChevronDown class="h-3 w-3 text-slate-400" />
+              </Chip>
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+                <DropdownMenuItem
+                  v-for="m in nodeChoices"
+                  :key="m"
+                  :class="menuItemClass"
+                  @select="pendingNode = m"
+                >
+                  Switch to Node {{ m }}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </DropdownMenuRoot>
+          <Chip
+            v-else
+            tip="Node inside the app container — pinned by the Sail runtime's Dockerfile (ARG NODE_VERSION)."
+          >
+            Node {{ project.php.node }}
+          </Chip>
+        </template>
       </div>
     </div>
 
@@ -853,6 +899,22 @@ async function addCommand() {
         <div class="flex justify-end gap-2">
           <Button variant="outline" @click="pendingPhp = null">Cancel</Button>
           <Button @click="switchPhp">Switch to PHP {{ pendingPhp }}</Button>
+        </div>
+      </div>
+    </Modal>
+
+    <Modal v-model:open="nodeConfirmOpen" title="Switch Node version">
+      <div class="space-y-3">
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          Pins <span class="font-mono">NODE_VERSION: '{{ pendingNode }}'</span> in the compose build
+          args (Sail's documented override), rebuilds
+          <span class="font-mono">{{ project.php?.service }}</span> without cache — several minutes
+          on a first build — and recreates the container if the project is running, then checks
+          <span class="font-mono">node -v</span> inside it.
+        </p>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="pendingNode = null">Cancel</Button>
+          <Button @click="switchNode">Switch to Node {{ pendingNode }}</Button>
         </div>
       </div>
     </Modal>
