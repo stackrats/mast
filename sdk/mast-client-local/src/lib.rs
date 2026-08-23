@@ -60,8 +60,11 @@ impl MastClient for LocalClient {
         self.engine.laravel_log(&project).await.map_err(ClientError::from)
     }
 
-    async fn php_extensions(&self, project: ProjectId) -> Result<Vec<String>, ClientError> {
-        self.engine.php_extensions(&project).await.map_err(ClientError::from)
+    async fn php_runtime(
+        &self,
+        project: ProjectId,
+    ) -> Result<mast_contract::PhpRuntimeReport, ClientError> {
+        self.engine.php_runtime(&project).await.map_err(ClientError::from)
     }
 
     async fn proxy_ca(&self) -> Result<Option<mast_contract::ProxyCa>, ClientError> {

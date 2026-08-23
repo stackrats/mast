@@ -484,6 +484,7 @@ impl Engine {
                 | Action::OpenUrl { .. }
                 | Action::OpenHostsFile
                 | Action::RevealPath { .. }
+                | Action::OpenProjectFile { .. }
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -1041,6 +1042,31 @@ impl Engine {
             Action::OpenHostsFile => {
                 self.spawn_operation(id, handle, async move {
                     integrations::open_path(std::path::Path::new(proxy::hosts_file_path()))
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::OpenProjectFile { id: project, file } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let root = engine.project_path(&project)?;
+                    let relative = std::path::Path::new(&file);
+                    let escapes = relative.is_absolute()
+                        || relative
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir));
+                    if escapes {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!("{file} is not a path inside the project"),
+                        });
+                    }
+                    let target = root.join(relative);
+                    if !target.is_file() {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!("{} does not exist", target.display()),
+                        });
+                    }
+                    let editor = engine.inner.state.lock().unwrap().integrations.editor.clone();
+                    integrations::open_editor(editor.as_deref(), &target)
                         .map_err(|message| ErrorInfo::Internal { message })
                 });
             }

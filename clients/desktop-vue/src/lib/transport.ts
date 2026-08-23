@@ -64,8 +64,8 @@ export async function laravelLog(project: ProjectId) {
   return unwrap(await commands.laravelLog(project));
 }
 
-export async function phpExtensions(project: ProjectId) {
-  return unwrap(await commands.phpExtensions(project));
+export async function phpRuntime(project: ProjectId) {
+  return unwrap(await commands.phpRuntime(project));
 }
 
 export async function proxyCa() {

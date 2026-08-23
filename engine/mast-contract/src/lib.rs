@@ -407,6 +407,33 @@ pub struct LaravelLogReport {
     pub truncated: bool,
 }
 
+/// One effective `php.ini` setting read from the running app container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpIniValue {
+    pub key: String,
+    /// As `ini_get` reports it; empty when the runtime has no value.
+    pub value: String,
+}
+
+/// What the PHP runtime actually is right now: loaded extensions and the
+/// common limits, read live from the app container — plus where the
+/// vendored runtime keeps the files that change them (paths relative to
+/// the project, present only when the files exist).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpRuntimeReport {
+    /// `php -m`, sorted, section headers dropped.
+    pub extensions: Vec<String>,
+    /// The classic limits (`memory_limit`, upload sizes, …), in a stable
+    /// display order.
+    pub ini: Vec<PhpIniValue>,
+    /// The vendored runtime's `php.ini` (e.g. `docker/8.4/php.ini`).
+    pub ini_file: Option<String>,
+    /// The vendored runtime's `Dockerfile` — where extensions are added.
+    pub dockerfile: Option<String>,
+}
+
 /// The local HTTPS proxy's root certificate, exported for manual trust —
 /// Firefox's import dialog wants the file, `curl --cacert` and
 /// `NODE_EXTRA_CA_CERTS` want the path, and pasting into another tool wants
@@ -936,6 +963,10 @@ pub enum Action {
     /// already knows — a watched directory or an imported project's root —
     /// so the surface stays as narrow as the buttons that use it.
     RevealPath { path: String },
+    /// Open one file inside a project in the configured editor — the
+    /// vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
+    /// dialog. `file` is project-relative and may not escape the project.
+    OpenProjectFile { id: ProjectId, file: String },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside

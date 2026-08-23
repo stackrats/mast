@@ -62,6 +62,18 @@ const NODE_CHOICES: [&str; 4] = ["18", "20", "22", "24"];
 /// pinned PHP series and the vendored alternatives, plus the effective Node
 /// major — the compose `build.args.NODE_VERSION` override when present,
 /// else the runtime Dockerfile's ARG default.
+/// The app service's build context relative to the project (Sail's
+/// `./docker/<series>` in the stock layout) — where the vendored runtime
+/// keeps its Dockerfile and php.ini.
+pub(crate) fn runtime_context(dir: &Path) -> Option<String> {
+    let source = base_compose_source(dir)?;
+    mast_compose::sail::sail_builds(&source).into_iter().find_map(|b| {
+        let context = b.context?;
+        mast_compose::sail::runtime_series(&context)?;
+        Some(context.trim_start_matches("./").to_string())
+    })
+}
+
 pub(crate) fn php_info(dir: &Path) -> Option<PhpVersionInfo> {
     let source = base_compose_source(dir)?;
     let build = mast_compose::sail::sail_builds(&source).into_iter().find_map(|b| {
