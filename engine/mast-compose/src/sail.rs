@@ -4,6 +4,7 @@
 //! changing BOTH — users routinely change one, rebuild nothing, and chase a
 //! phantom PHP for an afternoon (laravel/sail#442 and friends).
 
+use mast_yaml_edit::{Edit, key};
 use saphyr::{LoadableYamlNode, Scalar, Yaml};
 
 use crate::network::mapping_get;
@@ -76,9 +77,63 @@ pub fn image_series(image: &str) -> Option<String> {
     (tail == "app" && series_like(series)).then(|| series.to_string())
 }
 
+/// Plan adding the `host.docker.internal:host-gateway` mapping to a service
+/// — what Sail's current stub ships and older published files lack, and
+/// without which Xdebug's default `client_host` resolves to nothing on
+/// Linux. Refuses when the service already has `extra_hosts` (merging into
+/// an existing list is the user's call, not a blind append).
+pub fn plan_add_host_gateway(
+    source: &str,
+    service: &str,
+) -> Result<(Vec<Edit>, Vec<String>), String> {
+    let docs = Yaml::load_from_str(source).map_err(|e| e.to_string())?;
+    let root = docs.first().ok_or("empty compose file")?;
+    let services = mapping_get(root, "services").ok_or("no services mapping in this file")?;
+    let svc = mapping_get(services, service)
+        .ok_or_else(|| format!("service \"{service}\" is not in this file"))?;
+    if mapping_get(svc, "extra_hosts").is_some() {
+        return Err(format!(
+            "service \"{service}\" already has extra_hosts — add \
+             'host.docker.internal:host-gateway' to that list yourself"
+        ));
+    }
+    Ok((
+        vec![Edit::InsertMapBlock {
+            path: vec![key("services"), key(service)],
+            key: "extra_hosts".to_string(),
+            lines: vec!["- 'host.docker.internal:host-gateway'".to_string()],
+        }],
+        vec![
+            format!("add to service {service}:"),
+            "  extra_hosts:".into(),
+            "    - 'host.docker.internal:host-gateway'".into(),
+        ],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_gateway_plan_inserts_and_refuses_existing() {
+        let source = "services:\n  laravel.test:\n    image: 'sail-8.4/app'\n    ports:\n      - '80:80'\n  redis:\n    image: 'redis:alpine'\n";
+        let (edits, summary) = plan_add_host_gateway(source, "laravel.test").unwrap();
+        let out = mast_yaml_edit::apply_all(source, &edits).unwrap();
+        assert!(
+            out.contains(
+                "    extra_hosts:\n      - 'host.docker.internal:host-gateway'"
+            ),
+            "{out}"
+        );
+        assert!(Yaml::load_from_str(&out).is_ok());
+        assert!(summary.iter().any(|s| s.contains("host-gateway")));
+
+        let already = out;
+        let err = plan_add_host_gateway(&already, "laravel.test").unwrap_err();
+        assert!(err.contains("already has extra_hosts"), "{err}");
+        assert!(plan_add_host_gateway(&already, "nope").unwrap_err().contains("not in this file"));
+    }
 
     #[test]
     fn builds_parse_both_forms_and_skip_imageless_pulls() {

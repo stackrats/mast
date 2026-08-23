@@ -2295,6 +2295,95 @@ async fn stale_vite_hot_file_is_found_and_removed_but_a_live_one_is_respected() 
     drop(live);
 }
 
+/// The Xdebug doctor: an old published compose file that never passes
+/// XDEBUG_MODE is the fatal first rung; once the mode flows, a missing
+/// host-gateway mapping on Linux is an Error with a one-click compose
+/// repair through the write transaction.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn xdebug_doctor_finds_missing_wiring_and_repairs_host_gateway() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("xdbg");
+    std::fs::create_dir_all(&project).unwrap();
+    // Sail-flavored via composer.json; compose file predates Xdebug wiring.
+    std::fs::write(
+        project.join("composer.json"),
+        r#"{"require-dev": {"laravel/sail": "^1.41"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "APP_SERVICE=laravel.test\nSAIL_XDEBUG_MODE=develop,debug\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "xdebug")
+        .expect("unwired XDEBUG_MODE must be found");
+    assert!(f.title.contains("never reaches the container"), "{}", f.title);
+
+    // The mode now flows, but the file still lacks the Linux host mapping.
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  laravel.test:\n    image: 'alpine:latest'\n    environment:\n      XDEBUG_MODE: '${SAIL_XDEBUG_MODE:-off}'\n",
+    )
+    .unwrap();
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "xdebug" && f.title.contains("client_host"))
+        .expect("missing host-gateway must be found");
+    let repair = f.repair.as_ref().unwrap();
+    assert_eq!(repair.id, "add-host-gateway");
+    assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
+
+    // Preview shows the exact insertion; apply lands it via the transaction.
+    let plan = engine
+        .repair_preview("add-host-gateway", Some("laravel.test"), Some(&pid))
+        .await
+        .unwrap();
+    let preview = plan.file_preview.expect("compose repair must show the diff");
+    assert!(preview.after.contains("host.docker.internal:host-gateway"), "{}", preview.after);
+    run_action(
+        &engine,
+        Action::ApplyRepair {
+            repair: "add-host-gateway".into(),
+            arg: Some("laravel.test".into()),
+            project: Some(pid.clone()),
+        },
+    )
+    .await;
+    let edited = std::fs::read_to_string(project.join("compose.yaml")).unwrap();
+    assert!(edited.contains("extra_hosts:"), "{edited}");
+    assert!(edited.contains("host.docker.internal:host-gateway"), "{edited}");
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.check == "xdebug" && f.title.contains("client_host")),
+        "{:?}",
+        report.findings
+    );
+}
+
 /// Sharing tunnels the RUNNING app; a stopped project is refused up front
 /// with the reason, not a dead tunnel.
 #[tokio::test(flavor = "multi_thread")]

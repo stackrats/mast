@@ -49,6 +49,7 @@ pub const REPAIR_CONFIG_CLEAR: &str = "config-clear";
 pub const REPAIR_CHOWN_STORAGE: &str = "chown-storage";
 pub const REPAIR_REMOVE_HOT: &str = "remove-hot-file";
 pub const REPAIR_NORMALIZE_ENV_EOL: &str = "normalize-env-eol";
+pub const REPAIR_ADD_HOST_GATEWAY: &str = "add-host-gateway";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -224,6 +225,30 @@ pub struct ProjectFacts {
     /// `.env` has CRLF line endings — sail sources it with bash, so every
     /// value grows an invisible `\r`.
     pub env_crlf: bool,
+    /// Xdebug facts, when `.env` requests a mode other than `off`.
+    pub xdebug: Option<XdebugFacts>,
+}
+
+/// Everything the Xdebug doctor needs, per project. Gathered only when
+/// SAIL_XDEBUG_MODE requests something.
+#[derive(Debug, Clone)]
+pub struct XdebugFacts {
+    pub env: mast_laravel::xdebug::XdebugEnv,
+    /// The compose service the app runs as (APP_SERVICE, default
+    /// laravel.test) — the repair's target.
+    pub app_service: String,
+    /// Some compose source passes XDEBUG_MODE into the container; a file
+    /// published before Sail's Xdebug wiring never does.
+    pub compose_passes_mode: bool,
+    /// Some compose source maps host.docker.internal to host-gateway —
+    /// required for the default client_host on Linux.
+    pub compose_has_host_gateway: bool,
+    /// Something listens on the debugger port on this machine (probed only
+    /// when step-debugging is requested); `None` = not probed.
+    pub ide_listening: Option<bool>,
+    /// `php -m` inside the running app container reports xdebug; `None`
+    /// when the container was not probeable.
+    pub extension_loaded: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +402,20 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           every value."
                 .into(),
             arg: None,
+        }),
+        REPAIR_ADD_HOST_GATEWAY => Some(RepairSpec {
+            id: REPAIR_ADD_HOST_GATEWAY,
+            title: match arg {
+                Some(service) => format!("Map host.docker.internal on \"{service}\""),
+                None => "Map host.docker.internal to the host".into(),
+            },
+            risk: RiskTier::Safe,
+            description: "Adds `extra_hosts: host.docker.internal:host-gateway` to the app \
+                          service through the compose write transaction — what Sail's \
+                          current stub ships and files published before it lack. Without \
+                          it, Xdebug's default client_host resolves to nothing on Linux."
+                .into(),
+            arg: arg.map(String::from),
         }),
         REPAIR_DB_RECONCILE => Some(RepairSpec {
             id: REPAIR_DB_RECONCILE,
