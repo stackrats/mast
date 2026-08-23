@@ -184,6 +184,8 @@ That unlocks the parts of development that plain `http://localhost` quietly brea
 
 Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before a polkit prompt runs it.
 
+<img src="docs/media/https.png" alt="Local HTTPS dialog with storefront.test enabled, the proxy's output, and Fix buttons for the /etc/hosts entry and certificate trust" width="460">
+
 ---
 
 ## Logs & captures
@@ -204,6 +206,8 @@ Captures are written to disk, so they survive both the container being replaced 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
 
 And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab.
+
+<img src="docs/media/app-log.png" alt="Application log dialog with level badges and an expanded SQL error showing its grouped stack trace" width="704">
 
 <img src="docs/media/captures.png" alt="Captures tab listing three containers that went down, the newest expanded to show its final log lines" width="900">
 
