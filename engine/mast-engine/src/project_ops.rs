@@ -717,6 +717,11 @@ impl Engine {
                 Ok(CommandOutcome::Cancelled) => OperationEventKind::Cancelled,
                 Err(e) => OperationEventKind::Failed { error: redactor.redact(&e) },
             };
+            // A failing verb owes its explanation (and Fix button, when a
+            // signature maps to a repair) before the terminal event.
+            if matches!(kind, OperationEventKind::Failed { .. }) {
+                engine.flush_signature_explanations(&handle, id, Some(&project));
+            }
             // Order matters: journal cleared and lock released BEFORE the
             // terminal event — once a client sees the terminal, dispatching a
             // follow-up verb must succeed.

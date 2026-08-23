@@ -48,7 +48,7 @@ fn risk_to_contract(r: RiskTier) -> RepairRisk {
     }
 }
 
-fn offer_to_contract(spec: RepairSpec) -> RepairOffer {
+pub(crate) fn offer_to_contract(spec: RepairSpec) -> RepairOffer {
     RepairOffer {
         id: spec.id.to_string(),
         title: spec.title,

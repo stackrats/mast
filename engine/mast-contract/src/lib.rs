@@ -863,6 +863,11 @@ pub enum OperationEventKind {
     Progress { percent: u8, message: String },
     /// One line of live subprocess output (compose/sail shell-outs).
     Output { line: String, stderr: bool },
+    /// A one-click repair that addresses a failure signature spotted in this
+    /// operation's output — emitted just before [`Self::Failed`], so a
+    /// failure can carry its own Fix button. Preview the repair before
+    /// applying; the preview says exactly what will change.
+    FixAvailable { repair: RepairOffer, project: ProjectId },
     Completed,
     Failed { error: String },
     Cancelled,

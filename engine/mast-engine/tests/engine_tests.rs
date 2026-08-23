@@ -2080,6 +2080,50 @@ async fn failing_operations_explain_known_error_signatures() {
         lines[cause + 1].starts_with("  fix:"),
         "advice must follow the cause: {lines:?}"
     );
+
+    // A signature that maps to a repair also emits a FixAvailable event —
+    // the failure carries its own Fix button, offer and project attached.
+    std::fs::write(
+        project.join("fail-like-a-port-clash.sh"),
+        "#!/bin/sh\necho 'Error starting userland proxy: bind: address already in use' >&2\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project.join("fail-like-a-port-clash.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "clash".into(),
+                command: "./fail-like-a-port-clash.sh".into(),
+                auto_start: false,
+            }],
+        },
+    )
+    .await;
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "clash".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let mut fix = None;
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::FixAvailable { repair, project } => fix = Some((repair, project)),
+            OperationEventKind::Failed { .. } => break,
+            OperationEventKind::Completed | OperationEventKind::Cancelled => break,
+            _ => {}
+        }
+    }
+    let (repair, fix_project) = fix.expect("port clash must carry a fix offer");
+    assert_eq!(repair.id, "reassign-ports");
+    assert_eq!(fix_project, pid);
 }
 
 /// The PHP switch: refuses series that are not vendored, rewrites build

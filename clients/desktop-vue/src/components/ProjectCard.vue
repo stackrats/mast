@@ -43,6 +43,7 @@ import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
 import Checkbox from "./ui/Checkbox.vue";
 import Chip from "./ui/Chip.vue";
+import FixButton from "./ui/FixButton.vue";
 import Hint from "./ui/Hint.vue";
 import Sparkline from "./ui/Sparkline.vue";
 import Tooltip from "./ui/Tooltip.vue";
@@ -720,6 +721,12 @@ async function addCommand() {
         >
           Share failed: {{ shareOp.error }}
         </p>
+        <FixButton
+          v-if="shareOp && shareOp.terminal === 'failed' && shareOp.fix"
+          :repair="shareOp.fix.repair"
+          :project="shareOp.fix.project"
+          @applied="store.dismissOperation(shareKey(project.id))"
+        />
       </div>
     </Modal>
 
@@ -775,17 +782,25 @@ async function addCommand() {
         <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700">cancelled</span>
         <span v-else class="text-red-700">failed: {{ op.error }}</span>
       </p>
-      <!-- A failure is only actionable if you can see what was run. -->
-      <Button
-        v-if="op.terminal === 'failed' && op.id >= 0"
-        variant="ghost"
-        size="sm"
-        class="-mx-2 mt-1"
-        @click="store.showOperationCommand(op.id)"
-      >
-        <ScrollText class="h-3.5 w-3.5" />
-        Show the command that failed
-      </Button>
+      <!-- A failure is only actionable if you can see what was run — and,
+           when the engine matched the failure to a repair, fixable in place. -->
+      <div v-if="op.terminal === 'failed'" class="mt-1 flex flex-wrap items-center gap-1">
+        <FixButton
+          v-if="op.fix"
+          :repair="op.fix.repair"
+          :project="op.fix.project"
+          @applied="store.dismissOperation(project.id)"
+        />
+        <Button
+          v-if="op.id >= 0"
+          variant="ghost"
+          size="sm"
+          @click="store.showOperationCommand(op.id)"
+        >
+          <ScrollText class="h-3.5 w-3.5" />
+          Show the command that failed
+        </Button>
+      </div>
     </div>
 
     <EnvPanel v-model:open="showEnv" :project="project.id" />
