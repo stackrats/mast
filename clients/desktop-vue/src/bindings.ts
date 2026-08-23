@@ -302,6 +302,11 @@ export type Action =
  */
 { type: "openInBrowser"; id: ProjectId } | 
 /**
+ * Open an http(s) URL Mast itself surfaced (share URL, tunnel
+ * dashboard) in the default browser. Non-http schemes are refused.
+ */
+{ type: "openUrl"; url: string } | 
+/**
  * Persist external-tool preferences.
  */
 { type: "setIntegrations"; integrations: IntegrationSettings } | 
@@ -776,6 +781,11 @@ php?: PhpVersionInfo | null;
  * None while not sharing.
  */
 shareUrl?: string | null; 
+/**
+ * The live tunnel's local dashboard (SAIL_SHARE_DASHBOARD, possibly
+ * auto-moved off a busy port); None while not sharing.
+ */
+shareDashboardUrl?: string | null; 
 /**
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …

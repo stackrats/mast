@@ -67,6 +67,7 @@ impl Engine {
                 ["docker", "rm", "-f", container.as_str()].map(String::from).into();
             let _ = run_command(&rm, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
             engine.set_share_url(&project.0, None);
+            engine.set_share_dashboard(&project.0, None);
             let kind = match result {
                 Ok(()) => OperationEventKind::Completed,
                 Err(_) if handle.cancel.is_cancelled() => {
@@ -97,6 +98,17 @@ impl Engine {
                 && entry.summary.share_url != url
             {
                 entry.summary.share_url = url;
+                events.push(PatchEvent::ProjectUpdated { project: entry.summary.clone() });
+            }
+        });
+    }
+
+    fn set_share_dashboard(&self, project: &str, url: Option<String>) {
+        self.with_state(|st, events| {
+            if let Some(entry) = st.projects.get_mut(project)
+                && entry.summary.share_dashboard_url != url
+            {
+                entry.summary.share_dashboard_url = url;
                 events.push(PatchEvent::ProjectUpdated { project: entry.summary.clone() });
             }
         });
@@ -186,6 +198,13 @@ impl Engine {
             );
             settings.dashboard_port = free.to_string();
         }
+
+        // The dashboard address is knowable the moment the port settles —
+        // surface it so the UI can offer a button, not a guess.
+        self.set_share_dashboard(
+            &project.0,
+            Some(format!("http://localhost:{}", settings.dashboard_port)),
+        );
 
         // A crashed previous share can leave the named container behind.
         let rm: Vec<String> = ["docker", "rm", "-f", container].map(String::from).into();
