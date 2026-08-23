@@ -911,7 +911,7 @@ impl Engine {
                     let summary = if no_op {
                         vec![".env already exists — nothing to do".to_string()]
                     } else {
-                        vec![format!("create .env as a copy of .env.example")]
+                        vec!["create .env as a copy of .env.example".to_string()]
                     };
                     Ok(RepairPlan {
                         repair: offer,
