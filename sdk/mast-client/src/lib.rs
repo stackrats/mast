@@ -6,7 +6,7 @@
 
 use futures::stream::BoxStream;
 use mast_contract::{
-    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport, ProxyCa,
+    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport, PhpRuntimeReport, ProxyCa,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
@@ -67,9 +67,10 @@ pub trait MastClient: Send + Sync {
     /// first). On demand only — log bodies routinely carry user data.
     async fn laravel_log(&self, project: ProjectId) -> Result<LaravelLogReport, ClientError>;
 
-    /// `php -m` inside the running app container — the extensions the
-    /// runtime actually loaded. Fails when the app service is not running.
-    async fn php_extensions(&self, project: ProjectId) -> Result<Vec<String>, ClientError>;
+    /// The PHP runtime as it actually is — extensions and common ini
+    /// limits from the running app container, plus where the vendored
+    /// runtime keeps the files that change them.
+    async fn php_runtime(&self, project: ProjectId) -> Result<PhpRuntimeReport, ClientError>;
 
     /// The local HTTPS proxy's root certificate, exported for manual trust
     /// (Firefox import, `curl --cacert`); None until a domain has been

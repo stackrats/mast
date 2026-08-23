@@ -39,6 +39,7 @@ import {
 
 import type {
   LaravelLogReport,
+  PhpRuntimeReport,
   ProjectCommand,
   ProjectSummary,
   ProxyCa,
@@ -47,7 +48,7 @@ import type {
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
-import { envReport, laravelLog, phpExtensions, proxyCa } from "../lib/transport";
+import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -105,7 +106,7 @@ function lifecycle(label: string, type: "startProject" | "stopProject" | "restar
 function serviceVerb(
   service: string,
   label: string,
-  type: "startService" | "stopService" | "restartService",
+  type: "startService" | "stopService" | "restartService" | "rebuildService",
 ) {
   void store.runLifecycle(project.id, `${label} ${service}`, {
     type,
@@ -469,21 +470,24 @@ async function addCommand() {
   }
 }
 
-// --- PHP extensions viewer: php -m from the LIVE container, because what
-// the runtime loaded beats what any Dockerfile promises ---
+// --- PHP runtime viewer: php -m and the classic ini limits from the LIVE
+// container, because what the runtime loaded beats what any file promises ---
 const extOpen = ref(false);
-const extList = ref<string[] | null>(null);
+const phpRt = ref<PhpRuntimeReport | null>(null);
 const extError = ref<string | null>(null);
 watch(extOpen, async (open) => {
   if (!open) return;
-  extList.value = null;
+  phpRt.value = null;
   extError.value = null;
   try {
-    extList.value = await phpExtensions(project.id);
+    phpRt.value = await phpRuntime(project.id);
   } catch (e) {
     extError.value = String(e);
   }
 });
+function editRuntimeFile(file: string) {
+  void store.run({ type: "openProjectFile", id: project.id, file });
+}
 
 // Two-step clear for the app log: first click arms, second truncates —
 // destructive enough for a pause, not enough for a whole modal.
@@ -1259,35 +1263,74 @@ async function clearAppLog() {
       </div>
     </Modal>
 
-    <!-- What php -m says inside the LIVE app container — the truth about
-         loaded extensions, as opposed to what a Dockerfile intends. -->
-    <Modal v-model:open="extOpen" title="PHP extensions">
+    <!-- What the LIVE app container says about itself — ini limits via
+         ini_get and extensions via php -m — with the vendored runtime's own
+         files one click from the editor, and a rebuild to apply them. -->
+    <Modal v-model:open="extOpen" title="PHP runtime" wide>
       <p v-if="extError" class="text-sm text-slate-500 dark:text-slate-400">
         {{ extError }}
       </p>
-      <p v-else-if="extList == null" class="text-sm text-slate-500 dark:text-slate-400">
-        Running php -m in the app container…
+      <p v-else-if="phpRt == null" class="text-sm text-slate-500 dark:text-slate-400">
+        Asking the app container…
       </p>
       <template v-else>
-        <p class="text-xs text-slate-500 dark:text-slate-400">
-          {{ extList.length }} extensions loaded in the running
-          <span class="font-mono">{{ project.php?.service ?? "app" }}</span> container:
+        <p class="text-xs font-medium text-slate-600 dark:text-slate-300">Limits</p>
+        <div class="mt-1.5 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+          <template v-for="row in phpRt.ini" :key="row.key">
+            <span class="font-mono text-slate-500 dark:text-slate-400">{{ row.key }}</span>
+            <span class="font-mono text-slate-900 dark:text-slate-100">
+              {{ row.value || "(not set)" }}
+            </span>
+          </template>
+        </div>
+        <p class="mt-4 text-xs font-medium text-slate-600 dark:text-slate-300">
+          Extensions ({{ phpRt.extensions.length }})
         </p>
-        <div class="mt-2 grid max-h-[45vh] grid-cols-3 gap-x-3 gap-y-1 overflow-y-auto">
+        <div class="mt-1.5 grid max-h-[32vh] grid-cols-4 gap-x-3 gap-y-1 overflow-y-auto">
           <span
-            v-for="ext in extList"
+            v-for="ext in phpRt.extensions"
             :key="ext"
             class="truncate font-mono text-xs text-slate-700 dark:text-slate-200"
           >
             {{ ext }}
           </span>
         </div>
-        <p class="mt-3 text-xs text-slate-400">
-          The set is baked into the
-          <span class="font-mono">sail-{{ project.php?.current }}/app</span> image when it builds.
-          To add one, edit the vendored runtime's Dockerfile (<span class="font-mono"
-            >docker/{{ project.php?.current }}/Dockerfile</span
-          >) and rebuild from the Runtimes row — a one-click installer is on the roadmap.
+        <div class="mt-4 flex flex-wrap items-center gap-2">
+          <Button
+            v-if="phpRt.iniFile"
+            variant="outline"
+            size="sm"
+            @click="editRuntimeFile(phpRt.iniFile)"
+          >
+            <Pencil class="h-3.5 w-3.5" /> Edit php.ini
+          </Button>
+          <Button
+            v-if="phpRt.dockerfile"
+            variant="outline"
+            size="sm"
+            @click="editRuntimeFile(phpRt.dockerfile)"
+          >
+            <Pencil class="h-3.5 w-3.5" /> Edit Dockerfile
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            :disabled="store.readOnly || opRunning || !project.php"
+            @click="
+              extOpen = false;
+              serviceVerb(project.php!.service, 'rebuild', 'rebuildService');
+            "
+          >
+            <RotateCw class="h-3.5 w-3.5" /> Rebuild to apply
+          </Button>
+        </div>
+        <p class="mt-2 text-xs text-slate-400">
+          Limits live in the runtime's <span class="font-mono">php.ini</span>; extensions are
+          installed by its <span class="font-mono">Dockerfile</span>. Both are copied into the
+          <span class="font-mono">sail-{{ project.php?.current }}/app</span> image when it builds,
+          so edits take effect after a rebuild of
+          <span class="font-mono">{{ project.php?.service ?? "the app service" }}</span
+          >.
         </p>
       </template>
     </Modal>

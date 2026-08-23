@@ -70,9 +70,9 @@ async proxyCa() : Promise<Result<ProxyCa | null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
-async phpExtensions(project: ProjectId) : Promise<Result<string[], string>> {
+async phpRuntime(project: ProjectId) : Promise<Result<PhpRuntimeReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("php_extensions", { project }) };
+    return { status: "ok", data: await TAURI_INVOKE("php_runtime", { project }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -453,6 +453,12 @@ export type Action =
  */
 { type: "revealPath"; path: string } | 
 /**
+ * Open one file inside a project in the configured editor — the
+ * vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
+ * dialog. `file` is project-relative and may not escape the project.
+ */
+{ type: "openProjectFile"; id: ProjectId; file: string } | 
+/**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
  * sail:install --php=…` — each run in the official composer image inside
@@ -794,6 +800,38 @@ export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } |
  * discard stragglers from a superseded subscription generation.
  */
 export type PatchStreamItem = { streamId: number; item: SubscriptionItem }
+/**
+ * One effective `php.ini` setting read from the running app container.
+ */
+export type PhpIniValue = { key: string; 
+/**
+ * As `ini_get` reports it; empty when the runtime has no value.
+ */
+value: string }
+/**
+ * What the PHP runtime actually is right now: loaded extensions and the
+ * common limits, read live from the app container — plus where the
+ * vendored runtime keeps the files that change them (paths relative to
+ * the project, present only when the files exist).
+ */
+export type PhpRuntimeReport = { 
+/**
+ * `php -m`, sorted, section headers dropped.
+ */
+extensions: string[]; 
+/**
+ * The classic limits (`memory_limit`, upload sizes, …), in a stable
+ * display order.
+ */
+ini: PhpIniValue[]; 
+/**
+ * The vendored runtime's `php.ini` (e.g. `docker/8.4/php.ini`).
+ */
+iniFile: string | null; 
+/**
+ * The vendored runtime's `Dockerfile` — where extensions are added.
+ */
+dockerfile: string | null }
 /**
  * The app's Sail PHP runtime: what `build.context` currently pins and which
  * vendored runtimes it could switch to (drives the PHP version picker).

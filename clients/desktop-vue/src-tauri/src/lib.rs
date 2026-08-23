@@ -14,7 +14,7 @@ use mast_client::MastClient;
 use mast_client_local::LocalClient;
 use mast_contract::{
     Action, CatalogEntry, CustomServiceSpec, DiagnosticReport, DiagnosticsHistory, EngineSnapshot,
-    EnvReport, LaravelLogReport, ProxyCa, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
+    EnvReport, LaravelLogReport, PhpRuntimeReport, ProxyCa, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
 };
@@ -138,11 +138,11 @@ async fn proxy_ca(state: State<'_, AppState>) -> Result<Option<ProxyCa>, String>
 
 #[tauri::command]
 #[specta::specta]
-async fn php_extensions(
+async fn php_runtime(
     state: State<'_, AppState>,
     project: ProjectId,
-) -> Result<Vec<String>, String> {
-    state.client.php_extensions(project).await.map_err(|e| e.to_string())
+) -> Result<PhpRuntimeReport, String> {
+    state.client.php_runtime(project).await.map_err(|e| e.to_string())
 }
 
 /// The effect-history backlog (M9): what Mast has run and written, oldest
@@ -388,7 +388,7 @@ fn specta_builder() -> tauri_specta::Builder {
             env_report,
             laravel_log,
             proxy_ca,
-            php_extensions,
+            php_runtime,
             network_attach_preview,
             list_snapshots,
             snapshot_report,

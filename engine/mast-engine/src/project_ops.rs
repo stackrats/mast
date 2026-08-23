@@ -891,12 +891,26 @@ fn capitalize(word: &str) -> String {
 
 /// Sail's own app-service selector: `.env` `APP_SERVICE`, default
 /// `laravel.test`.
+/// The classic limits everyone tunes, in display order.
+const PHP_INI_KEYS: [&str; 6] = [
+    "memory_limit",
+    "max_execution_time",
+    "upload_max_filesize",
+    "post_max_size",
+    "max_input_vars",
+    "opcache.enable",
+];
+
 impl crate::Engine {
-    /// `php -m` inside the running app container: the extensions the runtime
-    /// actually loaded, not what a Dockerfile promises. On demand from the
-    /// PHP chip; fails plainly when nothing is running to ask.
-    pub async fn php_extensions(&self, project: &ProjectId) -> Result<Vec<String>, ErrorInfo> {
-        let (path, container) = {
+    /// The PHP runtime as it actually is: `php -m` and the common limits via
+    /// `ini_get`, both from the RUNNING app container — what the runtime
+    /// loaded beats what any file promises — plus the vendored runtime files
+    /// that change them, for the dialog's edit buttons.
+    pub async fn php_runtime(
+        &self,
+        project: &ProjectId,
+    ) -> Result<mast_contract::PhpRuntimeReport, ErrorInfo> {
+        let (path, services) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -905,31 +919,41 @@ impl crate::Engine {
             (entry.record.path.clone(), entry.summary.services.clone())
         };
         let app = app_service_of(&path);
-        let container = container
+        let container = services
             .iter()
             .find(|s| s.name == app && s.state == Some(mast_contract::ContainerState::Running))
             .and_then(|s| s.container_id.clone())
             .ok_or_else(|| ErrorInfo::InvalidInput {
                 message: format!("{app} is not running — start the project first"),
             })?;
-        let argv: Vec<String> =
-            ["docker", "exec", container.as_str(), "php", "-m"].map(String::from).into();
-        let out = mast_docker::run_command(
-            &argv,
-            None,
-            &[],
-            crate::diagnostics::PROBE_TIMEOUT,
-            crate::diagnostics::PROBE_CAP,
-        )
-            .await
-            .map_err(crate::internal_err)?;
-        if !out.success() {
-            return Err(ErrorInfo::Internal {
-                message: format!("php -m failed: {}", out.stderr.trim()),
-            });
-        }
-        let mut extensions: Vec<String> = out
-            .stdout
+
+        let exec = |tail: Vec<String>| {
+            let container = container.clone();
+            async move {
+                let mut argv: Vec<String> =
+                    ["docker", "exec", container.as_str()].map(String::from).into();
+                let label = tail.join(" ");
+                argv.extend(tail);
+                let out = mast_docker::run_command(
+                    &argv,
+                    None,
+                    &[],
+                    crate::diagnostics::PROBE_TIMEOUT,
+                    crate::diagnostics::PROBE_CAP,
+                )
+                .await
+                .map_err(crate::internal_err)?;
+                if !out.success() {
+                    return Err(ErrorInfo::Internal {
+                        message: format!("{label} failed: {}", out.stderr.trim()),
+                    });
+                }
+                Ok(out.stdout)
+            }
+        };
+
+        let modules = exec(["php", "-m"].map(String::from).into()).await?;
+        let mut extensions: Vec<String> = modules
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('['))
@@ -937,7 +961,38 @@ impl crate::Engine {
             .collect();
         extensions.sort_by_key(|e| e.to_ascii_lowercase());
         extensions.dedup();
-        Ok(extensions)
+
+        let script = format!(
+            "foreach ([{}] as $k) echo $k, '=', ini_get($k), PHP_EOL;",
+            PHP_INI_KEYS.map(|k| format!("'{k}'")).join(",")
+        );
+        let raw =
+            exec(vec!["php".into(), "-r".into(), script]).await?;
+        let reported: std::collections::HashMap<&str, &str> =
+            raw.lines().filter_map(|l| l.split_once('=')).collect();
+        // Fixed order from the key list, not hash order — the dialog reads
+        // top-down the same way every time.
+        let ini = PHP_INI_KEYS
+            .iter()
+            .map(|key| mast_contract::PhpIniValue {
+                key: (*key).to_string(),
+                value: reported.get(key).unwrap_or(&"").trim().to_string(),
+            })
+            .collect();
+
+        // The vendored runtime's own files, when the standard layout holds —
+        // the dialog's edit buttons point straight at them.
+        let runtime_file = |name: &str| {
+            crate::php::runtime_context(&path)
+                .map(|context| format!("{}/{name}", context.trim_end_matches('/')))
+                .filter(|rel| path.join(rel).is_file())
+        };
+        Ok(mast_contract::PhpRuntimeReport {
+            extensions,
+            ini,
+            ini_file: runtime_file("php.ini"),
+            dockerfile: runtime_file("Dockerfile"),
+        })
     }
 }
 
