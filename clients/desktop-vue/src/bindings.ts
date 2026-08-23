@@ -843,7 +843,18 @@ export type ServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy"
  * One compose service of a project: declared by the resolved model and/or
  * observed as a container. `container_id == None` means declared-but-absent.
  */
-export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth }
+export type ServiceState = { name: string; containerId: string | null; state: ContainerState | null; health: ServiceHealth; 
+/**
+ * Host-reachable address of this service's web dashboard (Mailpit,
+ * Meilisearch, MinIO console, …) when the image is recognized and the
+ * container port is published — powers "Open UI" on the service chip.
+ */
+uiUrl?: string | null; 
+/**
+ * Host-side port of a recognized database service — what a GUI client
+ * on the host connects to (with the credentials from `.env`).
+ */
+dbPort?: number | null }
 /**
  * One service's share of the machine, over one sampling interval.
  */

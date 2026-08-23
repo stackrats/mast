@@ -671,6 +671,35 @@ fn observation_belongs_to(observation: &ContainerObservation, project_dir: &str)
 }
 
 /// Union of declared services (resolved model) and observed containers.
+/// Host-side dashboard URL and database port for a declared service, when
+/// the image is recognized and the container-side convention port is
+/// actually published. The mapping comes from `port_targets`, so a moved
+/// FORWARD_* port still lands on the right address.
+fn service_host_endpoints(
+    declared: &mast_compose::ResolvedService,
+) -> (Option<String>, Option<u16>) {
+    let Some(image) = declared.image.as_deref() else {
+        return (None, None);
+    };
+    let host_for = |container: u16| {
+        declared
+            .port_targets
+            .iter()
+            .find(|(_, target)| *target == container)
+            .map(|(host, _)| *host)
+    };
+    let ui_url = mast_compose::catalog::ui_port_for_image(image)
+        .and_then(host_for)
+        .map(|port| format!("http://localhost:{port}"));
+    let db_port = mast_laravel::db::db_image_series(image)
+        .map(|(kind, _)| match kind {
+            mast_laravel::db::DbKind::Pgsql => 5432,
+            _ => 3306,
+        })
+        .and_then(host_for);
+    (ui_url, db_port)
+}
+
 fn build_services(
     model: Option<&mast_compose::ResolvedModel>,
     observed: &[&ContainerObservation],
@@ -678,11 +707,14 @@ fn build_services(
     let mut services: Vec<ServiceState> = Vec::new();
     if let Some(model) = model {
         for declared in &model.services {
+            let (ui_url, db_port) = service_host_endpoints(declared);
             services.push(ServiceState {
                 name: declared.name.clone(),
                 container_id: None,
                 state: None,
                 health: mast_contract::ServiceHealth::Unknown,
+                ui_url,
+                db_port,
             });
         }
     }
@@ -699,6 +731,8 @@ fn build_services(
                 container_id: Some(container.id.clone()),
                 state,
                 health,
+                ui_url: None,
+                db_port: None,
             });
         }
     }
@@ -721,6 +755,7 @@ mod tests {
                     aliases: Vec::new(),
                     published_ports: ports.to_vec(),
                     volumes: Vec::new(),
+                    port_targets: Vec::new(),
                 })
                 .collect(),
             external_networks: Vec::new(),

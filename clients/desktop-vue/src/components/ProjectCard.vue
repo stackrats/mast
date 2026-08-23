@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Copy,
   Cpu,
+  Database,
   FileCog,
   Globe,
   Plus,
@@ -191,6 +192,49 @@ function startShare() {
 function stopShare() {
   void store.cancelLifecycle(shareKey(project.id));
 }
+// --- DB connection card: host/port from the resolved model, credentials
+// from .env — everything a GUI client asks for, without grepping compose
+// files. Fetched on open so it is never stale. ---
+const connService = ref<ServiceState | null>(null);
+const connOpen = computed({
+  get: () => connService.value != null,
+  set: (open: boolean) => {
+    if (!open) connService.value = null;
+  },
+});
+const connRows = ref<{ label: string; value: string; mask?: boolean }[] | null>(null);
+const connUri = ref<string | null>(null);
+const connCopied = ref<string | null>(null);
+watch(connService, async (service) => {
+  if (!service || service.dbPort == null) return;
+  connRows.value = null;
+  connUri.value = null;
+  try {
+    const report = await envReport(project.id);
+    const env = (key: string) => report.entries.find((e) => e.key === key)?.value?.trim() || null;
+    const port = String(service.dbPort);
+    const database = env("DB_DATABASE") ?? "laravel";
+    const username = env("DB_USERNAME") ?? "sail";
+    const password = env("DB_PASSWORD") ?? "password";
+    connRows.value = [
+      { label: "Host", value: "127.0.0.1" },
+      { label: "Port", value: port },
+      { label: "Database", value: database },
+      { label: "Username", value: username },
+      { label: "Password", value: password, mask: true },
+    ];
+    const scheme = env("DB_CONNECTION") === "pgsql" ? "postgresql" : "mysql";
+    connUri.value = `${scheme}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@127.0.0.1:${port}/${database}`;
+  } catch {
+    connRows.value = [];
+  }
+});
+async function copyConn(label: string, value: string) {
+  await navigator.clipboard.writeText(value);
+  connCopied.value = label;
+  setTimeout(() => (connCopied.value = null), 1500);
+}
+
 async function copyShareUrl() {
   if (!project.shareUrl) return;
   await navigator.clipboard.writeText(project.shareUrl);
@@ -503,7 +547,7 @@ async function addCommand() {
       <div class="flex items-center gap-1.5">
         <p :class="rowLabelClass">Services</p>
         <Hint
-          text="The containers this project is made of, colored by live state (green running, amber starting, red unhealthy). Click a chip for its logs, an in-container shell, and start/stop/restart of just that service."
+          text="The containers this project is made of, colored by live state (green running, amber starting, red unhealthy). Click a chip for its logs, an in-container shell, start/stop/restart — and Open UI or connection details when the service has them."
         />
       </div>
       <div class="mt-1.5 flex flex-wrap gap-2">
@@ -516,6 +560,25 @@ async function addCommand() {
           </DropdownMenuTrigger>
           <DropdownMenuPortal>
             <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+              <DropdownMenuItem
+                v-if="service.uiUrl"
+                :class="menuItemClass"
+                :disabled="service.state !== 'running'"
+                @select="store.run({ type: 'openUrl', url: service.uiUrl })"
+              >
+                <Globe class="h-3.5 w-3.5 text-slate-400" /> Open UI
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                v-if="service.dbPort != null"
+                :class="menuItemClass"
+                @select="connService = service"
+              >
+                <Database class="h-3.5 w-3.5 text-slate-400" /> Connection info
+              </DropdownMenuItem>
+              <DropdownMenuSeparator
+                v-if="service.uiUrl || service.dbPort != null"
+                :class="menuSeparatorClass"
+              />
               <DropdownMenuItem
                 :class="menuItemClass"
                 :disabled="service.containerId == null"
@@ -920,6 +983,55 @@ async function addCommand() {
           @applied="store.dismissOperation(shareKey(project.id))"
         />
       </div>
+    </Modal>
+
+    <!-- Everything a database GUI asks for, in the copy-icon rhythm of the
+         share settings — plus the host-vs-container caveat, because pointing
+         .env at 127.0.0.1 is the classic follow-up mistake. -->
+    <Modal v-model:open="connOpen" :title="`Connect to ${connService?.name ?? 'database'}`">
+      <p v-if="connRows == null" class="text-sm text-slate-500 dark:text-slate-400">
+        Reading .env…
+      </p>
+      <template v-else>
+        <div class="grid grid-cols-[auto_1fr] items-baseline gap-x-4 gap-y-1.5 text-sm">
+          <template v-for="row in connRows" :key="row.label">
+            <span class="text-slate-500 dark:text-slate-400">{{ row.label }}</span>
+            <span
+              class="flex min-w-0 items-baseline gap-1.5 font-mono text-slate-900 dark:text-slate-100"
+            >
+              <span class="truncate">{{ row.mask ? "••••••••" : row.value }}</span>
+              <Tooltip :text="`Copy the ${row.label.toLowerCase()}.`">
+                <button
+                  :class="['shrink-0', iconButtonClass]"
+                  @click="copyConn(row.label, row.value)"
+                >
+                  <Check v-if="connCopied === row.label" class="h-3.5 w-3.5 text-emerald-600" />
+                  <Copy v-else class="h-3.5 w-3.5" />
+                </button>
+              </Tooltip>
+            </span>
+          </template>
+        </div>
+        <div v-if="connUri" class="mt-3 border-t border-slate-200 pt-3 dark:border-slate-700">
+          <p class="text-xs text-slate-500 dark:text-slate-400">Connection URL:</p>
+          <p
+            class="mt-1 flex items-baseline gap-1.5 font-mono text-xs break-all select-all text-slate-900 dark:text-slate-100"
+          >
+            {{ connUri.replace(/:[^/@:]*@/, ":••••@") }}
+            <Tooltip text="Copy the URL (with the real password).">
+              <button :class="['shrink-0', iconButtonClass]" @click="copyConn('URL', connUri)">
+                <Check v-if="connCopied === 'URL'" class="h-3.5 w-3.5 text-emerald-600" />
+                <Copy v-else class="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
+          </p>
+        </div>
+        <p class="mt-3 text-xs text-slate-400">
+          These are for programs on this machine — TablePlus, DBeaver, artisan run outside Sail.
+          Inside the containers the app keeps using the service hostname; don't point
+          <span class="font-mono">DB_HOST</span> at 127.0.0.1.
+        </p>
+      </template>
     </Modal>
 
     <Modal v-model:open="phpConfirmOpen" title="Switch PHP version">
