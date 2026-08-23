@@ -4,10 +4,10 @@
 
 use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
-    REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY,
-    REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
-    REPAIR_STORAGE_LINK,
+    REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR, REPAIR_COPY_ENV_EXAMPLE,
+    REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
+    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -645,6 +645,83 @@ impl Check for ConfigCache {
     }
 }
 
+/// Containers running a configuration the files no longer describe. The
+/// classic ".env edits do nothing" trap (Sail closed it as an edge case):
+/// compose injects env at container CREATION, so `restart` keeps the old
+/// values forever. The compose config-hash label makes this exact — only
+/// services whose resolved config actually changed are named.
+struct ConfigDrift;
+impl Check for ConfigDrift {
+    fn id(&self) -> &'static str {
+        "config-drift"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.drifted_services.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| !p.drifted_services.is_empty())
+            .map(|p| {
+                for_project(
+                    finding(
+                        self.id(),
+                        Severity::Warning,
+                        format!(
+                            "{}: running containers are behind the configuration",
+                            p.name
+                        ),
+                        format!(
+                            "{} started under an older configuration — compose only \
+                             applies .env and file changes when a container is created, \
+                             so a plain restart changes nothing. Press Start (compose \
+                             `up -d`): it recreates exactly the drifted services.",
+                            p.drifted_services.join(", ")
+                        ),
+                    ),
+                    p,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Files under storage/ or bootstrap/cache owned by someone else — root
+/// from a sudo'd installer, 1337 from a container that ran without WWWUSER
+/// mapping. The cure for Sail's most-commented issue ever (#81), whose
+/// top-voted answer is a manual chown; wwwuser-parity prevents NEW damage,
+/// this repairs the existing kind.
+struct StorageOwnership;
+impl Check for StorageOwnership {
+    fn id(&self) -> &'static str {
+        "storage-ownership"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.foreign_owned.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| p.foreign_owned.as_ref().map(|f| (p, f)))
+            .map(|(p, (count, example, uid))| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: {} storage file(s) owned by another user", p.name, count),
+                    format!(
+                        "e.g. {example} is owned by uid {uid}. Laravel will fail with \
+                         \"laravel.log could not be opened: Permission denied\", and your \
+                         editor cannot save these files. Typical causes: an installer run \
+                         with sudo, or a container that started without WWWUSER mapping."
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_CHOWN_STORAGE, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// PHP runtime coherence for Sail-shaped builds. Two traps from the tracker:
 /// a Sail update removes the runtime a committed compose file still builds
 /// from (PHP 7.4/8.0 removals), and a half-done version switch — context
@@ -1032,6 +1109,8 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(ConfigCache),
         Box::new(ComposeQuirks),
         Box::new(PhpRuntime),
+        Box::new(StorageOwnership),
+        Box::new(ConfigDrift),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1110,6 +1189,8 @@ mod tests {
             dotted_services: Vec::new(),
             sail_builds: Vec::new(),
             available_runtimes: Vec::new(),
+            foreign_owned: None,
+            drifted_services: Vec::new(),
         }
     }
 
@@ -1313,6 +1394,31 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn drifted_containers_warn_naming_only_the_stale_services() {
+        let mut p = sail_project("a");
+        p.drifted_services = vec!["laravel.test".into(), "mysql".into()];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "config-drift").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.detail.contains("laravel.test, mysql"), "{}", f.detail);
+        assert!(f.detail.contains("restart changes nothing"), "{}", f.detail);
+        assert!(f.repair.is_none(), "the Start button is the repair");
+    }
+
+    #[test]
+    fn foreign_owned_storage_warns_with_the_containerized_chown() {
+        let mut p = sail_project("a");
+        p.foreign_owned = Some((17, "storage/logs/laravel.log".into(), 0));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "storage-ownership").unwrap();
+        assert!(f.title.contains("17 storage file(s)"), "{}", f.title);
+        assert!(f.detail.contains("uid 0"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_CHOWN_STORAGE);
+        assert_eq!(repair.risk, RiskTier::Caution);
     }
 
     #[test]
