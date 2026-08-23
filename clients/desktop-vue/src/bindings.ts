@@ -718,7 +718,12 @@ current: string;
 /**
  * Series available under `vendor/laravel/sail/runtimes/`.
  */
-available: string[] }
+available: string[]; 
+/**
+ * Node major the runtime's Dockerfile pins (`ARG NODE_VERSION=…`);
+ * None when the Dockerfile is absent or carries no pin.
+ */
+node?: string | null }
 /**
  * A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
  * long-running artisan command inside the app container. Detected from

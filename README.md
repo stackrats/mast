@@ -166,11 +166,11 @@ These processes remain attached to the project they belong to rather than disapp
 
 ## Share your site publicly
 
-`sail share` as a button: publish the running app at a temporary public URL through Sail's own expose tunnel.
+`sail share`, as a button. Publish the running app at a temporary public URL, scan the QR code to open it on your phone, and keep the tunnel's own output in view — the place where share problems actually explain themselves.
 
-The URL arrives with a QR code for opening it on a phone, and the tunnel's output stays visible in the dialog — the place where share problems actually explain themselves.
+Mast shows exactly what will be shared before anything starts, warns when a Vite dev server would break the shared page's assets, picks a free dashboard port instead of dying on a busy one, and reliably stops the tunnel when you do.
 
-Before the link goes out, Mast warns if a Vite dev server (or its leftover `public/hot` file) would break the shared page's assets — the classic "CORS errors through the tunnel" mystery. A busy dashboard port is skipped automatically instead of killing the share, and stopping the share reliably stops the tunnel container.
+<img src="docs/media/share.png" alt="Share dialog with the public URL, a QR code, Open and Dashboard buttons, and the tunnel output" width="710">
 
 ---
 
@@ -233,17 +233,16 @@ Mast checks for common problems and presents each finding with a guided repair.
 
 Every repair has a risk tier and a preview of what Mast intends to change before anything is written.
 
-The checks reach the places Sail's own issue tracker says people actually get stuck:
+The checks go after the problems that actually eat afternoons:
 
-- **Database credentials that stopped matching the volume** — the "Access denied for user 'sail'" trap, where editing `.env` changes nothing because the database only reads it on first creation. Mast reconciles the live server as an administrator without touching data, or recreates the volume with explicit consent.
-- **A database image bumped past its data.** Retagging a database is refused when the container would crash-loop on its existing volume, and warned when the data will upgrade in place.
-- **Containers running an older configuration than your files** — the ".env edits do nothing until a recreate" trap, detected per service through compose's own config hash.
-- **A stale Vite `public/hot` file** — pages load without CSS/JS and `npm run build` changes nothing until it's gone.
-- **Xdebug that never connects**, with the actual broken rung named: a compose file that never passes the mode through, the missing `host.docker.internal` mapping on Linux (one-click fix), a runtime without the extension, or simply no IDE listening.
-- **MailHog left over** from before Sail switched to Mailpit — migrated in one transaction, `.env` included.
-- Storage files owned by root, CRLF line endings in `.env`, a missing `APP_KEY`, an unlinked public disk, cached configuration, known-bad Docker/Compose versions, and more.
+- Database says _Access denied_ after you changed `.env`? Mast fixes the live server without touching your data.
+- Bumped a database version its data can't follow? Mast refuses the change that would crash-loop, and explains the safe path.
+- Edited `.env` and nothing happened? Mast points at the cached config, or the exact containers that need recreating.
+- Breakpoints never hit? The Xdebug check names which link in the chain is broken — one of them is a one-click fix.
+- Pages suddenly have no CSS and rebuilding changes nothing? A leftover Vite dev-server file, deleted in one click.
+- Still on MailHog, or files in `storage/` owned by root? One step each.
 
-When an operation fails, its output runs through the same knowledge: known failure shapes end with a plain-language _likely cause / fix_, and where a one-click repair applies, the failure carries its own **Fix** button — previewed before anything changes.
+And when an operation fails, Mast reads the output for known failure shapes and says what likely went wrong and how to fix it — where a repair applies, the failure carries its own **Fix** button, previewed before anything changes.
 
 <img src="docs/media/diagnostics.png" alt="Diagnostics dialog listing errors with repair actions" width="900">
 
