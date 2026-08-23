@@ -577,6 +577,29 @@ pub fn plan_service_remove(source: &str, service: &str) -> Result<CatalogPlan, S
 }
 
 
+/// One-click MailHog → Mailpit migration: remove the MailHog service exactly
+/// as it stands (no three-way baseline — Mast never added it) and add the
+/// catalog's Mailpit in the same transaction. Sail swapped the stub in 2023
+/// and upstream MailHog is abandoned; projects published before the swap
+/// keep silently rotting.
+pub fn plan_mailpit_migration(source: &str, mailhog_service: &str) -> Result<CatalogPlan, String> {
+    let mailpit = catalog_def("mailpit").expect("mailpit is a catalog entry");
+    let remove = plan_service_remove(source, mailhog_service)?;
+    let add = plan_catalog_add(source, mailpit).map_err(|e| {
+        format!("cannot add mailpit: {e} — remove \"{mailhog_service}\" from its service menu instead")
+    })?;
+    // Sequential application: the removal lands first, then the insert
+    // re-locates against the edited text (self-verifying splices).
+    let mut edits = remove.edits;
+    edits.extend(add.edits);
+    let mut summary = vec![format!(
+        "replace service {mailhog_service} (MailHog, abandoned upstream) with mailpit"
+    )];
+    summary.extend(add.summary.into_iter().filter(|s| !s.starts_with("add service")));
+    summary.push("dashboard moves from port 8025 (same default) — MAIL_* in .env updated".into());
+    Ok(CatalogPlan { edits, summary })
+}
+
 fn push_volume_edits<S: AsRef<str>>(
     root: &Yaml,
     volumes: &[S],
@@ -823,6 +846,28 @@ mod tests {
         assert!(plan_service_remove(doc, "missing").unwrap_err().contains("not in this file"));
         let only = "services:\n  app:\n    image: alpine\n";
         assert!(plan_service_remove(only, "app").unwrap_err().contains("last service"));
+    }
+
+    #[test]
+    fn mailhog_migrates_to_mailpit_in_one_plan() {
+        let doc = "services:\n  laravel.test:\n    image: sail-8.4/app\n    networks:\n      - sail\n  mailhog:\n    image: 'mailhog/mailhog:latest'\n    ports:\n      - '${FORWARD_MAILHOG_PORT:-1025}:1025'\n      - '${FORWARD_MAILHOG_DASHBOARD_PORT:-8025}:8025'\nnetworks:\n  sail:\n    driver: bridge\n";
+        let plan = plan_mailpit_migration(doc, "mailhog").unwrap();
+        let out = apply_all(doc, &plan.edits).unwrap();
+        assert!(!out.contains("mailhog"), "{out}");
+        assert!(out.contains("  mailpit:\n    image: 'axllent/mailpit:latest'"), "{out}");
+        assert!(out.contains("    networks:\n      - sail"), "mailpit joins the sail network");
+        assert!(Yaml::load_from_str(&out).is_ok());
+        assert!(plan.summary.iter().any(|s| s.contains("MAIL_HOST=mailpit")), "{:?}", plan.summary);
+
+        // Mailpit already present: refuse with a pointer, don't half-migrate.
+        let both = format!("{doc}  mailpit:\n    image: 'axllent/mailpit:latest'\n");
+        // (append under networks would be invalid yaml — rebuild properly)
+        let both = both.replace(
+            "networks:\n  sail:\n    driver: bridge\n  mailpit:",
+            "  mailpit:",
+        );
+        let err = plan_mailpit_migration(&both, "mailhog");
+        assert!(err.is_err());
     }
 
     #[test]

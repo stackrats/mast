@@ -16,8 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
-    REPAIR_ADD_HOST_GATEWAY, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -290,6 +290,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
                 .map(|bytes| bytes.windows(2).any(|w| w == b"\r\n"))
                 .unwrap_or(false),
         xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
+        service_images: Vec::new(), // filled from the resolved model in gather
     };
     (facts, db_target)
 }
@@ -605,6 +606,19 @@ impl Engine {
         })
         .await
         .unwrap_or_default();
+
+        // Service images from the resolved model (needs no docker) — feeds
+        // the stub-drift check.
+        for meta in &db_metas {
+            if let Some((facts, _)) = inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+            {
+                facts.service_images = meta
+                    .services
+                    .iter()
+                    .map(|(service, image, _)| (service.clone(), image.clone()))
+                    .collect();
+            }
+        }
 
         // Live credential probes — only where there is something to probe:
         // a running project whose DB_HOST names a service in its model.
@@ -1038,6 +1052,36 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_MIGRATE_MAILPIT => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "migrate-mailpit needs the MailHog service name".into(),
+                    })?
+                    .to_string();
+                let (_invocation, file) = self.catalog_context(project)?;
+                tokio::task::spawn_blocking(move || {
+                    let before = std::fs::read_to_string(&file).map_err(crate::internal_err)?;
+                    let plan = mast_compose::catalog::plan_mailpit_migration(&before, &service)
+                        .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                    let after = mast_yaml_edit::apply_all(&before, &plan.edits)
+                        .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: file.to_string_lossy().into_owned(),
+                            before,
+                            after,
+                            summary: plan.summary.clone(),
+                            no_op: false,
+                        }),
+                        summary: plan.summary,
+                        no_op: false,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_ADD_HOST_GATEWAY => {
                 let project = self.require_project(project)?;
                 let service = arg
@@ -1414,6 +1458,67 @@ impl Engine {
                     op,
                     OperationEventKind::Output {
                         line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_MIGRATE_MAILPIT => {
+                let project = self.require_project(project)?;
+                let service = arg
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "migrate-mailpit needs the MailHog service name".into(),
+                    })?
+                    .to_string();
+                let (invocation, file) = self.catalog_context(project)?;
+                let source = tokio::task::spawn_blocking({
+                    let file = file.clone();
+                    move || std::fs::read_to_string(file)
+                })
+                .await
+                .map_err(crate::internal_err)?
+                .map_err(crate::internal_err)?;
+                let plan = mast_compose::catalog::plan_mailpit_migration(&source, &service)
+                    .map_err(|message| ErrorInfo::InvalidInput { message })?;
+                self.write_compose(&invocation, &file, &plan.edits, plan.summary.clone()).await?;
+                for line in &plan.summary {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output { line: line.clone(), stderr: false },
+                    );
+                }
+                // Same .env updates a catalog mailpit add applies.
+                let mailpit = mast_compose::catalog::catalog_def("mailpit")
+                    .expect("mailpit is a catalog entry");
+                let env_path = invocation.project_dir.join(".env");
+                if env_path.is_file() {
+                    let backups = self.inner.deps.store.backups_dir();
+                    let sets: Vec<(String, String)> = mailpit
+                        .env_sets
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    tokio::task::spawn_blocking(move || {
+                        mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
+                            for (k, v) in &sets {
+                                f.set(k, v)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .map_err(crate::internal_err)?
+                    .map_err(crate::env_write_error)?;
+                }
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "MailHog replaced with Mailpit — Start recreates the stack with \
+                               the new mailbox (dashboard on port 8025)"
+                            .into(),
                         stderr: false,
                     },
                 );

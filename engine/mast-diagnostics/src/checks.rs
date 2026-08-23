@@ -6,9 +6,9 @@ use crate::{
     repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
-    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_NORMALIZE_ENV_EOL,
-    REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER,
-    REPAIR_STORAGE_LINK,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
+    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -643,6 +643,69 @@ impl Check for ConfigCache {
                 for_project(f, p)
             })
             .collect()
+    }
+}
+
+/// Same semantics as `mast_compose::catalog::image_matches`, duplicated
+/// here because this crate deliberately carries no compose dependency (the
+/// check set stays pure over gathered facts): strip the tag (not a registry
+/// port), then match the stem exactly or as a path suffix.
+fn image_stem_matches(image: &str, stem: &str) -> bool {
+    let name = match image.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => name,
+        _ => image,
+    };
+    name == stem || name.ends_with(&format!("/{stem}"))
+}
+
+/// Stub rot: services still running what Sail shipped years ago and has
+/// since replaced. The compose file is generated once and never migrated,
+/// so projects quietly diverge from every current doc and fix.
+struct StubDrift;
+impl Check for StubDrift {
+    fn id(&self) -> &'static str {
+        "stub-drift"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.service_images.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for p in &ctx.projects {
+            for (service, image) in &p.service_images {
+                if image_stem_matches(image, "mailhog/mailhog") || image_stem_matches(image, "mailhog")
+                {
+                    let mut f = finding(
+                        self.id(),
+                        Severity::Warning,
+                        format!("{}: \"{service}\" still runs MailHog", p.name),
+                        "Sail replaced MailHog with Mailpit in 2023 and upstream MailHog is \
+                         abandoned — current docs, env keys and fixes all assume Mailpit.",
+                    );
+                    f.repair = repair_spec(REPAIR_MIGRATE_MAILPIT, Some(service));
+                    findings.push(for_project(f, p));
+                } else if image_stem_matches(image, "mysql/mysql-server") {
+                    findings.push(for_project(
+                        finding(
+                            self.id(),
+                            Severity::Warning,
+                            format!(
+                                "{}: \"{service}\" runs the abandoned mysql/mysql-server image",
+                                p.name
+                            ),
+                            format!(
+                                "Oracle stopped publishing mysql/mysql-server; current Sail \
+                                 uses mysql:8.4. Retag \"{service}\" to mysql:8.4 from the \
+                                 Services card — the volume guard will walk the data \
+                                 upgrade ({image} today)."
+                            ),
+                        ),
+                        p,
+                    ));
+                }
+            }
+        }
+        findings
     }
 }
 
@@ -1308,6 +1371,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(EnvLineEndings),
         Box::new(DockerDesktopLinux),
         Box::new(Xdebug),
+        Box::new(StubDrift),
         Box::new(WwwUserParity),
         Box::new(EnvValidation),
         Box::new(PortConflicts),
@@ -1392,6 +1456,7 @@ mod tests {
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
+            service_images: Vec::new(),
         }
     }
 
@@ -1610,6 +1675,26 @@ mod tests {
         q.is_laravel = false;
         let (_, findings) = run_all(&ctx(vec![q]));
         assert!(!findings.iter().any(|f| f.check == "config-cache"));
+    }
+
+    #[test]
+    fn stub_drift_flags_mailhog_with_migration_and_dead_mysql_repo() {
+        let mut p = sail_project("a");
+        p.service_images = vec![
+            ("mailhog".into(), "mailhog/mailhog:latest".into()),
+            ("mysql".into(), "mysql/mysql-server:8.0".into()),
+            ("redis".into(), "redis:alpine".into()),
+        ];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let drift: Vec<_> = findings.iter().filter(|f| f.check == "stub-drift").collect();
+        assert_eq!(drift.len(), 2, "{drift:?}");
+        let mailhog = drift.iter().find(|f| f.title.contains("MailHog")).unwrap();
+        let repair = mailhog.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_MIGRATE_MAILPIT);
+        assert_eq!(repair.arg.as_deref(), Some("mailhog"));
+        let mysql = drift.iter().find(|f| f.title.contains("mysql-server")).unwrap();
+        assert!(mysql.repair.is_none(), "retag flow owns the fix");
+        assert!(mysql.detail.contains("mysql:8.4"), "{}", mysql.detail);
     }
 
     #[test]
