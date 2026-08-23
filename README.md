@@ -39,13 +39,16 @@ Mast gives your existing Sail projects a single control center.
 - See every project and its current state at a glance.
 - Start complete development workspaces in dependency order.
 - Start, stop, and restart individual projects or services.
+- Serve every project at a trusted `https://myapp.test` address — no more port juggling.
 - View live logs without hunting through terminal tabs.
 - Keep a container's last words when it dies, so the reason outlives the restart.
+- Read the application log parsed — each error with its stack trace as one entry.
 - See what each project costs in CPU and memory, and what to stop.
 - Run Horizon, Reverb, queue workers, and project commands automatically.
-- Diagnose and repair common local environment problems.
+- Diagnose and repair common local environment problems, with Fix buttons on failures.
 - Share your running app at a temporary public URL — QR code included.
-- Switch PHP versions as a single, verified operation.
+- Switch PHP and Node versions as single, verified operations.
+- Copy database credentials and open service dashboards straight from their chips.
 - Manage services and environment variables without leaving Mast.
 
 ### Mast doesn't replace Sail
