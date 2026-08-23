@@ -226,6 +226,14 @@ async fn env_drift_is_found_reconciled_live_and_recreated_when_root_is_lost() {
     let repair = finding.repair.as_ref().unwrap();
     assert_eq!(repair.id, "db-reconcile");
     assert_eq!(repair.arg.as_deref(), Some("mariadb"));
+    // The same .env edit also drifts the running container's config-hash —
+    // the "restart won't apply this" heads-up rides the same report.
+    let drift = report
+        .findings
+        .iter()
+        .find(|f| f.check == "config-drift")
+        .expect("interpolated .env change must show as drift");
+    assert!(drift.detail.contains("mariadb"), "{}", drift.detail);
 
     // The preview shows the statements with the password masked.
     let plan = engine.repair_preview("db-reconcile", Some("mariadb"), Some(&pid)).await.unwrap();

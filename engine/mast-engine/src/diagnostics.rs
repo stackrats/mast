@@ -14,9 +14,9 @@ use mast_contract::{
 use mast_diagnostics::{
     DiagCtx, DiagnosticsDb, Finding, ProjectFacts, RepairSpec, RiskTier, Severity, SocketFacts,
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
-    REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE, REPAIR_DOCKER_GROUP,
-    REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
+    REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_NODE_INSTALL, REPAIR_REASSIGN_PORTS,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_docker::run_command;
 
@@ -221,11 +221,12 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         0
     };
     let node = mast_project::inspect_node_project(&seed.path);
+    let is_laravel = std::fs::read_to_string(seed.path.join("composer.json"))
+        .map(|c| c.contains("laravel/framework"))
+        .unwrap_or(false);
     let facts = ProjectFacts {
         sail_flavored: mast_project::is_sail_flavored(&seed.path),
-        is_laravel: std::fs::read_to_string(seed.path.join("composer.json"))
-            .map(|c| c.contains("laravel/framework"))
-            .unwrap_or(false),
+        is_laravel,
         has_compose: mast_project::has_compose_file(&seed.path),
         has_vendor: seed.path.join("vendor").is_dir(),
         package_manager: node.as_ref().map(|n| n.manager.as_str().to_string()),
@@ -264,8 +265,117 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             .collect(),
         sail_builds: sail_build_facts(&seed.path),
         available_runtimes: available_runtimes(&seed.path),
+        foreign_owned: if is_laravel {
+            foreign_owned_scan(&seed.path, uid_gid().0)
+        } else {
+            None
+        },
+        drifted_services: Vec::new(),
     };
     (facts, db_target)
+}
+
+/// Bounded ownership scan over the paths Laravel must write (`storage/`,
+/// `bootstrap/cache`): anything owned by a uid other than the user's is the
+/// #81 permission trap in its cured-too-late form. Depth- and entry-capped so
+/// a giant storage/ cannot stall gathering; a truncated count still proves
+/// the problem exists.
+#[cfg(unix)]
+fn foreign_owned_scan(dir: &Path, uid: u32) -> Option<(usize, String, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    if uid == 0 {
+        return None; // root owns everything it looks at — the scan is meaningless
+    }
+    let mut count = 0usize;
+    let mut example: Option<(String, u32)> = None;
+    let mut budget = 2000usize;
+    let mut note = |path: &Path, owner: u32| {
+        count += 1;
+        if example.is_none() {
+            let rel = path.strip_prefix(dir).unwrap_or(path);
+            example = Some((rel.display().to_string(), owner));
+        }
+    };
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    for root in ["storage", "bootstrap/cache"] {
+        let path = dir.join(root);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.uid() != uid {
+            note(&path, meta.uid());
+        }
+        if meta.is_dir() {
+            stack.push((path, 0));
+        }
+    }
+    while let Some((path, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else { continue };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return example.map(|(path, owner)| (count, path, owner));
+            }
+            budget -= 1;
+            let child = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&child) else { continue };
+            if meta.uid() != uid {
+                note(&child, meta.uid());
+            }
+            if meta.is_dir() && depth < 4 {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    example.map(|(path, owner)| (count, path, owner))
+}
+
+/// Windows adapter TODO: unix ownership semantics do not apply.
+#[cfg(not(unix))]
+fn foreign_owned_scan(_dir: &Path, _uid: u32) -> Option<(usize, String, u32)> {
+    None
+}
+
+/// Current per-service config hashes (`config --hash "*"`), through the
+/// read-only runner rule: `SAIL_SKIP_CHECKS=1 sail` for Sail projects, bare
+/// compose otherwise. Compared against running containers'
+/// `com.docker.compose.config-hash` labels — ADR-0001's drift signal.
+async fn config_hashes(
+    invocation: &mast_compose::ComposeInvocation,
+) -> Option<std::collections::HashMap<String, String>> {
+    let (argv, env) =
+        crate::db_repair::scoped_compose_argv(invocation, &["config", "--hash", "*"]);
+    let out = run_command(&argv, Some(&invocation.project_dir), &env, PROBE_TIMEOUT, PROBE_CAP)
+        .await
+        .ok()
+        .filter(|o| o.success())?;
+    Some(
+        out.stdout
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                Some((cols.next()?.to_string(), cols.next()?.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// The containerized chown for [`REPAIR_CHOWN_STORAGE`]: mounts the project
+/// and touches ONLY the paths Laravel must own. `None` when neither target
+/// exists.
+fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
+    let targets: Vec<String> = ["storage", "bootstrap/cache"]
+        .iter()
+        .filter(|rel| dir.join(rel).is_dir())
+        .map(|rel| format!("/mast-fix/{rel}"))
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> =
+        ["docker", "run", "--rm", "-v"].map(String::from).into();
+    argv.push(format!("{}:/mast-fix", dir.display()));
+    argv.extend(["alpine:latest".into(), "chown".into(), "-R".into()]);
+    argv.push(format!("{uid}:{gid}"));
+    argv.extend(targets);
+    Some(argv)
 }
 
 /// Sail-shaped build services from the project's base compose file.
@@ -464,6 +574,41 @@ impl Engine {
             for (facts, _) in &mut inspected {
                 if let Some(issues) = version_issues.remove(&facts.id) {
                     facts.db_versions = issues;
+                }
+            }
+            // Config drift: containers created under an older resolved
+            // config than the files+.env now produce.
+            let adapter = self.inner.adapter.lock().unwrap().clone();
+            let observations = match adapter {
+                Some(adapter) => adapter.list_compose_containers().await.ok(),
+                None => None,
+            };
+            if let Some(observations) = observations {
+                for meta in &db_metas {
+                    let running: Vec<_> = observations
+                        .iter()
+                        .filter(|o| o.project == meta.compose_name && o.state == "running")
+                        .collect();
+                    if running.is_empty() {
+                        continue;
+                    }
+                    let Some(invocation) = invocations.get(&meta.project_id) else { continue };
+                    let Some(current) = config_hashes(invocation).await else { continue };
+                    let mut drifted: Vec<String> = running
+                        .iter()
+                        .filter_map(|o| {
+                            let label = o.config_hash.as_ref()?;
+                            let now = current.get(&o.service)?;
+                            (label != now).then(|| o.service.clone())
+                        })
+                        .collect();
+                    drifted.sort();
+                    drifted.dedup();
+                    if let Some((facts, _)) =
+                        inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+                    {
+                        facts.drifted_services = drifted;
+                    }
                 }
             }
         }
@@ -796,6 +941,29 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_CHOWN_STORAGE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let argv = chown_storage_argv(&path, uid, gid);
+                    let scan = foreign_owned_scan(&path, uid);
+                    let no_op = scan.is_none();
+                    let summary = match (no_op, argv) {
+                        (true, _) => {
+                            vec!["everything is already owned by you — nothing to do".into()]
+                        }
+                        (false, Some(argv)) => vec![
+                            format!("run: {}", argv.join(" ")),
+                            "only storage/ and bootstrap/cache are touched".into(),
+                            "runs as root in a throwaway container — no sudo on the host"
+                                .into(),
+                        ],
+                        (false, None) => vec!["neither storage/ nor bootstrap/cache exists".into()],
+                    };
+                    Ok(RepairPlan { repair: offer, file_preview: None, summary, no_op })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_CONFIG_CLEAR => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -1066,6 +1234,38 @@ impl Engine {
                 let install = sail_install_argv(&path, uid, gid);
                 self.run_streamed_command(handle, op, &install, Some(&path), &redactor, timeout)
                     .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_CHOWN_STORAGE => {
+                let path = self.project_path(self.require_project(project)?)?;
+                let argv = chown_storage_argv(&path, uid, gid).ok_or_else(|| {
+                    ErrorInfo::InvalidInput {
+                        message: "neither storage/ nor bootstrap/cache exists".into(),
+                    }
+                })?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output { line: format!("$ {}", argv.join(" ")), stderr: false },
+                );
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &crate::Redactor::default(),
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("storage/ and bootstrap/cache now belong to uid {uid}"),
+                        stderr: false,
+                    },
+                );
                 self.hint();
                 Ok(())
             }

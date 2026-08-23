@@ -46,6 +46,7 @@ pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
 pub const REPAIR_DB_RECREATE: &str = "db-recreate-volume";
 pub const REPAIR_CONFIG_CLEAR: &str = "config-clear";
+pub const REPAIR_CHOWN_STORAGE: &str = "chown-storage";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -202,6 +203,16 @@ pub struct ProjectFacts {
     pub sail_builds: Vec<SailBuildFacts>,
     /// PHP series present under `vendor/laravel/sail/runtimes/`.
     pub available_runtimes: Vec<String>,
+    /// Writable-by-Laravel paths (under storage/ and bootstrap/cache) owned
+    /// by a uid other than the user's — root from a sudo'd install, 1337
+    /// from an unmapped container. (count, example path, example uid);
+    /// `None` when nothing foreign was found or the scan does not apply.
+    pub foreign_owned: Option<(usize, String, u32)>,
+    /// Running services whose containers were created from a different
+    /// configuration than the files+`.env` now resolve to (compose
+    /// `config-hash` label vs current `config --hash`). A restart will NOT
+    /// pick the changes up; only a recreate does.
+    pub drifted_services: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +328,16 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             risk: RiskTier::Safe,
             description: "Deletes `bootstrap/cache/config.php` (what `artisan config:clear` \
                           does), so Laravel reads `.env` again."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_CHOWN_STORAGE => Some(RepairSpec {
+            id: REPAIR_CHOWN_STORAGE,
+            title: "Take back ownership of storage/".into(),
+            risk: RiskTier::Caution,
+            description: "Runs `chown -R <you>` over `storage/` and `bootstrap/cache` — and \
+                          nothing else — inside a throwaway root container, so no sudo is \
+                          needed on the host."
                 .into(),
             arg: None,
         }),
