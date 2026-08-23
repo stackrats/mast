@@ -25,6 +25,67 @@ const SAIL_APP_SERVICE: &str = "laravel.test";
 use crate::{Engine, ProjectEntry, Redactor, initial_summary, internal_err};
 
 impl Engine {
+    /// The tail of `storage/logs/laravel.log`, parsed into grouped entries
+    /// (newest first). On demand only, like the env report — log bodies
+    /// routinely carry user data. Reads at most the last 256 KiB, so a
+    /// months-old multi-gigabyte log answers as fast as a fresh one.
+    pub async fn laravel_log(
+        &self,
+        project: &ProjectId,
+    ) -> Result<mast_contract::LaravelLogReport, ErrorInfo> {
+        const WINDOW: u64 = 256 * 1024;
+        const MAX_ENTRIES: usize = 300;
+        let path = {
+            let st = self.inner.state.lock().unwrap();
+            st.projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?
+                .record
+                .path
+                .clone()
+        };
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let log_path = path.join("storage/logs/laravel.log");
+            let Ok(mut file) = std::fs::File::open(&log_path) else {
+                return Ok(mast_contract::LaravelLogReport {
+                    exists: false,
+                    entries: Vec::new(),
+                    truncated: false,
+                });
+            };
+            let len = file.metadata().map_err(crate::internal_err)?.len();
+            let mut truncated = len > WINDOW;
+            if truncated {
+                file.seek(SeekFrom::End(-(WINDOW as i64))).map_err(crate::internal_err)?;
+            }
+            let mut body = String::new();
+            // Not read_to_string: a seek can land mid-UTF-8-sequence.
+            let mut bytes = Vec::with_capacity(WINDOW as usize);
+            file.read_to_end(&mut bytes).map_err(crate::internal_err)?;
+            body.push_str(&String::from_utf8_lossy(&bytes));
+            let mut parsed = mast_laravel::log::parse_log(&body);
+            if parsed.len() > MAX_ENTRIES {
+                truncated = true;
+                parsed.drain(..parsed.len() - MAX_ENTRIES);
+            }
+            parsed.reverse();
+            let entries = parsed
+                .into_iter()
+                .map(|e| mast_contract::LaravelLogEntry {
+                    timestamp: e.timestamp,
+                    environment: e.environment,
+                    level: e.level,
+                    message: e.message,
+                    detail: e.detail,
+                })
+                .collect();
+            Ok(mast_contract::LaravelLogReport { exists: true, entries, truncated })
+        })
+        .await
+        .map_err(crate::internal_err)?
+    }
+
     /// Build the env editor payload: entries with secret flags, the
     /// .env/.env.example diff, and validation findings against the resolved
     /// service names. On demand only — never in snapshots/patches.

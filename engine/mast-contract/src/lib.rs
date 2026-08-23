@@ -371,6 +371,36 @@ pub struct EnvReport {
     pub findings: Vec<EnvFinding>,
 }
 
+/// One grouped entry from `storage/logs/laravel.log`: the Monolog header
+/// split into fields, with the stack trace (when one follows) kept attached
+/// instead of scattered across raw lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LaravelLogEntry {
+    pub timestamp: String,
+    pub environment: String,
+    /// Monolog level, uppercase (`ERROR`, `WARNING`, …).
+    pub level: String,
+    pub message: String,
+    /// Continuation lines — stack trace, previous exceptions — when any.
+    pub detail: Option<String>,
+}
+
+/// The tail of the application log, parsed. On demand only, like
+/// [`EnvReport`]: log bodies routinely carry user data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LaravelLogReport {
+    /// False when `storage/logs/laravel.log` does not exist (fresh app, or
+    /// LOG_CHANNEL points elsewhere).
+    pub exists: bool,
+    /// Newest first.
+    pub entries: Vec<LaravelLogEntry>,
+    /// True when the file outgrew the read window and older entries were
+    /// left behind.
+    pub truncated: bool,
+}
+
 // ---------- service catalog (M7) ----------
 
 /// One installable companion service (Redis, Mailpit, …). `installed` means

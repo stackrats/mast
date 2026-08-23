@@ -6,7 +6,7 @@
 
 use futures::stream::BoxStream;
 use mast_contract::{
-    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport,
+    Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
     ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
     WorkspaceSnapshot,
@@ -62,6 +62,10 @@ pub trait MastClient: Send + Sync {
     /// Env editor payload (entries, example diff, validation findings). On
     /// demand only — values may be secrets and stay out of the patch store.
     async fn env_report(&self, project: ProjectId) -> Result<EnvReport, ClientError>;
+
+    /// The tail of `storage/logs/laravel.log`, parsed and grouped (newest
+    /// first). On demand only — log bodies routinely carry user data.
+    async fn laravel_log(&self, project: ProjectId) -> Result<LaravelLogReport, ClientError>;
 
     /// Recent effect history, oldest first: every command Mast spawned and
     /// every config file it wrote, with outcomes.

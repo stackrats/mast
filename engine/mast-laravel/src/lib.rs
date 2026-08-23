@@ -6,6 +6,7 @@ pub mod app_key;
 pub mod db;
 pub mod env;
 pub mod env_write;
+pub mod log;
 pub mod ports;
 pub mod processes;
 pub mod share;

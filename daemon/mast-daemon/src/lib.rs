@@ -231,6 +231,10 @@ async fn handle_request(
             let project: ProjectId = param(&params, "project")?;
             ok(engine.env_report(&project).await?)
         }
+        "laravelLog" => {
+            let project: ProjectId = param(&params, "project")?;
+            ok(engine.laravel_log(&project).await?)
+        }
         "historyRecent" => ok(engine.history_recent()),
         "subscribeHistory" => {
             let stream_id: u64 = param(&params, "stream")?;
