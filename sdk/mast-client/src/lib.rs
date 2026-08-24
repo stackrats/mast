@@ -120,8 +120,13 @@ pub trait MastClient: Send + Sync {
     /// Current state vs a snapshot — a report, never an automatic restore.
     async fn snapshot_report(&self, snapshot_id: String) -> Result<SnapshotReport, ClientError>;
 
-    /// Run the full applicable check set; the run is recorded in history.
-    async fn run_diagnostics(&self) -> Result<DiagnosticReport, ClientError>;
+    /// Run the applicable check set — everything (recorded in history), or
+    /// scoped to one project's findings (not recorded: the trend history
+    /// tracks full passes only).
+    async fn run_diagnostics(
+        &self,
+        project: Option<ProjectId>,
+    ) -> Result<DiagnosticReport, ClientError>;
 
     /// What a repair would do — shown before consent (apply via
     /// `Action::ApplyRepair`).

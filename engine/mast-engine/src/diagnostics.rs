@@ -520,12 +520,16 @@ fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
 }
 
 impl Engine {
-    async fn gather_diag_ctx(&self) -> DiagCtx {
+    /// Gather everything the checks read. `scope` narrows the gather to one
+    /// project id: only its facts and probes, and no workspace-graph issues
+    /// (those are not any single project's).
+    async fn gather_diag_ctx(&self, scope: Option<&str>) -> DiagCtx {
         let (docker, seeds, invocations, db_metas, publishing, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
                 .values()
+                .filter(|e| scope.is_none_or(|id| e.record.id == id))
                 .map(|e| ProjectSeed {
                     id: e.record.id.clone(),
                     name: e.summary.name.clone(),
@@ -562,6 +566,7 @@ impl Engine {
             let db_metas: Vec<crate::db_repair::DbServiceMeta> = st
                 .projects
                 .values()
+                .filter(|e| scope.is_none_or(|id| e.record.id == id))
                 .filter_map(|e| {
                     let model = e.model.as_ref()?;
                     Some(crate::db_repair::DbServiceMeta {
@@ -601,10 +606,14 @@ impl Engine {
                     ))
                 })
                 .collect();
-            let issues = workspace_summaries(&st)
-                .into_iter()
-                .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
-                .collect();
+            let issues = if scope.is_some() {
+                Vec::new()
+            } else {
+                workspace_summaries(&st)
+                    .into_iter()
+                    .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
+                    .collect()
+            };
             let docker_host_env = self
                 .inner
                 .deps
@@ -865,18 +874,42 @@ impl Engine {
     /// Run every applicable check and record the run in history. Failure to
     /// record is logged, never fatal — the report is the point.
     pub async fn run_diagnostics(&self) -> Result<DiagnosticReport, ErrorInfo> {
-        let ctx = self.gather_diag_ctx().await;
-        let (checks_run, findings) = mast_diagnostics::run_all(&ctx);
+        self.run_diagnostics_scoped(None).await
+    }
+
+    /// Run diagnostics for one project (or everything, `None`). A scoped run
+    /// gathers only that project's facts — no probes into the neighbours —
+    /// keeps only its findings, and stays out of history: the recorded trend
+    /// is "the full set passed", not a partial look.
+    pub async fn run_diagnostics_scoped(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<DiagnosticReport, ErrorInfo> {
+        if let Some(project) = project {
+            let st = self.inner.state.lock().unwrap();
+            if !st.projects.contains_key(&project.0) {
+                return Err(ErrorInfo::NotFound { what: format!("project {}", project.0) });
+            }
+        }
+        let ctx = self.gather_diag_ctx(project.map(|p| p.0.as_str())).await;
+        let (checks_run, mut findings) = mast_diagnostics::run_all(&ctx);
         let taken_unix = now_unix();
 
-        let db_path = self.inner.deps.store.diagnostics_db_path();
-        let for_history = findings.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
-            DiagnosticsDb::open(&db_path)?.record_run(taken_unix, checks_run, &for_history)
-        })
-        .await;
-        if let Ok(Err(e)) = recorded {
-            tracing::warn!("failed to record diagnostics run: {e}");
+        match project {
+            Some(project) => {
+                findings.retain(|f| f.project.as_deref() == Some(project.0.as_str()));
+            }
+            None => {
+                let db_path = self.inner.deps.store.diagnostics_db_path();
+                let for_history = findings.clone();
+                let recorded = tokio::task::spawn_blocking(move || {
+                    DiagnosticsDb::open(&db_path)?.record_run(taken_unix, checks_run, &for_history)
+                })
+                .await;
+                if let Ok(Err(e)) = recorded {
+                    tracing::warn!("failed to record diagnostics run: {e}");
+                }
+            }
         }
 
         Ok(DiagnosticReport {

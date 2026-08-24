@@ -102,9 +102,9 @@ async snapshotReport(snapshotId: string) : Promise<Result<SnapshotReport, string
     else return { status: "error", error: e  as any };
 }
 },
-async runDiagnostics() : Promise<Result<DiagnosticReport, string>> {
+async runDiagnostics(project: ProjectId | null) : Promise<Result<DiagnosticReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("run_diagnostics") };
+    return { status: "ok", data: await TAURI_INVOKE("run_diagnostics", { project }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

@@ -276,8 +276,11 @@ impl MastClient for IpcClient {
         self.call("snapshotReport", json!({"snapshot": snapshot_id})).await
     }
 
-    async fn run_diagnostics(&self) -> Result<mast_contract::DiagnosticReport, ClientError> {
-        self.call("runDiagnostics", json!({})).await
+    async fn run_diagnostics(
+        &self,
+        project: Option<ProjectId>,
+    ) -> Result<mast_contract::DiagnosticReport, ClientError> {
+        self.call("runDiagnostics", json!({"project": project})).await
     }
 
     async fn repair_preview(
