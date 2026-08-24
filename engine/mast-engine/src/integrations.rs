@@ -14,9 +14,14 @@ use mast_docker::spawn_detached;
 
 /// Probe order when no terminal is configured — modern emulators first,
 /// classic fallbacks last (plan names Ghostty/WezTerm/Kitty/gnome-terminal).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const TERMINAL_CANDIDATES: [&str; 8] =
     ["ghostty", "wezterm", "kitty", "alacritty", "foot", "konsole", "gnome-terminal", "xterm"];
+
+/// Windows Terminal when present (stock on Windows 11), the shells as
+/// fallback — `cmd` always exists, so the probe cannot come up empty.
+#[cfg(target_os = "windows")]
+const TERMINAL_CANDIDATES: [&str; 4] = ["wt", "pwsh", "powershell", "cmd"];
 
 /// macOS ships no terminal on `PATH`, so the probe covers the emulators that
 /// install a CLI shim (Homebrew, or the app's own "install CLI" action) and
@@ -32,15 +37,31 @@ pub const MAC_TERMINAL: &str = "Terminal.app";
 #[cfg(not(target_os = "macos"))]
 const EDITOR_CANDIDATES: [&str; 4] = ["code", "codium", "zed", "subl"];
 
-/// `mate` is TextMate's shim; the rest match the Linux list.
+/// `mate` is TextMate's shim; the rest match the Linux list. The `.app`
+/// bundles carry the list past the CLI shims — most mac installs never run
+/// the editor's "install command line tool" step, and without the bundles
+/// the Editor button would fall through to the Finder opener, landing on
+/// the same view as Files.
 #[cfg(target_os = "macos")]
-const EDITOR_CANDIDATES: [&str; 5] = ["code", "codium", "zed", "subl", "mate"];
+const EDITOR_CANDIDATES: [&str; 8] = [
+    "code",
+    "codium",
+    "zed",
+    "subl",
+    "mate",
+    "Visual Studio Code.app",
+    "Zed.app",
+    "Sublime Text.app",
+];
 
 /// The desktop's generic opener: a URL, a file or a directory, dispatched to
-/// whatever handles it.
+/// whatever handles it. Windows has no xdg-open; `explorer` dispatches both
+/// URLs (default browser) and paths.
 #[cfg(target_os = "macos")]
 const OPENER: &str = "open";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+const OPENER: &str = "explorer";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const OPENER: &str = "xdg-open";
 
 /// Directories searched on top of `PATH`.
@@ -54,22 +75,68 @@ const EXTRA_BIN_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/
 const EXTRA_BIN_DIRS: [&str; 0] = [];
 
 pub fn find_in_path(binary: &str) -> Option<PathBuf> {
-    if binary.contains('/') {
+    if Path::new(binary).is_absolute() || binary.contains('/') || binary.contains('\\') {
         let path = PathBuf::from(binary);
         return path.is_file().then_some(path);
     }
-    let from_path = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).map(|dir| dir.join(binary)).find(|p| p.is_file())
-    });
-    from_path.or_else(|| {
-        EXTRA_BIN_DIRS.iter().map(|dir| Path::new(dir).join(binary)).find(|p| p.is_file())
-    })
+    let from_path = std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).find_map(|dir| candidate_in(&dir, binary)));
+    from_path
+        .or_else(|| EXTRA_BIN_DIRS.iter().find_map(|dir| candidate_in(Path::new(dir), binary)))
+}
+
+/// The executable `binary` names inside `dir`. On Windows the PATHEXT forms
+/// come first: VS Code's bin/ holds both a POSIX `code` script (which
+/// CreateProcess refuses with error 193) and the `code.cmd` that runs.
+fn candidate_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    for ext in ["exe", "cmd", "bat"] {
+        let path = dir.join(format!("{binary}.{ext}"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path = dir.join(binary);
+    path.is_file().then_some(path)
+}
+
+/// std's canonicalize on Windows yields `\\?\C:\…` verbatim paths, which
+/// explorer and most argv-consuming tools refuse — strip the prefix wherever
+/// a path leaves Mast as a command argument.
+fn argv_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(stripped) => stripped.to_string(),
+        None => text.into_owned(),
+    }
 }
 
 /// App bundles are launched, not executed: they never live on `PATH`, and
 /// `open -a` resolves them by name through Launch Services.
 fn is_app_bundle(name: &str) -> bool {
     name.ends_with(".app")
+}
+
+/// Whether an `.app` candidate is actually present — `open -a` on a missing
+/// bundle only fails after the click. Terminal.app ships with macOS (under
+/// /System/Applications/Utilities), so it is trusted even if the layout
+/// shifts and the probe misses it.
+#[cfg(target_os = "macos")]
+fn app_bundle_installed(name: &str) -> bool {
+    if name == MAC_TERMINAL {
+        return true;
+    }
+    let user_apps = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Applications"));
+    ["/Applications", "/Applications/Utilities", "/System/Applications"]
+        .iter()
+        .map(|d| PathBuf::from(d))
+        .chain(user_apps)
+        .any(|dir| dir.join(name).exists())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_bundle_installed(_name: &str) -> bool {
+    true
 }
 
 fn pick(configured: Option<&str>, candidates: &[&str]) -> Option<String> {
@@ -83,7 +150,7 @@ fn pick(configured: Option<&str>, candidates: &[&str]) -> Option<String> {
     // a Finder-launched app — cannot see EXTRA_BIN_DIRS the probe just did.
     candidates.iter().find_map(|c| {
         if is_app_bundle(c) {
-            return Some(c.to_string());
+            return app_bundle_installed(c).then(|| c.to_string());
         }
         find_in_path(c).map(|p| p.to_string_lossy().into_owned())
     })
@@ -168,9 +235,31 @@ pub fn terminal_argv(terminal: &str, cwd: &Path, command: Option<&[String]>) -> 
     if is_app_bundle(&base) {
         return terminal_app_argv(&base, cwd, command);
     }
-    let dir = cwd.to_string_lossy().into_owned();
+    let dir = argv_path(cwd);
     let mut argv = vec![terminal.to_string()];
     match base.as_str() {
+        // Windows: the spawn cwd (open_terminal passes it) already sets the
+        // starting directory for the shells; wt takes it explicitly.
+        "wt" | "wt.exe" => {
+            argv.push("-d".into());
+            argv.push(dir);
+            if let Some(cmd) = command {
+                argv.extend(cmd.iter().cloned());
+            }
+        }
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => {
+            argv.push("-NoExit".into());
+            if let Some(cmd) = command {
+                argv.push("-Command".into());
+                argv.extend(cmd.iter().cloned());
+            }
+        }
+        "cmd" | "cmd.exe" => {
+            if let Some(cmd) = command {
+                argv.push("/K".into());
+                argv.extend(cmd.iter().cloned());
+            }
+        }
         "gnome-terminal" => {
             argv.push(format!("--working-directory={dir}"));
             if let Some(cmd) = command {
@@ -272,11 +361,11 @@ pub fn open_terminal(
 pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> {
     let argv = match pick(configured, &EDITOR_CANDIDATES) {
         Some(editor) if is_app_bundle(&editor) => {
-            vec![OPENER.into(), "-a".into(), editor, path.to_string_lossy().into_owned()]
+            vec![OPENER.into(), "-a".into(), editor, argv_path(path)]
         }
-        Some(editor) => vec![editor, path.to_string_lossy().into_owned()],
+        Some(editor) => vec![editor, argv_path(path)],
         // Last resort: let the desktop decide.
-        None => vec![OPENER.into(), path.to_string_lossy().into_owned()],
+        None => vec![OPENER.into(), argv_path(path)],
     };
     spawn_detached(&argv, None).map_err(|e| e.to_string())
 }
@@ -286,13 +375,11 @@ pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> 
 /// Open a file with the desktop's default application (xdg-open/open) —
 /// the manual fallback for files Mast must not edit itself (/etc/hosts).
 pub fn open_path(path: &Path) -> Result<(), String> {
-    spawn_detached(&[OPENER.into(), path.to_string_lossy().into_owned()], None)
-        .map_err(|e| e.to_string())
+    spawn_detached(&[OPENER.into(), argv_path(path)], None).map_err(|e| e.to_string())
 }
 
 pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    spawn_detached(&[OPENER.into(), path.to_string_lossy().into_owned()], None)
-        .map_err(|e| e.to_string())
+    spawn_detached(&[OPENER.into(), argv_path(path)], None).map_err(|e| e.to_string())
 }
 
 /// Hand a URL to the desktop's default browser. The scheme is re-checked
