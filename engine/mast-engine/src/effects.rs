@@ -732,6 +732,7 @@ fn build_services(
                 health: mast_contract::ServiceHealth::Unknown,
                 ui_url,
                 db_port,
+                orphaned: false,
             });
         }
     }
@@ -750,6 +751,11 @@ fn build_services(
                 health,
                 ui_url: None,
                 db_port: None,
+                // Observed but not declared: with a resolved model in hand
+                // this container is a leftover from an earlier config.
+                // Without one (resolution failed) nothing can be said about
+                // membership, so it stays a plain service.
+                orphaned: model.is_some(),
             });
         }
     }
@@ -759,7 +765,10 @@ fn build_services(
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandError, DockerError, connect_error_text, merge_host_ports, parse_git_status};
+    use super::{
+        CommandError, DockerError, build_services, connect_error_text, merge_host_ports,
+        parse_git_status,
+    };
 
     fn model(services: &[(&str, &[u16])]) -> mast_compose::ResolvedModel {
         mast_compose::ResolvedModel {
@@ -837,6 +846,37 @@ mod tests {
             (Some("detached".into()), Some(false))
         );
         assert_eq!(parse_git_status(""), (None, Some(false)));
+    }
+
+    /// The post-git-pull trap: containers created by an older config keep
+    /// running under service keys the new file no longer declares. They must
+    /// surface as orphans — compose verbs cannot address them.
+    #[test]
+    fn observed_but_undeclared_services_are_orphaned() {
+        let m = model(&[("app", &[])]);
+        let container = |service: &str| mast_docker::ContainerObservation {
+            id: format!("{service}-id"),
+            name: format!("demo-{service}-1"),
+            project: "demo".into(),
+            service: service.into(),
+            config_files: Vec::new(),
+            working_dir: None,
+            state: "running".into(),
+            health: None,
+            exit_code: None,
+            config_hash: None,
+            networks: Vec::new(),
+            published_ports: Vec::new(),
+        };
+        let app = container("app");
+        let old = container("old-db");
+        let services = build_services(Some(&m), &[&app, &old]);
+        let by_name = |n: &str| services.iter().find(|s| s.name == n).unwrap();
+        assert!(!by_name("app").orphaned);
+        assert!(by_name("old-db").orphaned);
+        // Without a resolved model nothing can be said about membership.
+        let services = build_services(None, &[&old]);
+        assert!(!services[0].orphaned, "{services:?}");
     }
 
     #[test]

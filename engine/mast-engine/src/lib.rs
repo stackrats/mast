@@ -501,6 +501,9 @@ impl Engine {
             Action::RestartProject { id } => {
                 return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Restart, None);
             }
+            Action::RebuildProject { id } => {
+                return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Rebuild, None);
+            }
             Action::StartService { id, service } => {
                 return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Up, Some(service.clone()));
             }
@@ -1197,6 +1200,7 @@ impl Engine {
             Action::StartProject { .. }
             | Action::StopProject { .. }
             | Action::RestartProject { .. }
+            | Action::RebuildProject { .. }
             | Action::StartService { .. }
             | Action::StopService { .. }
             | Action::RestartService { .. }
