@@ -937,6 +937,10 @@ pub enum Action {
     /// config that changed underneath the project (a git pull), which
     /// `restart` (reuses containers) and `up` (reuses images) both miss.
     RebuildProject { id: ProjectId },
+    /// Remove one orphaned service's leftover container (`docker rm -f`) —
+    /// the targeted disposal for a single [`ServiceState::orphaned`] chip,
+    /// where a whole-project Rebuild would be overkill.
+    RemoveOrphanContainer { id: ProjectId, service: String },
     /// Switch a Sail-built service to another vendored PHP runtime, as ONE
     /// operation: rewrites `build.context` and the `sail-X.Y/app` image tag
     /// together, rebuilds without cache, recreates the container when the
@@ -1262,6 +1266,7 @@ mod tests {
             Action::StopProject { id: ProjectId("p1".into()) },
             Action::RestartProject { id: ProjectId("p1".into()) },
             Action::RebuildProject { id: ProjectId("p1".into()) },
+            Action::RemoveOrphanContainer { id: ProjectId("p1".into()), service: "old".into() },
             Action::OpenTerminal { id: ProjectId("p1".into()) },
             Action::ShellIntoContainer { id: ProjectId("p1".into()), service: "app".into() },
             Action::OpenInEditor { id: ProjectId("p1".into()) },
