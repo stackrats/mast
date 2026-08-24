@@ -27,8 +27,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 /// Per-user socket path: `$XDG_RUNTIME_DIR/mast/daemon.sock`, falling back
-/// to `/tmp/mast-<uid>` (created 0700 either way).
+/// to `/tmp/mast-<uid>` (created 0700 either way). On Windows — where the
+/// daemon does not serve yet — the per-user location under %LOCALAPPDATA%,
+/// so callers still get a stable path to point at. (The old unconditional
+/// `getuid` shim passed `cargo check` on Windows but failed the first real
+/// link: check never links.)
 pub fn default_socket_path() -> PathBuf {
+    #[cfg(unix)]
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -36,10 +41,15 @@ pub fn default_socket_path() -> PathBuf {
             let uid = unsafe { libc_getuid() };
             PathBuf::from(format!("/tmp/mast-{uid}"))
         });
+    #[cfg(not(unix))]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     base.join("mast").join("daemon.sock")
 }
 
 // Tiny shim so this crate needs no libc dependency.
+#[cfg(unix)]
 unsafe fn libc_getuid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
