@@ -182,7 +182,7 @@ const OVERRIDE_CANDIDATES: [&str; 4] = [
 /// mount sources against the `-f` file's directory, and Docker Desktop
 /// refuses `\\?\C:\…` sources outright ("mount denied"). Everything an
 /// invocation carries must be in plain form.
-fn strip_verbatim(path: PathBuf) -> PathBuf {
+pub fn strip_verbatim(path: PathBuf) -> PathBuf {
     let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else { return path };
     match rest.strip_prefix(r"UNC\") {
         Some(unc) => PathBuf::from(format!(r"\\{unc}")),
