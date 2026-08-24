@@ -1,9 +1,10 @@
 name: Release binaries
 
-# Builds the desktop bundles and the mast/mast-daemon binaries for macOS
-# (Apple Silicon + Intel) and Windows, and uploads them to the release for
-# the given tag. Linux assets are built and uploaded from the dev machine
-# today; this covers the platforms that cannot be cross-compiled from it.
+# The whole release, from one tag push: builds the desktop bundles and the
+# mast/mast-daemon binaries for Linux, macOS (Apple Silicon + Intel) and
+# Windows, and attaches them to the release for that tag — created as a
+# DRAFT if it does not exist yet, so the notes get written by a human
+# before anything goes public. Also dispatchable against an existing tag.
 on:
   workflow_dispatch:
     inputs:
@@ -47,13 +48,33 @@ jobs:
           path: clients/desktop-vue/dist
           if-no-files-found: error
 
+  # The upload target must exist before the build jobs race to attach
+  # assets. A tag push gets a draft; a dispatch against an already
+  # published release leaves it exactly as it is.
+  ensure-release:
+    name: Ensure release exists
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --draft --title "Mast $TAG" \
+            --notes "Draft — binaries attached by CI; notes to come."
+
   desktop:
     name: ${{ matrix.suffix }}
-    needs: frontend
+    needs: [frontend, ensure-release]
     strategy:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            suffix: linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             bundles: dmg
@@ -69,6 +90,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf pkg-config
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -117,7 +144,9 @@ jobs:
           fi
           UPLOADS=("$ARCHIVE")
           shopt -s nullglob
-          for bundle in "$BIN"/bundle/dmg/*.dmg "$BIN"/bundle/nsis/*-setup.exe; do
+          for bundle in "$BIN"/bundle/dmg/*.dmg "$BIN"/bundle/nsis/*-setup.exe \
+            "$BIN"/bundle/deb/*.deb "$BIN"/bundle/rpm/*.rpm \
+            "$BIN"/bundle/appimage/*.AppImage; do
             UPLOADS+=("$bundle")
           done
           gh release upload "$TAG" "${UPLOADS[@]}" --clobber
