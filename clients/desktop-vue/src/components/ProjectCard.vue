@@ -27,6 +27,7 @@ import {
   Stethoscope,
   Trash2,
   TriangleAlert,
+  Wrench,
   X,
 } from "lucide-vue-next";
 import { useQRCode } from "@vueuse/integrations/useQRCode";
@@ -672,9 +673,19 @@ async function clearAppLog() {
           <ScrollText class="h-3.5 w-3.5" /> App log
         </Button>
       </Tooltip>
-      <Tooltip text="Run the diagnostic checks scoped to this project's findings and fixes.">
+      <Tooltip
+        :text="
+          op?.terminal === 'failed' && op.fixes.length > 0
+            ? 'A one-click fix for the last failure is waiting in here.'
+            : 'Run the diagnostic checks scoped to this project\'s findings and fixes.'
+        "
+      >
         <Button variant="ghost" size="sm" @click="emit('diagnose')">
           <Stethoscope class="h-3.5 w-3.5" /> Diagnose
+          <TriangleAlert
+            v-if="op?.terminal === 'failed' && op.fixes.length > 0"
+            class="h-3 w-3 text-amber-500"
+          />
         </Button>
       </Tooltip>
     </div>
@@ -1647,16 +1658,14 @@ async function clearAppLog() {
         <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700">cancelled</span>
         <span v-else class="text-red-700">failed: {{ op.error }}</span>
       </p>
-      <!-- A failure is only actionable if you can see what was run — and,
-           when the engine matched the failure to a repair, fixable in place. -->
+      <!-- A failure is only actionable if you can see what was run. Matched
+           fixes live in Diagnostics (one home for every repair) — the
+           failure box and the Diagnose button both point there. -->
       <div v-if="op.terminal === 'failed'" class="mt-1 flex flex-wrap items-center gap-1">
-        <FixButton
-          v-for="f in op.fixes"
-          :key="f.repair.id + (f.repair.arg ?? '')"
-          :repair="f.repair"
-          :project="f.project"
-          @applied="store.dismissOperation(project.id)"
-        />
+        <Button v-if="op.fixes.length > 0" variant="outline" size="sm" @click="emit('diagnose')">
+          <Wrench class="h-3.5 w-3.5 text-amber-500" />
+          Fix available — open Diagnose
+        </Button>
         <Button
           v-if="op.id >= 0"
           variant="ghost"
