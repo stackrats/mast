@@ -85,6 +85,22 @@ pub fn rewrite_explicit_port(raw: &str, from: u16, to: u16) -> Option<String> {
     Some(format!("{prefix}{host}:{to}{suffix}"))
 }
 
+/// The port an `APP_URL` value pins explicitly, if any — the half of
+/// [`rewrite_explicit_port`]'s condition that detection needs on its own.
+pub fn explicit_port(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    if raw.contains("${") {
+        return None;
+    }
+    let rest = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// `host` or `host:1234`. Deliberately narrow — it is also what stops a
 /// scheme-less `javascript:alert(1)` from being read as a bare host.
 fn is_host_port(authority: &str) -> bool {
@@ -149,6 +165,16 @@ mod tests {
             Some("http://localhost:8080/admin".into())
         );
         assert_eq!(app_url(&env(&[("APP_URL", "myapp.test")])), Some("http://myapp.test".into()));
+    }
+
+    #[test]
+    fn explicit_ports_are_read_out_of_url_shapes() {
+        assert_eq!(explicit_port("http://localhost:8000"), Some(8000));
+        assert_eq!(explicit_port("https://myapp.test:8000/admin"), Some(8000));
+        assert_eq!(explicit_port("myapp.test:8000"), Some(8000));
+        assert_eq!(explicit_port("http://localhost"), None);
+        assert_eq!(explicit_port("http://${APP_HOST}:8000"), None);
+        assert_eq!(explicit_port(""), None);
     }
 
     #[test]

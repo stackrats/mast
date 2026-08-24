@@ -7,8 +7,9 @@ use crate::{
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
-    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT,
-    REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS,
+    REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -1200,6 +1201,94 @@ impl Check for DetachedContainers {
     }
 }
 
+/// `APP_URL` pins a port the project does not publish while `APP_PORT`
+/// names another. [`mast_laravel::app_url`] gives an explicit `APP_URL`
+/// port the last word, so the Browser button keeps opening the dead
+/// address. The current remap drags `APP_URL` along when it moves
+/// `APP_PORT`; this check heals the projects an older move (or a
+/// hand-edit) already left behind.
+struct StaleAppUrl;
+impl Check for StaleAppUrl {
+    fn id(&self) -> &'static str {
+        "stale-app-url"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.app_url_mismatch.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| p.app_url_mismatch.map(|m| (p, m)))
+            .map(|(p, (url_port, app_port))| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: the Browser link points at a dead port", p.name),
+                    format!(
+                        "APP_URL pins port {url_port}, but the project publishes nothing \
+                         there — the app is forwarded on APP_PORT={app_port}. The Browser \
+                         button (and anything else reading APP_URL) opens a refused \
+                         connection. This is what a port move leaves behind when APP_URL \
+                         had the old port written in."
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_FIX_APP_URL, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// The database answers with the `.env` credentials but holds no
+/// `migrations` table — the first `artisan migrate` never ran. Laravel
+/// keeps sessions, users and cache in the database by default, so every
+/// page 500s on a missing-table QueryException while everything *looks*
+/// healthy: containers up, credentials fine. The fresh-bootstrap trap.
+struct DbNotMigrated;
+impl Check for DbNotMigrated {
+    fn id(&self) -> &'static str {
+        "db-not-migrated"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| {
+            p.is_laravel
+                && p.db.as_ref().is_some_and(|db| {
+                    db.failure.is_none() && db.migrations_table == Some(false)
+                })
+        })
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.is_laravel)
+            .filter_map(|p| {
+                p.db
+                    .as_ref()
+                    .filter(|db| db.failure.is_none() && db.migrations_table == Some(false))
+                    .map(|db| (p, db))
+            })
+            .map(|(p, db)| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{}: the database has never been migrated", p.name),
+                    format!(
+                        "The {} database \"{}\" is reachable with the .env credentials but \
+                         holds no `migrations` table. Laravel keeps sessions, users and \
+                         cache there by default, so requests fail with a QueryException \
+                         naming a missing table (SQLSTATE 42S02) until the first `artisan \
+                         migrate` runs.",
+                        db.kind.as_str(),
+                        db.database
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_ARTISAN_MIGRATE, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// Files under storage/ or bootstrap/cache owned by someone else — root
 /// from a sudo'd installer, 1337 from a container that ran without WWWUSER
 /// mapping. The cure for Sail's most-commented issue ever (#81), whose
@@ -1626,6 +1715,8 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(StorageOwnership),
         Box::new(ConfigDrift),
         Box::new(DetachedContainers),
+        Box::new(StaleAppUrl),
+        Box::new(DbNotMigrated),
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
         Box::new(DockerDesktopLinux),
@@ -1710,6 +1801,7 @@ mod tests {
             resolution_error: None,
             db: None,
             db_versions: Vec::new(),
+            app_url_mismatch: None,
             config_cached: false,
             dotted_services: Vec::new(),
             sail_builds: Vec::new(),
@@ -1754,6 +1846,7 @@ mod tests {
             username: "sail".into(),
             failure,
             admin_access,
+            migrations_table: None,
         }
     }
 
@@ -2212,6 +2305,54 @@ mod tests {
         assert_eq!(repair.id, REPAIR_RECREATE_SERVICE);
         assert_eq!(repair.risk, RiskTier::Caution);
         assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
+    }
+
+    #[test]
+    fn a_stale_app_url_warns_with_the_env_repair() {
+        let mut p = sail_project("a");
+        p.app_url_mismatch = Some((8000, 8082));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "stale-app-url").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.detail.contains("APP_URL pins port 8000"), "{}", f.detail);
+        assert!(f.detail.contains("APP_PORT=8082"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_FIX_APP_URL);
+        assert_eq!(repair.risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn an_unmigrated_database_errors_with_the_migrate_repair() {
+        let mut p = sail_project("a");
+        p.running = true;
+        let mut db = db_facts(None, false);
+        db.migrations_table = Some(false);
+        p.db = Some(db);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "db-not-migrated").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.detail.contains("no `migrations` table"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_ARTISAN_MIGRATE);
+        assert_eq!(repair.risk, RiskTier::Caution);
+
+        // A migrated database (or an unprobeable one) raises nothing.
+        for table in [Some(true), None] {
+            let mut p = sail_project("a");
+            let mut db = db_facts(None, false);
+            db.migrations_table = table;
+            p.db = Some(db);
+            let (_, findings) = run_all(&ctx(vec![p]));
+            assert!(findings.iter().all(|f| f.check != "db-not-migrated"), "{table:?}");
+        }
+        // Broken credentials are the DbCredentials check's finding, not ours
+        // — a migrations answer gathered anyway must not double-report.
+        let mut p = sail_project("a");
+        let mut db = db_facts(Some(ProbeFailure::AccessDenied), false);
+        db.migrations_table = Some(false);
+        p.db = Some(db);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(findings.iter().all(|f| f.check != "db-not-migrated"));
     }
 
     #[test]

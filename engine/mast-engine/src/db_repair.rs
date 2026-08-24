@@ -138,22 +138,36 @@ pub(crate) async fn probe_db(
     target: &DbProbeTarget,
 ) -> Option<DbProbeFacts> {
     let creds = &target.creds;
-    let facts = |failure, admin_access| DbProbeFacts {
+    let facts = |failure, admin_access, migrations_table| DbProbeFacts {
         service: target.service.clone(),
         kind: creds.kind,
         database: creds.database.clone(),
         username: creds.username.clone(),
         failure,
         admin_access,
+        migrations_table,
     };
     let (tail, env) = probe_tail(creds);
     let out = exec_quiet(invocation, &target.service, &env, &tail).await?;
     if out.success() {
-        return Some(facts(None, false));
+        // The credentials work — one more question while we are here: has
+        // the first `artisan migrate` ever run? A clean `0`/`1` is an
+        // answer; anything else (odd shell, permission quirk) is not.
+        let (tail, env) = db::migrations_probe_tail(creds);
+        let migrations_table = match exec_quiet(invocation, &target.service, &env, &tail).await
+        {
+            Some(out) if out.success() => match out.stdout.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        return Some(facts(None, false, migrations_table));
     }
     let failure = db::classify_probe(creds.kind, &out.stderr)?;
     let admin = find_admin_login(invocation, &target.service, creds).await.is_some();
-    Some(facts(Some(failure), admin))
+    Some(facts(Some(failure), admin, None))
 }
 
 /// Parse `docker volume ls` three-column rows into

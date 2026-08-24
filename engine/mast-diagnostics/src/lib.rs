@@ -42,6 +42,8 @@ pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
 pub const REPAIR_RECREATE_SERVICE: &str = "recreate-service";
+pub const REPAIR_FIX_APP_URL: &str = "fix-app-url";
+pub const REPAIR_ARTISAN_MIGRATE: &str = "artisan-migrate";
 pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
 pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
@@ -127,6 +129,11 @@ pub struct DbProbeFacts {
     /// (probed only after a failure) — the gate between a live reconcile
     /// and a destructive volume recreate.
     pub admin_access: bool,
+    /// The database holds Laravel's `migrations` table (probed only when
+    /// the credentials work). `Some(false)` is the fresh-bootstrap trap:
+    /// every request touching the database 500s on a missing table until
+    /// the first `artisan migrate` runs. `None` = not determinable.
+    pub migrations_table: Option<bool>,
 }
 
 /// A database service whose pinned image version disagrees with what its
@@ -203,6 +210,11 @@ pub struct ProjectFacts {
     /// version (checked even when stopped — the point is warning BEFORE the
     /// crash-loop).
     pub db_versions: Vec<DbVersionIssue>,
+    /// `APP_URL` pins an explicit port the project does not publish while
+    /// `APP_PORT` names another — `(url_port, app_port)`. What a port remap
+    /// leaves behind when `APP_URL` had the old port written in: the
+    /// Browser button opens a refused connection until the URL follows.
+    pub app_url_mismatch: Option<(u16, u16)>,
     /// `bootstrap/cache/config.php` exists — Laravel is not reading `.env`.
     pub config_cached: bool,
     /// Compose service names containing a dot (`laravel.test`) — the shape
@@ -390,6 +402,27 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           untouched."
                 .into(),
             arg: arg.map(String::from),
+        }),
+        REPAIR_FIX_APP_URL => Some(RepairSpec {
+            id: REPAIR_FIX_APP_URL,
+            title: "Point APP_URL at the app's real port".into(),
+            risk: RiskTier::Safe,
+            description: "Rewrites the port pinned in `APP_URL` to the current `APP_PORT`, \
+                          through the transactional env writer — nothing else about the URL \
+                          changes."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_ARTISAN_MIGRATE => Some(RepairSpec {
+            id: REPAIR_ARTISAN_MIGRATE,
+            title: "Run the database migrations".into(),
+            risk: RiskTier::Caution,
+            description: "Runs `php artisan migrate --force` inside the running app service \
+                          — the project's own migrations, applied to the database `.env` \
+                          names. Creates and alters tables; nothing is dropped or rolled \
+                          back."
+                .into(),
+            arg: None,
         }),
         REPAIR_GENERATE_APP_KEY => Some(RepairSpec {
             id: REPAIR_GENERATE_APP_KEY,
