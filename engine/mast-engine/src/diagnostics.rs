@@ -1594,11 +1594,42 @@ impl Engine {
                 .map_err(crate::internal_err)?
             }
             REPAIR_TRUST_PROXY_CA => {
-                let no_op = self.proxy_ca_trusted().await;
+                let trusted = self.proxy_ca_trusted().await;
+                // System trust is only half the Linux story — Chromium-family
+                // browsers read ~/.pki/nssdb, and the plan must say which
+                // half is left rather than call a half-done job finished.
+                let nss_gap = if trusted { self.proxy_nss_gap().await } else { None };
                 let exported = self.inner.deps.store.proxy_dir().join("root.crt");
-                let summary = if no_op {
-                    vec!["the proxy CA is already in the system trust store — nothing to do"
-                        .to_string()]
+                let no_op = trusted
+                    && !matches!(nss_gap, Some(mast_diagnostics::NssTrustGap::CaMissing));
+                let summary = if trusted {
+                    match nss_gap {
+                        Some(mast_diagnostics::NssTrustGap::CaMissing) => vec![
+                            "the system trust store already holds the CA — that half is done"
+                                .into(),
+                            "add it to ~/.pki/nssdb (certutil) so Chromium-family \
+                             browsers (Chrome, Vivaldi, Brave, Edge) trust it too — no \
+                             elevation needed for this step"
+                                .into(),
+                            "fully restart the browser afterwards".into(),
+                        ],
+                        Some(mast_diagnostics::NssTrustGap::CertutilMissing) => vec![
+                            "the system trust store already holds the CA".into(),
+                            "but Chromium-family browsers (Chrome, Vivaldi, Brave, \
+                             Edge) read ~/.pki/nssdb, and certutil — the tool that \
+                             writes it — is not installed, so there is nothing this \
+                             fix can do yet"
+                                .into(),
+                            "install libnss3-tools (Debian/Ubuntu) or nss-tools \
+                             (Fedora), then open this fix again"
+                                .into(),
+                        ],
+                        None => vec![
+                            "the proxy CA is already trusted everywhere Mast can \
+                             reach — nothing to do"
+                                .to_string(),
+                        ],
+                    }
                 } else if cfg!(target_os = "macos") {
                     vec![
                         "copy the proxy's root certificate out of the mast-proxy container"
@@ -2385,41 +2416,62 @@ impl Engine {
                             .into(),
                     });
                 }
-                let script = if cfg!(target_os = "macos") {
-                    format!(
-                        "security add-trusted-cert -d -r trustRoot \
-                         -k /Library/Keychains/System.keychain '{crt_str}'"
-                    )
+                // The elevated half only when the system store does not
+                // already hold the CA — re-running to finish the NSS half
+                // must not raise a pointless elevation prompt.
+                if self.proxy_ca_trusted().await {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "system trust store already holds the CA — skipping \
+                                   the elevated step"
+                                .into(),
+                            stderr: false,
+                        },
+                    );
                 } else {
-                    let (dest, refresh) = if std::path::Path::new(
-                        "/usr/local/share/ca-certificates",
-                    )
-                    .is_dir()
-                    {
-                        ("/usr/local/share/ca-certificates/mast-proxy.crt", "update-ca-certificates")
-                    } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir() {
-                        ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                    let script = if cfg!(target_os = "macos") {
+                        format!(
+                            "security add-trusted-cert -d -r trustRoot \
+                             -k /Library/Keychains/System.keychain '{crt_str}'"
+                        )
                     } else {
-                        return Err(ErrorInfo::Internal {
-                            message: format!(
-                                "no known system trust store on this machine — the \
-                                 certificate was exported to {crt_str}; install it \
-                                 manually (the HTTPS dialog can copy the path or PEM)"
-                            ),
-                        });
+                        let (dest, refresh) = if std::path::Path::new(
+                            "/usr/local/share/ca-certificates",
+                        )
+                        .is_dir()
+                        {
+                            (
+                                "/usr/local/share/ca-certificates/mast-proxy.crt",
+                                "update-ca-certificates",
+                            )
+                        } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors")
+                            .is_dir()
+                        {
+                            ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                        } else {
+                            return Err(ErrorInfo::Internal {
+                                message: format!(
+                                    "no known system trust store on this machine — the \
+                                     certificate was exported to {crt_str}; install it \
+                                     manually (the HTTPS dialog can copy the path or PEM)"
+                                ),
+                            });
+                        };
+                        format!("install -m 644 '{crt_str}' {dest} && {refresh}")
                     };
-                    format!("install -m 644 '{crt_str}' {dest} && {refresh}")
-                };
-                let argv = crate::proxy::privileged_shell_argv(&script);
-                self.run_streamed_command(
-                    handle,
-                    op,
-                    &argv,
-                    None,
-                    &crate::Redactor::default(),
-                    Duration::from_secs(5 * 60),
-                )
-                .await?;
+                    let argv = crate::proxy::privileged_shell_argv(&script);
+                    self.run_streamed_command(
+                        handle,
+                        op,
+                        &argv,
+                        None,
+                        &crate::Redactor::default(),
+                        Duration::from_secs(5 * 60),
+                    )
+                    .await?;
+                }
                 // Chrome/Chromium on Linux read NSS, not the system store;
                 // best-effort, and its absence only means a browser warning
                 // remains. On macOS the keychain covers them already.
