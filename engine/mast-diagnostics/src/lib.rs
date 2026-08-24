@@ -57,6 +57,7 @@ pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
+pub const REPAIR_INSTALL_CERTUTIL: &str = "install-certutil";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -593,6 +594,18 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             }
             .into(),
             arg: arg.map(str::to_string),
+        }),
+        REPAIR_INSTALL_CERTUTIL => Some(RepairSpec {
+            id: REPAIR_INSTALL_CERTUTIL,
+            title: "Install certutil and finish browser trust".into(),
+            risk: RiskTier::HighRisk,
+            description: "Installs the NSS tools package (libnss3-tools / nss-tools) with \
+                          your distribution's package manager via pkexec, then adds the \
+                          local HTTPS certificate authority to ~/.pki/nssdb so \
+                          Chromium-family browsers trust it — the half the system trust \
+                          store cannot reach."
+                .into(),
+            arg: None,
         }),
         REPAIR_TRUST_PROXY_CA => Some(RepairSpec {
             id: REPAIR_TRUST_PROXY_CA,

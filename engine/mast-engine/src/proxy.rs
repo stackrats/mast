@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mast_contract::{ErrorInfo, OperationEventKind, OperationId, PatchEvent, ProjectId};
-use mast_diagnostics::{REPAIR_HOSTS_ENTRY, REPAIR_TRUST_PROXY_CA};
+use mast_diagnostics::{REPAIR_HOSTS_ENTRY, REPAIR_INSTALL_CERTUTIL, REPAIR_TRUST_PROXY_CA};
 use mast_docker::run_command;
 
 use crate::ops::OpHandle;
@@ -58,6 +58,32 @@ fn osascript_admin_argv(script: &str) -> Vec<String> {
 /// every platform so the mac branch cannot rot unnoticed on Linux builds.
 pub(crate) fn privileged_shell_argv(script: &str) -> Vec<String> {
     if cfg!(target_os = "macos") { osascript_admin_argv(script) } else { pkexec_argv(script) }
+}
+
+/// Is a binary reachable through `PATH`?
+pub(crate) fn on_path(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| dir.join(binary).is_file())
+}
+
+/// The elevated one-liner that installs the NSS tools (certutil) with this
+/// machine's package manager, plus the package's name for the messages.
+/// `None` when no manager Mast knows is on `PATH` — Linux only; on macOS
+/// the keychain already covers Chromium-family browsers.
+pub(crate) fn certutil_install_script() -> Option<(&'static str, String)> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    [
+        ("apt-get", "libnss3-tools", "apt-get install -y libnss3-tools"),
+        ("dnf", "nss-tools", "dnf install -y nss-tools"),
+        ("yum", "nss-tools", "yum install -y nss-tools"),
+        ("pacman", "nss", "pacman -S --noconfirm nss"),
+        ("zypper", "mozilla-nss-tools", "zypper --non-interactive install mozilla-nss-tools"),
+    ]
+    .into_iter()
+    .find(|(manager, _, _)| on_path(manager))
+    .map(|(_, package, script)| (package, script.to_string()))
 }
 
 /// How the elevation prompt is described to the user before they consent.
@@ -265,11 +291,10 @@ impl Engine {
             Some(mast_diagnostics::NssTrustGap::CertutilMissing) => {
                 out("the system store trusts the certificate authority, but \
                      Chromium-family browsers (Chrome, Vivaldi, Brave, Edge) read \
-                     ~/.pki/nssdb and certutil is not installed — install \
-                     libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora), then press \
-                     Fix to finish"
+                     ~/.pki/nssdb and certutil is not installed — Fix installs the NSS \
+                     tools and finishes the job"
                     .into());
-                self.offer_fix(handle, id, project, REPAIR_TRUST_PROXY_CA, None);
+                self.offer_fix(handle, id, project, REPAIR_INSTALL_CERTUTIL, None);
             }
             Some(mast_diagnostics::NssTrustGap::CaMissing) => {
                 out("the system store trusts the certificate authority, but the NSS \
