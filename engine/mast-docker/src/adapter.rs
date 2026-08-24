@@ -133,12 +133,14 @@ pub struct BollardAdapter {
 
 impl BollardAdapter {
     /// Map the resolved endpoint onto a bollard transport (ADR-0002):
-    /// unix + tcp/http are supported for observation; ssh/npipe/fd are not
+    /// unix + tcp/http everywhere, npipe on Windows; ssh/fd are not supported
     /// (documented degradation — CLI lifecycle is unaffected).
     pub fn connect(endpoint: &DockerEndpoint) -> Result<Self, DockerError> {
         let host = endpoint.host.as_str();
         let docker = if host.starts_with("unix://") {
             connect_unix(host)?
+        } else if host.starts_with("npipe://") {
+            connect_npipe(host)?
         } else if host.starts_with("tcp://") || host.starts_with("http://") {
             Docker::connect_with_http(host, 30, bollard::API_DEFAULT_VERSION)
                 .map_err(|e| DockerError::Api(e.to_string()))?
@@ -155,11 +157,28 @@ fn connect_unix(host: &str) -> Result<Docker, DockerError> {
         .map_err(|e| DockerError::Api(e.to_string()))
 }
 
-/// Windows adapter TODO: bollard has no unix-socket transport there at all
-/// (npipe:// is what Docker Desktop speaks), so a unix endpoint degrades the
-/// same documented way ssh/fd do — observation is lost, CLI lifecycle is not.
+/// bollard has no unix-socket transport on Windows, so a unix endpoint there
+/// degrades the documented way ssh/fd do — observation lost, CLI lifecycle
+/// unaffected. (Docker Desktop on Windows speaks npipe://, handled below.)
 #[cfg(not(unix))]
 fn connect_unix(host: &str) -> Result<Docker, DockerError> {
+    Err(DockerError::UnsupportedEndpoint(host.to_string()))
+}
+
+/// `npipe:////./pipe/dockerDesktopLinuxEngine` — what `docker context
+/// inspect` reports on a stock Docker Desktop for Windows. bollard's
+/// named-pipe transport (its `pipe` default feature) takes the address in
+/// exactly this form, so Windows gets live observation like everyone else.
+#[cfg(windows)]
+fn connect_npipe(host: &str) -> Result<Docker, DockerError> {
+    Docker::connect_with_named_pipe(host, 30, bollard::API_DEFAULT_VERSION)
+        .map_err(|e| DockerError::Api(e.to_string()))
+}
+
+/// An npipe endpoint anywhere but Windows is a misconfiguration (a copied
+/// DOCKER_HOST, usually) — degrade it the documented way.
+#[cfg(not(windows))]
+fn connect_npipe(host: &str) -> Result<Docker, DockerError> {
     Err(DockerError::UnsupportedEndpoint(host.to_string()))
 }
 
