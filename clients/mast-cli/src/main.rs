@@ -63,8 +63,11 @@ enum Command {
         #[arg(long)]
         service: Option<String>,
     },
-    /// Run the full diagnostic check set.
-    Diagnose,
+    /// Run the diagnostic check set — everything, or one project's findings.
+    Diagnose {
+        /// Project name (or path suffix) to scope the report to.
+        project: Option<String>,
+    },
     /// What Mast has run and written recently, newest last.
     History {
         /// Include Mast's own upkeep (resolution, probes, inspection).
@@ -105,7 +108,7 @@ async fn main() {
         Command::Restart { project, service } => {
             lifecycle(client.as_ref(), &project, service, "restart").await
         }
-        Command::Diagnose => diagnose(client.as_ref()).await,
+        Command::Diagnose { project } => diagnose(client.as_ref(), project).await,
         Command::History { background, limit } => {
             history(client.as_ref(), background, limit).await
         }
@@ -370,9 +373,19 @@ async fn lifecycle(
     0
 }
 
-async fn diagnose(client: &dyn MastClient) -> i32 {
-    let _ = settled_snapshot(client).await;
-    let report = match client.run_diagnostics().await {
+async fn diagnose(client: &dyn MastClient, wanted: Option<String>) -> i32 {
+    let snap = settled_snapshot(client).await;
+    let scope = match wanted {
+        Some(wanted) => match resolve_project(&snap, &wanted) {
+            Ok((id, _)) => Some(id),
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let report = match client.run_diagnostics(scope).await {
         Ok(report) => report,
         Err(e) => {
             eprintln!("diagnostics failed: {e}");

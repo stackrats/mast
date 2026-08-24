@@ -2785,6 +2785,18 @@ async fn a_stale_app_url_is_found_and_repaired() {
         .expect("the stale APP_URL must be found");
     assert_eq!(f.repair.as_ref().unwrap().id, "fix-app-url");
 
+    // A scoped run carries only this project's findings and stays out of
+    // recorded history; an unknown project is refused.
+    let scoped = engine.run_diagnostics_scoped(Some(&pid)).await.unwrap();
+    assert!(scoped.findings.iter().any(|f| f.check == "stale-app-url"));
+    assert!(scoped.findings.iter().all(|f| f.project.as_ref() == Some(&pid)), "{scoped:?}");
+    assert!(
+        engine
+            .run_diagnostics_scoped(Some(&mast_contract::ProjectId("nope".into())))
+            .await
+            .is_err()
+    );
+
     // Preview shows the exact .env edit; applying makes it and nothing else.
     let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
     assert!(!plan.no_op);
