@@ -35,14 +35,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      # Pinned like ci.yml: the curl installer tracks upstream's latest,
-      # which can reference not-yet-published packages.
-      - name: Install Vite Plus
-        run: npm install -g vite-plus@0.2.6
-      - name: vp install + build
+      # The workspace's own pinned vp, through pnpm — same reasoning as
+      # ci.yml: no dependence on the curl installer's idea of latest.
+      - name: Install dependencies (pnpm, frozen lockfile)
         run: |
-          vp install
-          vp build
+          npm install -g pnpm@11.1.2
+          pnpm install --frozen-lockfile
+      - name: vp build
+        run: pnpm exec vp build
       - uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
