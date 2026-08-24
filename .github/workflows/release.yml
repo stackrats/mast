@@ -1,0 +1,123 @@
+name: Release binaries
+
+# Builds the desktop bundles and the mast/mast-daemon binaries for macOS
+# (Apple Silicon + Intel) and Windows, and uploads them to the release for
+# the given tag. Linux assets are built and uploaded from the dev machine
+# today; this covers the platforms that cannot be cross-compiled from it.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets to (e.g. v0.3.0)"
+        required: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The web assets are platform-independent — build them once, with the
+  # same Vite Plus toolchain CI already proves, and hand the dist to the
+  # per-OS bundle jobs so Windows never needs the vp installer.
+  frontend:
+    name: Frontend dist
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/desktop-vue
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Vite Plus
+        run: curl -fsSL https://vite.plus | bash
+      - name: vp install + build
+        run: |
+          export PATH="$HOME/.vite-plus/bin:$PATH"
+          vp install
+          vp build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: clients/desktop-vue/dist
+          if-no-files-found: error
+
+  desktop:
+    name: ${{ matrix.suffix }}
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+            suffix: macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+            suffix: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            suffix: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.suffix }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: clients/desktop-vue/dist
+      - name: Build mast + mast-daemon
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p mast-cli -p mast-daemon
+      - name: Build desktop bundle
+        shell: bash
+        working-directory: clients/desktop-vue
+        run: |
+          # dist is prebuilt; null out beforeBuildCommand so tauri does not
+          # reach for vp on this runner.
+          printf '{"build":{"beforeBuildCommand":null}}' > ci-config.json
+          npx --yes @tauri-apps/cli@^2 build \
+            --target ${{ matrix.target }} \
+            --bundles ${{ matrix.bundles }} \
+            --config ci-config.json
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BIN="target/${{ matrix.target }}/release"
+          STAGE="$(mktemp -d)"
+          if [[ "${{ matrix.os }}" == windows-latest ]]; then
+            cp "$BIN/mast.exe" "$BIN/mast-daemon.exe" "$STAGE/"
+            ARCHIVE="mast-$VERSION-${{ matrix.suffix }}.zip"
+            (cd "$STAGE" && 7z a -bd "$OLDPWD/$ARCHIVE" mast.exe mast-daemon.exe)
+          else
+            cp "$BIN/mast" "$BIN/mast-daemon" "$STAGE/"
+            ARCHIVE="mast-$VERSION-${{ matrix.suffix }}.tar.gz"
+            tar -czf "$ARCHIVE" -C "$STAGE" mast mast-daemon
+          fi
+          UPLOADS=("$ARCHIVE")
+          shopt -s nullglob
+          for bundle in "$BIN"/bundle/dmg/*.dmg "$BIN"/bundle/nsis/*-setup.exe; do
+            UPLOADS+=("$bundle")
+          done
+          gh release upload "$TAG" "${UPLOADS[@]}" --clobber
