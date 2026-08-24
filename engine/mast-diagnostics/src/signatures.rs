@@ -31,6 +31,14 @@ pub fn extract_repair_arg(sig: &ErrorSignature, line: &str) -> Option<String> {
             let name = tokens.get(at + 1)?.trim_matches(['"', '\'', '`']);
             (!name.is_empty()).then(|| name.to_string())
         }
+        // "container 9765fe… is not connected to the network thinksolar_api_net"
+        // — the network name follows the LAST "network" token.
+        "stale-network-endpoint" => {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let at = tokens.iter().rposition(|t| *t == "network")?;
+            let name = tokens.get(at + 1)?.trim_matches(['"', '\'', '`', '.', ':']);
+            (!name.is_empty()).then(|| name.to_string())
+        }
         _ => None,
     }
 }
@@ -102,6 +110,17 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       not exist on the daemon",
         advice: "run Diagnostics — creating the missing network is a one-click repair",
         repair: Some(crate::REPAIR_CREATE_NETWORK),
+    },
+    ErrorSignature {
+        id: "stale-network-endpoint",
+        needles: &["is not connected to the network"],
+        explanation: "the project network still holds an endpoint record for a container \
+                      that no longer exists (the residue of a force-removed container), \
+                      so compose cannot remove or re-sync the network — every down/up \
+                      that touches it fails",
+        advice: "clearing the stale endpoint record is a one-click repair; the network \
+                 itself is recreated by the next start",
+        repair: Some(crate::REPAIR_DISCONNECT_STALE),
     },
     ErrorSignature {
         id: "dependency-unhealthy",
@@ -240,6 +259,14 @@ mod tests {
         let port = classify_line("bind: address already in use").unwrap();
         assert_eq!(port.repair, Some(crate::REPAIR_REASSIGN_PORTS));
         assert_eq!(extract_repair_arg(port, "bind: address already in use"), None);
+
+        // The exact daemon wording seen live: the network name follows the
+        // LAST "network" token, past the container id.
+        let line = "Error response from daemon: container 9765fe4e8e62cd621b90d7dbbc92a16d \
+                    is not connected to the network thinksolar_api_net";
+        let stale = classify_line(line).unwrap();
+        assert_eq!(stale.repair, Some(crate::REPAIR_DISCONNECT_STALE));
+        assert_eq!(extract_repair_arg(stale, line).as_deref(), Some("thinksolar_api_net"));
     }
 
     #[test]

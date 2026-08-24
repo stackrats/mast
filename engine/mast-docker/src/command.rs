@@ -174,6 +174,10 @@ async fn run_command_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A GUI-subsystem parent on Windows gets a fresh console window for
+    // every console-subsystem child — one flash per docker/git call.
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -199,7 +203,10 @@ async fn run_command_inner(
 
 /// Launch an external application (terminal, editor, file manager) detached:
 /// own process group, no captured output, outlives Mast. Argv-only.
-pub fn spawn_detached(argv: &[String], cwd: Option<&Path>) -> Result<(), CommandError> {
+/// `console` keeps the Windows console window — wanted exactly once, for
+/// launching a terminal; every other launch (explorer, `code.cmd` through
+/// cmd.exe) would otherwise flash one.
+pub fn spawn_detached(argv: &[String], cwd: Option<&Path>, console: bool) -> Result<(), CommandError> {
     let watchers = start_all(&CommandStart {
         argv,
         cwd,
@@ -207,7 +214,7 @@ pub fn spawn_detached(argv: &[String], cwd: Option<&Path>) -> Result<(), Command
         streaming: false,
         detached: true,
     });
-    let result = spawn_detached_inner(argv, cwd);
+    let result = spawn_detached_inner(argv, cwd, console);
     match &result {
         Ok(()) => finish_all(watchers, CommandFinish::Detached, &[]),
         Err(e) => finish_all(watchers, CommandFinish::Failed(e.to_string()), &[]),
@@ -215,7 +222,7 @@ pub fn spawn_detached(argv: &[String], cwd: Option<&Path>) -> Result<(), Command
     result
 }
 
-fn spawn_detached_inner(argv: &[String], cwd: Option<&Path>) -> Result<(), CommandError> {
+fn spawn_detached_inner(argv: &[String], cwd: Option<&Path>, console: bool) -> Result<(), CommandError> {
     let argv0 = argv.first().cloned().unwrap_or_default();
     let mut cmd = std::process::Command::new(&argv0);
     cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -223,6 +230,12 @@ fn spawn_detached_inner(argv: &[String], cwd: Option<&Path>) -> Result<(), Comma
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        let _ = console;
+    }
+    #[cfg(windows)]
+    if !console {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -244,6 +257,11 @@ pub struct OutputLine {
     pub line: String,
     pub stderr: bool,
 }
+
+/// No console window for captured-output children (docker, git, compose):
+/// a GUI-subsystem parent otherwise flashes one per spawn.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(unix)]
 const SIG_TERM: i32 = libc::SIGTERM;
@@ -322,6 +340,8 @@ async fn run_streaming_inner(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

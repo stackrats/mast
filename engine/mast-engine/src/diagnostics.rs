@@ -16,8 +16,9 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
-    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_INSTALL_CERTUTIL, REPAIR_REASSIGN_PORTS,
-    REPAIR_RECREATE_SERVICE, REPAIR_TRUST_PROXY_CA,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_DISCONNECT_STALE, REPAIR_FIX_APP_URL,
+    REPAIR_INSTALL_CERTUTIL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE,
+    REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -1235,6 +1236,22 @@ impl Engine {
                     no_op: false,
                 })
             }
+            REPAIR_DISCONNECT_STALE => {
+                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "disconnect-stale-endpoints needs a network name".into(),
+                })?;
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("inspect network {net} for endpoint records"),
+                        "force-disconnect every record whose container no longer exists"
+                            .into(),
+                        "containers that still exist are left untouched".into(),
+                    ],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
             REPAIR_FIX_APP_URL => {
                 let path = self.project_path(self.require_project(project)?)?;
                 tokio::task::spawn_blocking(move || {
@@ -1923,6 +1940,83 @@ impl Engine {
                 } else {
                     Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
                 }
+            }
+            REPAIR_DISCONNECT_STALE => {
+                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "disconnect-stale-endpoints needs a network name".into(),
+                })?;
+                let inspect: Vec<String> = [
+                    "docker",
+                    "network",
+                    "inspect",
+                    "--format",
+                    "{{range $id, $e := .Containers}}{{$id}} {{$e.Name}}\n{{end}}",
+                    net,
+                ]
+                .map(String::from)
+                .into();
+                let out = run_command(&inspect, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !out.success() {
+                    // Nothing to clean if the network itself is gone.
+                    if out.stderr.contains("not found") {
+                        self.emit_op(
+                            handle,
+                            op,
+                            OperationEventKind::Output {
+                                line: format!("network {net} no longer exists — nothing to clear"),
+                                stderr: false,
+                            },
+                        );
+                        self.hint();
+                        return Ok(());
+                    }
+                    return Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() });
+                }
+                let mut cleared = 0usize;
+                for line in out.stdout.lines() {
+                    let mut parts = line.split_whitespace();
+                    let Some(id) = parts.next() else { continue };
+                    let name = parts.next().unwrap_or(id);
+                    // A container that still exists keeps its endpoint; only
+                    // records whose container is gone are stale.
+                    let probe: Vec<String> =
+                        ["docker", "inspect", "--format", "{{.Id}}", id].map(String::from).into();
+                    let exists = run_command(&probe, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                        .map(|o| o.success())
+                        .unwrap_or(false);
+                    if exists {
+                        continue;
+                    }
+                    let disconnect: Vec<String> =
+                        ["docker", "network", "disconnect", "-f", net, name]
+                            .map(String::from)
+                            .into();
+                    let out = run_command(&disconnect, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                        .map_err(crate::internal_err)?;
+                    let line = if out.success() {
+                        cleared += 1;
+                        format!("cleared stale endpoint {name}")
+                    } else {
+                        format!("could not clear {name}: {}", out.stderr.trim())
+                    };
+                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                }
+                if cleared == 0 {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "no stale endpoints found".into(),
+                            stderr: false,
+                        },
+                    );
+                }
+                self.hint();
+                Ok(())
             }
             REPAIR_REASSIGN_PORTS => {
                 let project = self.require_project(project)?;
