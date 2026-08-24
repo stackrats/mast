@@ -10,6 +10,7 @@ import {
   Database,
   FileCog,
   Globe,
+  Hammer,
   Lock,
   Plus,
   FolderOpen,
@@ -101,7 +102,10 @@ function serviceDot(service: ServiceState): string {
   return "bg-slate-400";
 }
 
-function lifecycle(label: string, type: "startProject" | "stopProject" | "restartProject") {
+function lifecycle(
+  label: string,
+  type: "startProject" | "stopProject" | "restartProject" | "rebuildProject",
+) {
   void store.runLifecycle(project.id, label, { type, id: project.id });
 }
 
@@ -568,6 +572,18 @@ async function clearAppLog() {
               <Square class="h-3.5 w-3.5" /> Stop
             </Button>
           </template>
+          <Tooltip
+            text="Rebuild images, pull newer ones and recreate every container — for when the compose config changed underneath the project (e.g. after a git pull)."
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              :disabled="project.resolutionError != null"
+              @click="lifecycle('rebuild', 'rebuildProject')"
+            >
+              <Hammer class="h-3.5 w-3.5" /> Rebuild
+            </Button>
+          </Tooltip>
           <Tooltip text="Remove this project from Mast (files stay untouched).">
             <Button
               variant="ghost"
@@ -743,11 +759,20 @@ async function clearAppLog() {
           <DropdownMenuTrigger as-child>
             <Chip :dot="serviceDot(service)">
               {{ service.name }}
+              <TriangleAlert v-if="service.orphaned" class="h-3 w-3 text-amber-500" />
               <ChevronDown class="h-3 w-3 text-slate-400" />
             </Chip>
           </DropdownMenuTrigger>
           <DropdownMenuPortal>
             <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+              <div
+                v-if="service.orphaned"
+                class="max-w-56 px-2 py-1.5 text-[11px] leading-snug text-amber-600 dark:text-amber-400"
+              >
+                Leftover container from an earlier compose config — stop it here, or Rebuild the
+                project to replace the whole set.
+              </div>
+              <DropdownMenuSeparator v-if="service.orphaned" :class="menuSeparatorClass" />
               <DropdownMenuItem
                 v-if="service.uiUrl"
                 :class="menuItemClass"
