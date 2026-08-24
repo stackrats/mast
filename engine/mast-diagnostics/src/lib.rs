@@ -88,6 +88,20 @@ pub struct SocketFacts {
     pub writable: bool,
 }
 
+/// Why Chromium-family browsers (Chrome, Vivaldi, Brave, Edge) still warn
+/// about the local HTTPS proxy on Linux even though the *system* store
+/// trusts its certificate authority: they read the NSS user store
+/// (`~/.pki/nssdb`), which is a separate step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NssTrustGap {
+    /// `certutil` (libnss3-tools / nss-tools) is not installed, so the
+    /// trust repair could only fill the system store.
+    CertutilMissing,
+    /// `certutil` exists but the CA is not in `~/.pki/nssdb` yet —
+    /// re-applying the trust repair adds it.
+    CaMissing,
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemFacts {
     pub docker_connected: bool,
@@ -111,6 +125,10 @@ pub struct SystemFacts {
     pub selinux_enforcing: bool,
     pub uid: u32,
     pub gid: u32,
+    /// The system store trusts the HTTPS proxy's CA but Chromium-family
+    /// browsers still would not (Linux; probed only once the trust repair
+    /// has filled the system store). `None` = no gap or not applicable.
+    pub proxy_nss_gap: Option<NssTrustGap>,
 }
 
 /// Outcome of probing the project's database service with the credentials

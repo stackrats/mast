@@ -22,6 +22,10 @@ pub(crate) const PROXY_CONTAINER: &str = "mast-proxy";
 /// Where Caddy's internal CA keeps its root inside the container.
 pub(crate) const CA_IN_CONTAINER: &str =
     "mast-proxy:/data/caddy/pki/authorities/local/root.crt";
+/// The nickname the CA is filed under in `~/.pki/nssdb` — written by the
+/// trust repair, read back by the NSS gap probe.
+pub(crate) const NSS_NICKNAME: &str = "Mast local HTTPS (Caddy)";
+
 const PROXY_IMAGE: &str = "caddy:2-alpine";
 /// Generous: the first enable pulls the caddy image.
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(180);
@@ -254,7 +258,29 @@ impl Engine {
                 .into());
             self.offer_fix(handle, id, project, REPAIR_TRUST_PROXY_CA, None);
         }
-        if hosts_resolves(&hosts, &domain) && trusted {
+        // System trust alone leaves Chromium-family browsers (Chrome,
+        // Vivaldi, Brave, Edge) warning on Linux — they read NSS instead.
+        let nss_gap = if trusted { self.proxy_nss_gap().await } else { None };
+        match nss_gap {
+            Some(mast_diagnostics::NssTrustGap::CertutilMissing) => {
+                out("the system store trusts the certificate authority, but \
+                     Chromium-family browsers (Chrome, Vivaldi, Brave, Edge) read \
+                     ~/.pki/nssdb and certutil is not installed — install \
+                     libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora), then press \
+                     Fix to finish"
+                    .into());
+                self.offer_fix(handle, id, project, REPAIR_TRUST_PROXY_CA, None);
+            }
+            Some(mast_diagnostics::NssTrustGap::CaMissing) => {
+                out("the system store trusts the certificate authority, but the NSS \
+                     store Chromium-family browsers read does not yet — Fix adds it \
+                     (restart the browser afterwards)"
+                    .into());
+                self.offer_fix(handle, id, project, REPAIR_TRUST_PROXY_CA, None);
+            }
+            None => {}
+        }
+        if hosts_resolves(&hosts, &domain) && trusted && nss_gap.is_none() {
             out(format!("open https://{domain} — everything is in place"));
         }
         Ok(())
@@ -264,6 +290,9 @@ impl Engine {
     /// the file the trust repair installs; macOS asks the keychain to verify
     /// the exported root (`security verify-cert`), because there is no
     /// marker file to look for.
+    ///
+    /// Linux carries a second, separate question: Chromium-family browsers
+    /// read the NSS user store, not this one — [`proxy_nss_gap`] answers it.
     pub(crate) async fn proxy_ca_trusted(&self) -> bool {
         if cfg!(target_os = "macos") {
             let crt = self.inner.deps.store.proxy_dir().join("root.crt");
@@ -281,6 +310,29 @@ impl Engine {
         }
         std::path::Path::new("/usr/local/share/ca-certificates/mast-proxy.crt").exists()
             || std::path::Path::new("/etc/pki/ca-trust/source/anchors/mast-proxy.crt").exists()
+    }
+
+    /// The Chromium half of Linux trust: Chrome, Vivaldi, Brave and Edge
+    /// read the NSS user store (`~/.pki/nssdb`), not the system store the
+    /// trust repair fills first — a user can do everything asked and still
+    /// meet ERR_CERT_AUTHORITY_INVALID. `None` = no gap (or macOS, where
+    /// the keychain covers those browsers).
+    pub(crate) async fn proxy_nss_gap(&self) -> Option<mast_diagnostics::NssTrustGap> {
+        if cfg!(target_os = "macos") {
+            return None;
+        }
+        let home = std::env::var_os("HOME")?;
+        let db = format!("sql:{}", std::path::PathBuf::from(home).join(".pki/nssdb").display());
+        let argv: Vec<String> =
+            ["certutil", "-d", db.as_str(), "-L", "-n", NSS_NICKNAME].map(String::from).into();
+        match run_command(&argv, None, &[], Duration::from_secs(10), OUTPUT_CAP).await {
+            Ok(out) if out.success() => None,
+            // certutil ran and the nickname is absent (a fresh or missing
+            // database answers the same way).
+            Ok(_) => Some(mast_diagnostics::NssTrustGap::CaMissing),
+            // The spawn itself failed: certutil is not installed.
+            Err(_) => Some(mast_diagnostics::NssTrustGap::CertutilMissing),
+        }
     }
 
     /// Export the proxy CA's root certificate to the data dir and return it
