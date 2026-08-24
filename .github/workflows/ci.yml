@@ -59,18 +59,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      # Pinned to the same version the pnpm catalog pins — the curl
-      # installer tracks upstream's latest, which can (and did) reference
-      # not-yet-published packages and take CI down with it.
-      - name: Install Vite Plus
-        run: npm install -g vite-plus@0.2.6
-      - name: vp install
-        run: vp install
+      # The workspace's own pinned vp, through pnpm — the curl installer
+      # tracks upstream's latest, which can (and did) reference
+      # not-yet-published packages and take CI down with it, and a global
+      # vp brings its own vitest that clashes with the workspace's.
+      - name: Install dependencies (pnpm, frozen lockfile)
+        run: |
+          npm install -g pnpm@11.1.2
+          pnpm install --frozen-lockfile
       - name: vp check + test + build
         run: |
-          vp check
-          vp test run
-          vp build
+          pnpm exec vp check
+          pnpm exec vp test run
+          pnpm exec vp build
 
   # Proves the vanilla vite/vitest escape hatch continuously (plan §9): the
   # workspace routes `vite` to vite-plus-core via a pnpm override, so this
