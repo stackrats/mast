@@ -16,7 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
-    REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE, REPAIR_TRUST_PROXY_CA,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE,
+    REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -202,6 +203,35 @@ struct ProjectSeed {
 /// Filesystem half of a project's facts — runs in `spawn_blocking`. The
 /// second value is the database the async half should probe, when there is
 /// one (`facts.db` stays `None` until that probe fills it).
+/// `APP_URL` pins a port the project does not publish while `APP_PORT`
+/// names another — the Browser button opens a refused connection. A URL
+/// port that *is* published (a proxy or second service, say) is a deliberate
+/// arrangement, not staleness.
+fn app_url_mismatch(
+    env: &std::collections::HashMap<String, String>,
+    host_ports: &[(String, u16)],
+) -> Option<(u16, u16)> {
+    let url_port = env.get("APP_URL").and_then(|v| mast_laravel::explicit_port(v))?;
+    let app_port = env.get("APP_PORT").and_then(|v| v.trim().parse::<u16>().ok())?;
+    if url_port == app_port || host_ports.iter().any(|(_, port)| *port == url_port) {
+        return None;
+    }
+    Some((url_port, app_port))
+}
+
+/// The edit `fix-app-url` will make — recomputed fresh from the file, since
+/// the report may be stale by the time the user consents. `None` when
+/// APP_URL and APP_PORT already agree (or either says nothing).
+fn app_url_rewrite(file: &mast_laravel::EnvFile) -> Option<String> {
+    let url = file.get("APP_URL")?.value.clone();
+    let from = mast_laravel::explicit_port(&url)?;
+    let to = file.get("APP_PORT")?.value.trim().parse::<u16>().ok()?;
+    if from == to {
+        return None;
+    }
+    mast_laravel::rewrite_explicit_port(&url, from, to)
+}
+
 fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
@@ -235,6 +265,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
     let is_laravel = std::fs::read_to_string(seed.path.join("composer.json"))
         .map(|c| c.contains("laravel/framework"))
         .unwrap_or(false);
+    let url_mismatch = app_url_mismatch(&env, &seed.host_ports);
     let facts = ProjectFacts {
         sail_flavored,
         is_laravel,
@@ -267,6 +298,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         resolution_error: seed.resolution_error,
         db: None,
         db_versions: Vec::new(),
+        app_url_mismatch: url_mismatch,
         config_cached: seed.path.join("bootstrap/cache/config.php").is_file(),
         dotted_services: seed
             .services
@@ -890,6 +922,45 @@ impl Engine {
         .map_err(crate::internal_err)?
     }
 
+    /// What `artisan-migrate` needs: the invocation and the app service
+    /// (`APP_SERVICE`, default laravel.test) read fresh from `.env` and
+    /// validated against the resolved model before it lands in an argv.
+    fn migrate_target(
+        &self,
+        project: &ProjectId,
+    ) -> Result<(mast_compose::ComposeInvocation, String, PathBuf, crate::Redactor), ErrorInfo>
+    {
+        let (invocation, path, redactor, services) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            let invocation =
+                entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "the project's compose invocation is not resolved".into(),
+                })?;
+            let services: Vec<String> = entry
+                .model
+                .as_ref()
+                .map(|m| m.services.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            (invocation, entry.record.path.clone(), entry.redactor.clone(), services)
+        };
+        let src = std::fs::read_to_string(path.join(".env")).unwrap_or_default();
+        let service = mast_laravel::EnvFile::parse(&src)
+            .get("APP_SERVICE")
+            .map(|e| e.value.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "laravel.test".to_string());
+        if !services.iter().any(|s| s == &service) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!("app service \"{service}\" is not in the compose model"),
+            });
+        }
+        Ok((invocation, service, path, redactor))
+    }
+
     /// Validate a `recreate-service` arg and gather what its compose command
     /// needs. The arg travels through the UI, so every named service must
     /// exist in the resolved model before it lands in an argv.
@@ -1064,6 +1135,61 @@ impl Engine {
                 })?;
                 Ok(RepairPlan {
                     summary: vec![format!("run: docker network create {net}")],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_FIX_APP_URL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let before =
+                        std::fs::read_to_string(&env_path).map_err(crate::internal_err)?;
+                    let mut file = mast_laravel::EnvFile::parse(&before);
+                    let rewrite = app_url_rewrite(&file);
+                    let (summary, no_op) = match &rewrite {
+                        Some(to) => (vec![format!("set APP_URL={to}")], false),
+                        None => (
+                            vec!["APP_URL already agrees with APP_PORT — nothing to do".into()],
+                            true,
+                        ),
+                    };
+                    if let Some(to) = &rewrite {
+                        file.set("APP_URL", to)
+                            .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    }
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            after: file.to_string(),
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_ARTISAN_MIGRATE => {
+                let project = self.require_project(project)?;
+                let (invocation, service, path, _) = self.migrate_target(project)?;
+                let tail: Vec<String> =
+                    ["php", "artisan", "migrate", "--force"].map(String::from).into();
+                let argv = crate::db_repair::exec_env_argv(&invocation, &service, &[], &tail);
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: {}", argv.join(" ")),
+                        format!("in: {}", path.display()),
+                        "applies this project's own migrations — nothing is dropped or \
+                         rolled back"
+                            .into(),
+                        "runs in the app container, which must be running".into(),
+                    ],
                     repair: offer,
                     file_preview: None,
                     no_op: false,
@@ -1656,6 +1782,66 @@ impl Engine {
                         },
                     );
                 }
+                Ok(())
+            }
+            REPAIR_FIX_APP_URL => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                let applied =
+                    tokio::task::spawn_blocking(move || -> Result<Option<String>, ErrorInfo> {
+                        let mut applied = None;
+                        mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                            if let Some(to) = app_url_rewrite(f) {
+                                f.set("APP_URL", &to)?;
+                                applied = Some(to);
+                            }
+                            Ok(())
+                        })
+                        .map_err(crate::env_write_error)?;
+                        Ok(applied)
+                    })
+                    .await
+                    .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: match applied {
+                            Some(url) => format!("APP_URL now {url}"),
+                            None => {
+                                "APP_URL already agrees with APP_PORT — nothing to change".into()
+                            }
+                        },
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_ARTISAN_MIGRATE => {
+                let project = self.require_project(project)?;
+                let (invocation, service, path, redactor) = self.migrate_target(project)?;
+                let tail: Vec<String> =
+                    ["php", "artisan", "migrate", "--force"].map(String::from).into();
+                let argv = crate::db_repair::exec_env_argv(&invocation, &service, &[], &tail);
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("$ {}", argv.join(" ")),
+                        stderr: false,
+                    },
+                );
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &redactor,
+                    Duration::from_secs(10 * 60),
+                )
+                .await?;
+                self.hint();
                 Ok(())
             }
             REPAIR_RECREATE_SERVICE => {

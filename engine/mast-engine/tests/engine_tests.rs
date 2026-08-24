@@ -2745,3 +2745,64 @@ async fn diagnostics_flag_a_running_container_detached_from_its_network() {
         report.findings.iter().map(|f| &f.check).collect::<Vec<_>>()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_app_url_is_found_and_repaired() {
+    // The bootstrap-template trap: APP_URL pins :8000 while a port remap
+    // moved APP_PORT to 8082 — the Browser button opens a dead address.
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "staleurl");
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    ports:\n      - '${APP_PORT:-80}:80'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "APP_PORT=8082\nAPP_URL=http://localhost:8000\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter)));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    wait_until(&engine, "env read and model resolved", |s| {
+        s.projects.first().is_some_and(|p| {
+            p.compose_project_name.is_some()
+                && p.app_url.as_deref() == Some("http://localhost:8000")
+        })
+    })
+    .await;
+    let pid = project_id(&engine);
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "stale-app-url")
+        .expect("the stale APP_URL must be found");
+    assert_eq!(f.repair.as_ref().unwrap().id, "fix-app-url");
+
+    // Preview shows the exact .env edit; applying makes it and nothing else.
+    let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
+    assert!(!plan.no_op);
+    let preview = plan.file_preview.as_ref().unwrap();
+    assert!(preview.after.contains("APP_URL=http://localhost:8082"), "{}", preview.after);
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "fix-app-url".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("APP_URL=http://localhost:8082"), "{env}");
+    assert!(env.contains("APP_PORT=8082"), "{env}");
+
+    // Healed: the report no longer carries the finding, and a second apply
+    // is a clean no-op.
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(report.findings.iter().all(|f| f.check != "stale-app-url"));
+    let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
+    assert!(plan.no_op);
+}
