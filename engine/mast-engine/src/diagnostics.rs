@@ -673,6 +673,15 @@ impl Engine {
             None
         };
 
+        // Only meaningful once the trust repair has filled the system store
+        // — before that, the whole trust step is still ahead and the HTTPS
+        // dialog owns the story.
+        let proxy_nss_gap = if self.proxy_ca_trusted().await {
+            self.proxy_nss_gap().await
+        } else {
+            None
+        };
+
         let endpoint = docker.endpoint.clone();
         let (uid, gid) = uid_gid();
         let socket = endpoint.as_deref().and_then(unix_socket_path).map(socket_facts);
@@ -848,6 +857,7 @@ impl Engine {
                 selinux_enforcing,
                 uid,
                 gid,
+                proxy_nss_gap,
             },
             projects,
             docker_networks,
@@ -2423,22 +2433,37 @@ impl Engine {
                     let db = format!("sql:{}", nssdb.display());
                     let add: Vec<String> = [
                         "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
-                        "Mast local HTTPS (Caddy)", "-i", crt_str.as_str(),
+                        crate::proxy::NSS_NICKNAME, "-i", crt_str.as_str(),
                     ]
                     .map(String::from)
                     .into();
                     let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
-                    let line = match nss {
-                        Ok(o) if o.success() => {
-                            "added to ~/.pki/nssdb — Chrome/Chromium trust it after a restart"
-                                .to_string()
-                        }
-                        _ => "certutil not available — Chrome/Chromium may still warn; \
-                              install libnss3-tools and re-apply, or import the certificate \
-                              in the browser"
-                            .to_string(),
+                    let (line, stderr) = match nss {
+                        Ok(o) if o.success() => (
+                            "added to ~/.pki/nssdb — Chromium-family browsers (Chrome, \
+                             Vivaldi, Brave, Edge) trust it after a full restart"
+                                .to_string(),
+                            false,
+                        ),
+                        Ok(o) => (
+                            format!(
+                                "could not add to ~/.pki/nssdb ({}) — Chromium-family \
+                                 browsers will keep warning",
+                                o.stderr.trim().lines().next().unwrap_or("certutil failed")
+                            ),
+                            true,
+                        ),
+                        Err(_) => (
+                            "certutil is not installed, so the NSS store Chromium-family \
+                             browsers (Chrome, Vivaldi, Brave, Edge) read was NOT updated \
+                             — they will keep warning. Install libnss3-tools \
+                             (Debian/Ubuntu) or nss-tools (Fedora) and apply this fix \
+                             again."
+                                .to_string(),
+                            true,
+                        ),
                     };
-                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr });
                 }
                 let done = if cfg!(target_os = "macos") {
                     "added to the System keychain — restart the browser; Firefox needs \

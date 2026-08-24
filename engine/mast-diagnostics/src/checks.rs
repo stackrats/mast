@@ -3,7 +3,8 @@
 //! tells the user everything passed).
 
 use crate::{
-    repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
+    repair_spec, Check, DiagCtx, Finding, NssTrustGap, ProjectFacts, RepairSpec, RiskTier,
+    Severity, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
@@ -1690,6 +1691,50 @@ impl Check for WorkspaceIntegrity {
     }
 }
 
+/// The half-trusted HTTPS state: the system store accepts the proxy's CA
+/// (so curl and the trust check are happy) while Chromium-family browsers
+/// still show ERR_CERT_AUTHORITY_INVALID, because on Linux they read the
+/// NSS user store instead. The user did everything Mast asked and still
+/// sees the scary interstitial — worth naming precisely.
+struct BrowserTrust;
+impl Check for BrowserTrust {
+    fn id(&self) -> &'static str {
+        "browser-trust"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.system.proxy_nss_gap.is_some()
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let Some(gap) = ctx.system.proxy_nss_gap else { return Vec::new() };
+        let detail = match gap {
+            NssTrustGap::CertutilMissing => {
+                "The system trust store accepts the local HTTPS certificate authority, \
+                 but Chrome, Vivaldi, Brave and Edge read the NSS user store \
+                 (~/.pki/nssdb) — and certutil, the tool that writes it, is not \
+                 installed. Until it is, those browsers show \
+                 ERR_CERT_AUTHORITY_INVALID on every local https:// domain. Install \
+                 libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora), then apply this \
+                 repair."
+            }
+            NssTrustGap::CaMissing => {
+                "The system trust store accepts the local HTTPS certificate authority, \
+                 but the NSS user store (~/.pki/nssdb) that Chrome, Vivaldi, Brave and \
+                 Edge read does not hold it yet — they show \
+                 ERR_CERT_AUTHORITY_INVALID until it does. Applying the repair adds it \
+                 (a full browser restart follows)."
+            }
+        };
+        let mut f = finding(
+            self.id(),
+            Severity::Warning,
+            "Chromium-family browsers do not trust the local HTTPS authority yet",
+            detail,
+        );
+        f.repair = repair_spec(REPAIR_TRUST_PROXY_CA, None);
+        vec![f]
+    }
+}
+
 pub fn all_checks() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(DockerRunning),
@@ -1699,6 +1744,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(SnapDocker),
         Box::new(DiskSpace),
         Box::new(SelinuxInfo),
+        Box::new(BrowserTrust),
         Box::new(ContextSanity),
         Box::new(EnvMissing),
         Box::new(VendorMissing),
@@ -1773,6 +1819,7 @@ mod tests {
             selinux_enforcing: false,
             uid: 1000,
             gid: 1000,
+            proxy_nss_gap: None,
         }
     }
 
@@ -1864,6 +1911,22 @@ mod tests {
         let (ran, findings) = run_all(&ctx(vec![sail_project("a")]));
         assert!(findings.is_empty(), "unexpected findings: {findings:?}");
         assert!(ran >= 5);
+    }
+
+    #[test]
+    fn a_browser_trust_gap_warns_with_the_trust_repair() {
+        for gap in [NssTrustGap::CertutilMissing, NssTrustGap::CaMissing] {
+            let mut c = ctx(vec![]);
+            c.system.proxy_nss_gap = Some(gap);
+            let (_, findings) = run_all(&c);
+            let f = findings.iter().find(|f| f.check == "browser-trust").unwrap();
+            assert_eq!(f.severity, Severity::Warning);
+            assert!(f.detail.contains("ERR_CERT_AUTHORITY_INVALID"), "{}", f.detail);
+            assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_TRUST_PROXY_CA);
+            if gap == NssTrustGap::CertutilMissing {
+                assert!(f.detail.contains("libnss3-tools"), "{}", f.detail);
+            }
+        }
     }
 
     #[test]
