@@ -386,10 +386,12 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             },
             risk: RiskTier::Caution,
             description: "Force-disconnects endpoint records whose container no longer \
-                          exists, and removes a stopped leftover container the failing \
-                          command named — the residue that blocks `docker compose \
-                          down`/`up` with \"is not connected to the network\". Running \
-                          containers are never touched."
+                          exists, then removes every STOPPED container carrying the \
+                          network's compose project label — the exact set a successful \
+                          `docker compose down` would have removed, and the residue \
+                          that keeps failing it with \"is not connected to the \
+                          network\". Running containers are never touched; volumes and \
+                          images are untouched."
                 .into(),
             arg: arg.map(String::from),
         }),
