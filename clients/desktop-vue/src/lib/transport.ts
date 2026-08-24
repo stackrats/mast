@@ -84,8 +84,8 @@ export async function snapshotReport(snapshotId: string) {
   return unwrap(await commands.snapshotReport(snapshotId));
 }
 
-export async function runDiagnostics() {
-  return unwrap(await commands.runDiagnostics());
+export async function runDiagnostics(project: ProjectId | null = null) {
+  return unwrap(await commands.runDiagnostics(project));
 }
 
 export async function repairPreview(repair: string, arg: string | null, project: ProjectId | null) {

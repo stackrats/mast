@@ -119,8 +119,11 @@ impl MastClient for LocalClient {
         self.engine.snapshot_report(&snapshot_id).await.map_err(ClientError::from)
     }
 
-    async fn run_diagnostics(&self) -> Result<mast_contract::DiagnosticReport, ClientError> {
-        self.engine.run_diagnostics().await.map_err(ClientError::from)
+    async fn run_diagnostics(
+        &self,
+        project: Option<ProjectId>,
+    ) -> Result<mast_contract::DiagnosticReport, ClientError> {
+        self.engine.run_diagnostics_scoped(project.as_ref()).await.map_err(ClientError::from)
     }
 
     async fn repair_preview(

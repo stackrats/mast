@@ -23,6 +23,7 @@ import {
   Share2,
   Square,
   SquareTerminal,
+  Stethoscope,
   Trash2,
   TriangleAlert,
   X,
@@ -64,6 +65,7 @@ import Input from "./ui/Input.vue";
 import Modal from "./ui/Modal.vue";
 
 const { project } = defineProps<{ project: ProjectSummary }>();
+const emit = defineEmits<{ diagnose: [] }>();
 const store = useEngineStore();
 
 const op = computed(() => store.operations[project.id]);
@@ -579,7 +581,7 @@ async function clearAppLog() {
       </div>
     </div>
 
-    <div class="mt-2 flex gap-1">
+    <div class="mt-2 flex flex-wrap gap-1">
       <Tooltip text="Open a terminal at the project root.">
         <Button
           variant="ghost"
@@ -652,6 +654,11 @@ async function clearAppLog() {
       >
         <Button variant="ghost" size="sm" @click="appLogOpen = true">
           <ScrollText class="h-3.5 w-3.5" /> App log
+        </Button>
+      </Tooltip>
+      <Tooltip text="Run the diagnostic checks scoped to this project's findings and fixes.">
+        <Button variant="ghost" size="sm" @click="emit('diagnose')">
+          <Stethoscope class="h-3.5 w-3.5" /> Diagnose
         </Button>
       </Tooltip>
     </div>

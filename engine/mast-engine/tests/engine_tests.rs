@@ -264,6 +264,8 @@ fn observation(project_name: &str, project_dir: &Path, service: &str, state: &st
         health: None,
         exit_code: None,
         config_hash: Some("hash".into()),
+        networks: vec![format!("{project_name}_default")],
+        published_ports: Vec::new(),
     }
 }
 
@@ -2026,7 +2028,13 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
         "services:\n  app:\n    image: alpine:latest\n    ports:\n      - '${APP_PORT:-80}:80'\n",
     )
     .unwrap();
-    std::fs::write(project.join(".env"), format!("APP_PORT={busy}\nAPP_KEY=base64:x\n")).unwrap();
+    // APP_URL pins the same port explicitly (the bootstrap-template shape) —
+    // it must move together with APP_PORT or the Browser button goes stale.
+    std::fs::write(
+        project.join(".env"),
+        format!("APP_PORT={busy}\nAPP_URL=http://localhost:{busy}\nAPP_KEY=base64:x\n"),
+    )
+    .unwrap();
 
     let adapter = FakeAdapter::new();
     let runner = FakeRunner::new(Duration::from_millis(20), 0);
@@ -2061,6 +2069,8 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
     let env = std::fs::read_to_string(project.join(".env")).unwrap();
     assert!(!env.contains(&format!("APP_PORT={busy}")), "the busy port survived: {env}");
     assert!(env.contains(&format!("APP_PORT={}", busy + 1)), "{env}");
+    // The pinned APP_URL followed the move.
+    assert!(env.contains(&format!("APP_URL=http://localhost:{}", busy + 1)), "{env}");
     // Untouched keys keep their bytes.
     assert!(env.contains("APP_KEY=base64:x"), "{env}");
     let moved = moved_line.expect("the move is reported in the operation output");
@@ -2662,4 +2672,149 @@ async fn compose_cli_available() -> bool {
     .await
     .map(|o| o.success())
     .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_flag_a_running_container_detached_from_its_network() {
+    // The wreckage a half-failed start leaves behind: the container reports
+    // "running" but sits on no network and publishes none of its ports —
+    // and since its config-hash still matches, only a force-recreate helps.
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "adrift");
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    ports:\n      - '18099:80'\n",
+    )
+    .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project resolved", |s| {
+        s.projects.first().is_some_and(|p| p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let compose_name = snap.projects[0].compose_project_name.clone().unwrap();
+    let canonical = project.canonicalize().unwrap();
+
+    let mut adrift = observation(&compose_name, &canonical, "app", "running");
+    adrift.networks = Vec::new();
+    adapter.set_containers(vec![adrift]);
+    wait_until(&engine, "project running", |s| s.projects[0].status == ProjectStatus::Running)
+        .await;
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "detached-containers")
+        .expect("the detached container must be found");
+    let repair = f.repair.as_ref().unwrap();
+    assert_eq!(repair.id, "recreate-service");
+    assert_eq!(repair.arg.as_deref(), Some("app"));
+
+    // The preview names the exact compose command, scoped to the service.
+    let plan = engine.repair_preview("recreate-service", Some("app"), Some(&pid)).await.unwrap();
+    assert!(
+        plan.summary[0].contains("up -d --force-recreate --no-deps app"),
+        "{:?}",
+        plan.summary
+    );
+
+    // A service the model does not declare is refused — the arg travels
+    // through the UI before it lands in an argv.
+    assert!(engine.repair_preview("recreate-service", Some("nope"), Some(&pid)).await.is_err());
+
+    // The same container attached to its network raises nothing, even
+    // though the summary's published ports happen to be empty.
+    adapter.set_containers(vec![observation(&compose_name, &canonical, "app", "running")]);
+    wait_until(&engine, "project still running", |s| {
+        s.projects[0].status == ProjectStatus::Running
+    })
+    .await;
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(
+        report.findings.iter().all(|f| f.check != "detached-containers"),
+        "attached container flagged: {:?}",
+        report.findings.iter().map(|f| &f.check).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_app_url_is_found_and_repaired() {
+    // The bootstrap-template trap: APP_URL pins :8000 while a port remap
+    // moved APP_PORT to 8082 — the Browser button opens a dead address.
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "staleurl");
+    std::fs::write(
+        project.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n    ports:\n      - '${APP_PORT:-80}:80'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".env"), "APP_PORT=8082\nAPP_URL=http://localhost:8000\n")
+        .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter)));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    wait_until(&engine, "env read and model resolved", |s| {
+        s.projects.first().is_some_and(|p| {
+            p.compose_project_name.is_some()
+                && p.app_url.as_deref() == Some("http://localhost:8000")
+        })
+    })
+    .await;
+    let pid = project_id(&engine);
+
+    let report = engine.run_diagnostics().await.unwrap();
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.check == "stale-app-url")
+        .expect("the stale APP_URL must be found");
+    assert_eq!(f.repair.as_ref().unwrap().id, "fix-app-url");
+
+    // A scoped run carries only this project's findings and stays out of
+    // recorded history; an unknown project is refused.
+    let scoped = engine.run_diagnostics_scoped(Some(&pid)).await.unwrap();
+    assert!(scoped.findings.iter().any(|f| f.check == "stale-app-url"));
+    assert!(scoped.findings.iter().all(|f| f.project.as_ref() == Some(&pid)), "{scoped:?}");
+    assert!(
+        engine
+            .run_diagnostics_scoped(Some(&mast_contract::ProjectId("nope".into())))
+            .await
+            .is_err()
+    );
+
+    // Preview shows the exact .env edit; applying makes it and nothing else.
+    let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
+    assert!(!plan.no_op);
+    let preview = plan.file_preview.as_ref().unwrap();
+    assert!(preview.after.contains("APP_URL=http://localhost:8082"), "{}", preview.after);
+    run_action(
+        &engine,
+        Action::ApplyRepair { repair: "fix-app-url".into(), arg: None, project: Some(pid.clone()) },
+    )
+    .await;
+    let env = std::fs::read_to_string(project.join(".env")).unwrap();
+    assert!(env.contains("APP_URL=http://localhost:8082"), "{env}");
+    assert!(env.contains("APP_PORT=8082"), "{env}");
+
+    // Healed: the report no longer carries the finding, and a second apply
+    // is a clean no-op.
+    let report = engine.run_diagnostics().await.unwrap();
+    assert!(report.findings.iter().all(|f| f.check != "stale-app-url"));
+    let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
+    assert!(plan.no_op);
 }

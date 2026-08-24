@@ -16,7 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
-    REPAIR_REASSIGN_PORTS, REPAIR_TRUST_PROXY_CA,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_INSTALL_CERTUTIL, REPAIR_REASSIGN_PORTS,
+    REPAIR_RECREATE_SERVICE, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -202,6 +203,35 @@ struct ProjectSeed {
 /// Filesystem half of a project's facts — runs in `spawn_blocking`. The
 /// second value is the database the async half should probe, when there is
 /// one (`facts.db` stays `None` until that probe fills it).
+/// `APP_URL` pins a port the project does not publish while `APP_PORT`
+/// names another — the Browser button opens a refused connection. A URL
+/// port that *is* published (a proxy or second service, say) is a deliberate
+/// arrangement, not staleness.
+fn app_url_mismatch(
+    env: &std::collections::HashMap<String, String>,
+    host_ports: &[(String, u16)],
+) -> Option<(u16, u16)> {
+    let url_port = env.get("APP_URL").and_then(|v| mast_laravel::explicit_port(v))?;
+    let app_port = env.get("APP_PORT").and_then(|v| v.trim().parse::<u16>().ok())?;
+    if url_port == app_port || host_ports.iter().any(|(_, port)| *port == url_port) {
+        return None;
+    }
+    Some((url_port, app_port))
+}
+
+/// The edit `fix-app-url` will make — recomputed fresh from the file, since
+/// the report may be stale by the time the user consents. `None` when
+/// APP_URL and APP_PORT already agree (or either says nothing).
+fn app_url_rewrite(file: &mast_laravel::EnvFile) -> Option<String> {
+    let url = file.get("APP_URL")?.value.clone();
+    let from = mast_laravel::explicit_port(&url)?;
+    let to = file.get("APP_PORT")?.value.trim().parse::<u16>().ok()?;
+    if from == to {
+        return None;
+    }
+    mast_laravel::rewrite_explicit_port(&url, from, to)
+}
+
 fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
@@ -235,6 +265,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
     let is_laravel = std::fs::read_to_string(seed.path.join("composer.json"))
         .map(|c| c.contains("laravel/framework"))
         .unwrap_or(false);
+    let url_mismatch = app_url_mismatch(&env, &seed.host_ports);
     let facts = ProjectFacts {
         sail_flavored,
         is_laravel,
@@ -267,6 +298,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         resolution_error: seed.resolution_error,
         db: None,
         db_versions: Vec::new(),
+        app_url_mismatch: url_mismatch,
         config_cached: seed.path.join("bootstrap/cache/config.php").is_file(),
         dotted_services: seed
             .services
@@ -282,6 +314,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             None
         },
         drifted_services: Vec::new(),
+        detached_services: Vec::new(),
         compose_name: None, // filled from the resolved model in gather
         dir_basename: seed
             .path
@@ -487,12 +520,16 @@ fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
 }
 
 impl Engine {
-    async fn gather_diag_ctx(&self) -> DiagCtx {
-        let (docker, seeds, invocations, db_metas, workspace_issues, docker_host_env) = {
+    /// Gather everything the checks read. `scope` narrows the gather to one
+    /// project id: only its facts and probes, and no workspace-graph issues
+    /// (those are not any single project's).
+    async fn gather_diag_ctx(&self, scope: Option<&str>) -> DiagCtx {
+        let (docker, seeds, invocations, db_metas, publishing, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
                 .values()
+                .filter(|e| scope.is_none_or(|id| e.record.id == id))
                 .map(|e| ProjectSeed {
                     id: e.record.id.clone(),
                     name: e.summary.name.clone(),
@@ -529,6 +566,7 @@ impl Engine {
             let db_metas: Vec<crate::db_repair::DbServiceMeta> = st
                 .projects
                 .values()
+                .filter(|e| scope.is_none_or(|id| e.record.id == id))
                 .filter_map(|e| {
                     let model = e.model.as_ref()?;
                     Some(crate::db_repair::DbServiceMeta {
@@ -546,17 +584,43 @@ impl Engine {
                     })
                 })
                 .collect();
-            let issues = workspace_summaries(&st)
-                .into_iter()
-                .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
+            // Which of each project's services publish host ports, per the
+            // resolved model — the detached-container scan needs to know a
+            // container *should* be reachable before calling it wreckage.
+            let publishing: std::collections::HashMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = st
+                .projects
+                .values()
+                .filter_map(|e| {
+                    let model = e.model.as_ref()?;
+                    Some((
+                        e.record.id.clone(),
+                        model
+                            .services
+                            .iter()
+                            .filter(|s| !s.published_ports.is_empty())
+                            .map(|s| s.name.clone())
+                            .collect(),
+                    ))
+                })
                 .collect();
+            let issues = if scope.is_some() {
+                Vec::new()
+            } else {
+                workspace_summaries(&st)
+                    .into_iter()
+                    .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
+                    .collect()
+            };
             let docker_host_env = self
                 .inner
                 .deps
                 .process_env
                 .get("DOCKER_HOST")
                 .is_some_and(|v| !v.is_empty());
-            (st.docker.clone(), seeds, invocations, db_metas, issues, docker_host_env)
+            (st.docker.clone(), seeds, invocations, db_metas, publishing, issues, docker_host_env)
         };
 
         let compose_version = {
@@ -605,6 +669,15 @@ impl Engine {
                 .ok()
                 .filter(|o| o.success())
                 .map(|o| o.stdout.lines().map(|l| l.trim().to_string()).collect())
+        } else {
+            None
+        };
+
+        // Only meaningful once the trust repair has filled the system store
+        // — before that, the whole trust step is still ahead and the HTTPS
+        // dialog owns the story.
+        let proxy_nss_gap = if self.proxy_ca_trusted().await {
+            self.proxy_nss_gap().await
         } else {
             None
         };
@@ -724,6 +797,27 @@ impl Engine {
                     if running.is_empty() {
                         continue;
                     }
+                    // Detached wreckage first — it does not depend on the
+                    // config-hash probe below, and a detached container's
+                    // hash still matches anyway.
+                    let mut detached: Vec<String> = running
+                        .iter()
+                        .filter(|o| {
+                            o.networks.is_empty()
+                                && o.published_ports.is_empty()
+                                && publishing
+                                    .get(&meta.project_id)
+                                    .is_some_and(|svcs| svcs.contains(&o.service))
+                        })
+                        .map(|o| o.service.clone())
+                        .collect();
+                    detached.sort();
+                    detached.dedup();
+                    if let Some((facts, _)) =
+                        inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+                    {
+                        facts.detached_services = detached;
+                    }
                     let Some(invocation) = invocations.get(&meta.project_id) else { continue };
                     let Some(current) = config_hashes(invocation).await else { continue };
                     let mut drifted: Vec<String> = running
@@ -763,6 +857,7 @@ impl Engine {
                 selinux_enforcing,
                 uid,
                 gid,
+                proxy_nss_gap,
             },
             projects,
             docker_networks,
@@ -789,18 +884,42 @@ impl Engine {
     /// Run every applicable check and record the run in history. Failure to
     /// record is logged, never fatal — the report is the point.
     pub async fn run_diagnostics(&self) -> Result<DiagnosticReport, ErrorInfo> {
-        let ctx = self.gather_diag_ctx().await;
-        let (checks_run, findings) = mast_diagnostics::run_all(&ctx);
+        self.run_diagnostics_scoped(None).await
+    }
+
+    /// Run diagnostics for one project (or everything, `None`). A scoped run
+    /// gathers only that project's facts — no probes into the neighbours —
+    /// keeps only its findings, and stays out of history: the recorded trend
+    /// is "the full set passed", not a partial look.
+    pub async fn run_diagnostics_scoped(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<DiagnosticReport, ErrorInfo> {
+        if let Some(project) = project {
+            let st = self.inner.state.lock().unwrap();
+            if !st.projects.contains_key(&project.0) {
+                return Err(ErrorInfo::NotFound { what: format!("project {}", project.0) });
+            }
+        }
+        let ctx = self.gather_diag_ctx(project.map(|p| p.0.as_str())).await;
+        let (checks_run, mut findings) = mast_diagnostics::run_all(&ctx);
         let taken_unix = now_unix();
 
-        let db_path = self.inner.deps.store.diagnostics_db_path();
-        let for_history = findings.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
-            DiagnosticsDb::open(&db_path)?.record_run(taken_unix, checks_run, &for_history)
-        })
-        .await;
-        if let Ok(Err(e)) = recorded {
-            tracing::warn!("failed to record diagnostics run: {e}");
+        match project {
+            Some(project) => {
+                findings.retain(|f| f.project.as_deref() == Some(project.0.as_str()));
+            }
+            None => {
+                let db_path = self.inner.deps.store.diagnostics_db_path();
+                let for_history = findings.clone();
+                let recorded = tokio::task::spawn_blocking(move || {
+                    DiagnosticsDb::open(&db_path)?.record_run(taken_unix, checks_run, &for_history)
+                })
+                .await;
+                if let Ok(Err(e)) = recorded {
+                    tracing::warn!("failed to record diagnostics run: {e}");
+                }
+            }
         }
 
         Ok(DiagnosticReport {
@@ -844,6 +963,136 @@ impl Engine {
         })
         .await
         .map_err(crate::internal_err)?
+    }
+
+    /// The Chromium half of Linux trust: add the proxy CA to `~/.pki/nssdb`
+    /// via certutil. Best-effort — an unavailable certutil only means a
+    /// browser warning remains, and the outcome line says so plainly. On
+    /// macOS the keychain covers those browsers, so this does nothing.
+    async fn nss_add_proxy_ca(
+        &self,
+        handle: &std::sync::Arc<crate::OpHandle>,
+        op: OperationId,
+        crt_str: &str,
+    ) {
+        let nssdb = if cfg!(target_os = "macos") {
+            None
+        } else {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
+        };
+        let Some(nssdb) = nssdb else { return };
+        let _ = tokio::fs::create_dir_all(&nssdb).await;
+        let db = format!("sql:{}", nssdb.display());
+        let add: Vec<String> = [
+            "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
+            crate::proxy::NSS_NICKNAME, "-i", crt_str,
+        ]
+        .map(String::from)
+        .into();
+        let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+        let (line, stderr) = match nss {
+            Ok(o) if o.success() => (
+                "added to ~/.pki/nssdb — Chromium-family browsers (Chrome, Vivaldi, \
+                 Brave, Edge) trust it after a full restart"
+                    .to_string(),
+                false,
+            ),
+            Ok(o) => (
+                format!(
+                    "could not add to ~/.pki/nssdb ({}) — Chromium-family browsers \
+                     will keep warning",
+                    o.stderr.trim().lines().next().unwrap_or("certutil failed")
+                ),
+                true,
+            ),
+            Err(_) => (
+                "certutil is not installed, so the NSS store Chromium-family browsers \
+                 (Chrome, Vivaldi, Brave, Edge) read was NOT updated — they will keep \
+                 warning. The \"Install certutil\" fix installs it and finishes this \
+                 step."
+                    .to_string(),
+                true,
+            ),
+        };
+        self.emit_op(handle, op, OperationEventKind::Output { line, stderr });
+    }
+
+    /// What `artisan-migrate` needs: the invocation and the app service
+    /// (`APP_SERVICE`, default laravel.test) read fresh from `.env` and
+    /// validated against the resolved model before it lands in an argv.
+    fn migrate_target(
+        &self,
+        project: &ProjectId,
+    ) -> Result<(mast_compose::ComposeInvocation, String, PathBuf, crate::Redactor), ErrorInfo>
+    {
+        let (invocation, path, redactor, services) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            let invocation =
+                entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "the project's compose invocation is not resolved".into(),
+                })?;
+            let services: Vec<String> = entry
+                .model
+                .as_ref()
+                .map(|m| m.services.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            (invocation, entry.record.path.clone(), entry.redactor.clone(), services)
+        };
+        let src = std::fs::read_to_string(path.join(".env")).unwrap_or_default();
+        let service = mast_laravel::EnvFile::parse(&src)
+            .get("APP_SERVICE")
+            .map(|e| e.value.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "laravel.test".to_string());
+        if !services.iter().any(|s| s == &service) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!("app service \"{service}\" is not in the compose model"),
+            });
+        }
+        Ok((invocation, service, path, redactor))
+    }
+
+    /// Validate a `recreate-service` arg and gather what its compose command
+    /// needs. The arg travels through the UI, so every named service must
+    /// exist in the resolved model before it lands in an argv.
+    fn recreate_targets(
+        &self,
+        project: &ProjectId,
+        arg: Option<&str>,
+    ) -> Result<
+        (Vec<String>, mast_compose::ComposeInvocation, PathBuf, crate::Redactor),
+        ErrorInfo,
+    > {
+        let services: Vec<String> =
+            arg.unwrap_or_default().split_whitespace().map(str::to_string).collect();
+        if services.is_empty() {
+            return Err(ErrorInfo::InvalidInput {
+                message: "recreate-service needs the service name(s)".into(),
+            });
+        }
+        let st = self.inner.state.lock().unwrap();
+        let entry = st
+            .projects
+            .get(&project.0)
+            .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+        let invocation = entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+            message: "the project's compose invocation is not resolved".into(),
+        })?;
+        let known: std::collections::BTreeSet<&str> = entry
+            .model
+            .as_ref()
+            .map(|m| m.services.iter().map(|s| s.name.as_str()).collect())
+            .unwrap_or_default();
+        if let Some(unknown) = services.iter().find(|s| !known.contains(s.as_str())) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!("\"{unknown}\" is not a service of this project"),
+            });
+        }
+        Ok((services, invocation, entry.record.path.clone(), entry.redactor.clone()))
     }
 
     /// What a repair will do, before consent. Env-file repairs return a full
@@ -981,6 +1230,80 @@ impl Engine {
                 })?;
                 Ok(RepairPlan {
                     summary: vec![format!("run: docker network create {net}")],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_FIX_APP_URL => {
+                let path = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let env_path = path.join(".env");
+                    let before =
+                        std::fs::read_to_string(&env_path).map_err(crate::internal_err)?;
+                    let mut file = mast_laravel::EnvFile::parse(&before);
+                    let rewrite = app_url_rewrite(&file);
+                    let (summary, no_op) = match &rewrite {
+                        Some(to) => (vec![format!("set APP_URL={to}")], false),
+                        None => (
+                            vec!["APP_URL already agrees with APP_PORT — nothing to do".into()],
+                            true,
+                        ),
+                    };
+                    if let Some(to) = &rewrite {
+                        file.set("APP_URL", to)
+                            .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+                    }
+                    Ok(RepairPlan {
+                        repair: offer,
+                        file_preview: Some(FileEditPreview {
+                            file: env_path.to_string_lossy().into_owned(),
+                            after: file.to_string(),
+                            before,
+                            summary: summary.clone(),
+                            no_op,
+                        }),
+                        summary,
+                        no_op,
+                    })
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
+            REPAIR_ARTISAN_MIGRATE => {
+                let project = self.require_project(project)?;
+                let (invocation, service, path, _) = self.migrate_target(project)?;
+                let tail: Vec<String> =
+                    ["php", "artisan", "migrate", "--force"].map(String::from).into();
+                let argv = crate::db_repair::exec_env_argv(&invocation, &service, &[], &tail);
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: {}", argv.join(" ")),
+                        format!("in: {}", path.display()),
+                        "applies this project's own migrations — nothing is dropped or \
+                         rolled back"
+                            .into(),
+                        "runs in the app container, which must be running".into(),
+                    ],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_RECREATE_SERVICE => {
+                let project = self.require_project(project)?;
+                let (services, invocation, path, _) = self.recreate_targets(project, arg)?;
+                let mut tail: Vec<&str> = vec!["up", "-d", "--force-recreate", "--no-deps"];
+                tail.extend(services.iter().map(String::as_str));
+                let (argv, _) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: {}", argv.join(" ")),
+                        format!("in: {}", path.display()),
+                        "replaces exactly these containers — named volumes and their data \
+                         are untouched"
+                            .into(),
+                    ],
                     repair: offer,
                     file_preview: None,
                     no_op: false,
@@ -1323,11 +1646,42 @@ impl Engine {
                 .map_err(crate::internal_err)?
             }
             REPAIR_TRUST_PROXY_CA => {
-                let no_op = self.proxy_ca_trusted().await;
+                let trusted = self.proxy_ca_trusted().await;
+                // System trust is only half the Linux story — Chromium-family
+                // browsers read ~/.pki/nssdb, and the plan must say which
+                // half is left rather than call a half-done job finished.
+                let nss_gap = if trusted { self.proxy_nss_gap().await } else { None };
                 let exported = self.inner.deps.store.proxy_dir().join("root.crt");
-                let summary = if no_op {
-                    vec!["the proxy CA is already in the system trust store — nothing to do"
-                        .to_string()]
+                let no_op = trusted
+                    && !matches!(nss_gap, Some(mast_diagnostics::NssTrustGap::CaMissing));
+                let summary = if trusted {
+                    match nss_gap {
+                        Some(mast_diagnostics::NssTrustGap::CaMissing) => vec![
+                            "the system trust store already holds the CA — that half is done"
+                                .into(),
+                            "add it to ~/.pki/nssdb (certutil) so Chromium-family \
+                             browsers (Chrome, Vivaldi, Brave, Edge) trust it too — no \
+                             elevation needed for this step"
+                                .into(),
+                            "fully restart the browser afterwards".into(),
+                        ],
+                        Some(mast_diagnostics::NssTrustGap::CertutilMissing) => vec![
+                            "the system trust store already holds the CA".into(),
+                            "but Chromium-family browsers (Chrome, Vivaldi, Brave, \
+                             Edge) read ~/.pki/nssdb, and certutil — the tool that \
+                             writes it — is not installed, so there is nothing this \
+                             fix can do yet"
+                                .into(),
+                            "use the \"Install certutil\" fix instead — it installs \
+                             the NSS tools and finishes this step in one go"
+                                .into(),
+                        ],
+                        None => vec![
+                            "the proxy CA is already trusted everywhere Mast can \
+                             reach — nothing to do"
+                                .to_string(),
+                        ],
+                    }
                 } else if cfg!(target_os = "macos") {
                     vec![
                         "copy the proxy's root certificate out of the mast-proxy container"
@@ -1361,6 +1715,44 @@ impl Engine {
                             exported.display()
                         ),
                     ]
+                };
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
+            }
+            REPAIR_INSTALL_CERTUTIL => {
+                let installed = crate::proxy::on_path("certutil");
+                let script = crate::proxy::certutil_install_script();
+                let (summary, no_op) = if installed {
+                    (
+                        vec![
+                            "certutil is already installed — apply the trust fix \
+                             instead; it adds the CA to ~/.pki/nssdb"
+                                .to_string(),
+                        ],
+                        true,
+                    )
+                } else {
+                    match &script {
+                        Some((package, script)) => (
+                            vec![
+                                format!("install the {package} package: {script}"),
+                                crate::proxy::elevation_note().into(),
+                                "then add the proxy CA to ~/.pki/nssdb (certutil, no \
+                                 further elevation) — Chromium-family browsers trust \
+                                 it after a full restart"
+                                    .into(),
+                            ],
+                            false,
+                        ),
+                        None => (
+                            vec![
+                                "no supported package manager found (apt-get, dnf, \
+                                 yum, pacman, zypper) — install the NSS tools \
+                                 (certutil) manually, then apply the trust fix"
+                                    .to_string(),
+                            ],
+                            true,
+                        ),
+                    }
                 };
                 Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
             }
@@ -1554,6 +1946,94 @@ impl Engine {
                         },
                     );
                 }
+                Ok(())
+            }
+            REPAIR_FIX_APP_URL => {
+                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let backups = self.inner.deps.store.backups_dir();
+                let applied =
+                    tokio::task::spawn_blocking(move || -> Result<Option<String>, ErrorInfo> {
+                        let mut applied = None;
+                        mast_laravel::edit_env_file(&path, Some(&backups), |f| {
+                            if let Some(to) = app_url_rewrite(f) {
+                                f.set("APP_URL", &to)?;
+                                applied = Some(to);
+                            }
+                            Ok(())
+                        })
+                        .map_err(crate::env_write_error)?;
+                        Ok(applied)
+                    })
+                    .await
+                    .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: match applied {
+                            Some(url) => format!("APP_URL now {url}"),
+                            None => {
+                                "APP_URL already agrees with APP_PORT — nothing to change".into()
+                            }
+                        },
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_ARTISAN_MIGRATE => {
+                let project = self.require_project(project)?;
+                let (invocation, service, path, redactor) = self.migrate_target(project)?;
+                let tail: Vec<String> =
+                    ["php", "artisan", "migrate", "--force"].map(String::from).into();
+                let argv = crate::db_repair::exec_env_argv(&invocation, &service, &[], &tail);
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("$ {}", argv.join(" ")),
+                        stderr: false,
+                    },
+                );
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &redactor,
+                    Duration::from_secs(10 * 60),
+                )
+                .await?;
+                self.hint();
+                Ok(())
+            }
+            REPAIR_RECREATE_SERVICE => {
+                let project = self.require_project(project)?;
+                let (services, invocation, path, redactor) =
+                    self.recreate_targets(project, arg)?;
+                let mut tail: Vec<&str> = vec!["up", "-d", "--force-recreate", "--no-deps"];
+                tail.extend(services.iter().map(String::as_str));
+                let (argv, env) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("$ {}", argv.join(" ")),
+                        stderr: false,
+                    },
+                );
+                self.run_streamed_command_env(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &env,
+                    &redactor,
+                    Duration::from_secs(15 * 60),
+                )
+                .await?;
+                self.hint();
                 Ok(())
             }
             REPAIR_COMPOSER_INSTALL => {
@@ -2026,71 +2506,63 @@ impl Engine {
                             .into(),
                     });
                 }
-                let script = if cfg!(target_os = "macos") {
-                    format!(
-                        "security add-trusted-cert -d -r trustRoot \
-                         -k /Library/Keychains/System.keychain '{crt_str}'"
-                    )
+                // The elevated half only when the system store does not
+                // already hold the CA — re-running to finish the NSS half
+                // must not raise a pointless elevation prompt.
+                if self.proxy_ca_trusted().await {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "system trust store already holds the CA — skipping \
+                                   the elevated step"
+                                .into(),
+                            stderr: false,
+                        },
+                    );
                 } else {
-                    let (dest, refresh) = if std::path::Path::new(
-                        "/usr/local/share/ca-certificates",
-                    )
-                    .is_dir()
-                    {
-                        ("/usr/local/share/ca-certificates/mast-proxy.crt", "update-ca-certificates")
-                    } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir() {
-                        ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                    let script = if cfg!(target_os = "macos") {
+                        format!(
+                            "security add-trusted-cert -d -r trustRoot \
+                             -k /Library/Keychains/System.keychain '{crt_str}'"
+                        )
                     } else {
-                        return Err(ErrorInfo::Internal {
-                            message: format!(
-                                "no known system trust store on this machine — the \
-                                 certificate was exported to {crt_str}; install it \
-                                 manually (the HTTPS dialog can copy the path or PEM)"
-                            ),
-                        });
+                        let (dest, refresh) = if std::path::Path::new(
+                            "/usr/local/share/ca-certificates",
+                        )
+                        .is_dir()
+                        {
+                            (
+                                "/usr/local/share/ca-certificates/mast-proxy.crt",
+                                "update-ca-certificates",
+                            )
+                        } else if std::path::Path::new("/etc/pki/ca-trust/source/anchors")
+                            .is_dir()
+                        {
+                            ("/etc/pki/ca-trust/source/anchors/mast-proxy.crt", "update-ca-trust")
+                        } else {
+                            return Err(ErrorInfo::Internal {
+                                message: format!(
+                                    "no known system trust store on this machine — the \
+                                     certificate was exported to {crt_str}; install it \
+                                     manually (the HTTPS dialog can copy the path or PEM)"
+                                ),
+                            });
+                        };
+                        format!("install -m 644 '{crt_str}' {dest} && {refresh}")
                     };
-                    format!("install -m 644 '{crt_str}' {dest} && {refresh}")
-                };
-                let argv = crate::proxy::privileged_shell_argv(&script);
-                self.run_streamed_command(
-                    handle,
-                    op,
-                    &argv,
-                    None,
-                    &crate::Redactor::default(),
-                    Duration::from_secs(5 * 60),
-                )
-                .await?;
-                // Chrome/Chromium on Linux read NSS, not the system store;
-                // best-effort, and its absence only means a browser warning
-                // remains. On macOS the keychain covers them already.
-                let nssdb = if cfg!(target_os = "macos") {
-                    None
-                } else {
-                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
-                };
-                if let Some(nssdb) = nssdb {
-                    let _ = tokio::fs::create_dir_all(&nssdb).await;
-                    let db = format!("sql:{}", nssdb.display());
-                    let add: Vec<String> = [
-                        "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
-                        "Mast local HTTPS (Caddy)", "-i", crt_str.as_str(),
-                    ]
-                    .map(String::from)
-                    .into();
-                    let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
-                    let line = match nss {
-                        Ok(o) if o.success() => {
-                            "added to ~/.pki/nssdb — Chrome/Chromium trust it after a restart"
-                                .to_string()
-                        }
-                        _ => "certutil not available — Chrome/Chromium may still warn; \
-                              install libnss3-tools and re-apply, or import the certificate \
-                              in the browser"
-                            .to_string(),
-                    };
-                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                    let argv = crate::proxy::privileged_shell_argv(&script);
+                    self.run_streamed_command(
+                        handle,
+                        op,
+                        &argv,
+                        None,
+                        &crate::Redactor::default(),
+                        Duration::from_secs(5 * 60),
+                    )
+                    .await?;
                 }
+                self.nss_add_proxy_ca(handle, op, &crt_str).await;
                 let done = if cfg!(target_os = "macos") {
                     "added to the System keychain — restart the browser; Firefox needs \
                      the certificate imported manually"
@@ -2103,6 +2575,74 @@ impl Engine {
                     op,
                     OperationEventKind::Output { line: done.into(), stderr: false },
                 );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_INSTALL_CERTUTIL => {
+                if !crate::proxy::on_path("certutil") {
+                    let (_, script) =
+                        crate::proxy::certutil_install_script().ok_or_else(|| {
+                            ErrorInfo::InvalidInput {
+                                message: "no supported package manager found — install \
+                                          the NSS tools (certutil) manually, then apply \
+                                          the trust fix"
+                                    .into(),
+                            }
+                        })?;
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: format!("$ {script}"),
+                            stderr: false,
+                        },
+                    );
+                    let argv = crate::proxy::privileged_shell_argv(&script);
+                    self.run_streamed_command(
+                        handle,
+                        op,
+                        &argv,
+                        None,
+                        &crate::Redactor::default(),
+                        Duration::from_secs(10 * 60),
+                    )
+                    .await?;
+                    if !crate::proxy::on_path("certutil") {
+                        return Err(ErrorInfo::Internal {
+                            message: "the install finished but certutil is still not on \
+                                      PATH — install the NSS tools manually, then apply \
+                                      the trust fix"
+                                .into(),
+                        });
+                    }
+                } else {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "certutil is already installed".into(),
+                            stderr: false,
+                        },
+                    );
+                }
+                // Finish the reason it was installed: the CA into nssdb.
+                let dir = self.inner.deps.store.proxy_dir();
+                tokio::fs::create_dir_all(&dir).await.map_err(crate::internal_err)?;
+                let crt = dir.join("root.crt");
+                let crt_str = crt.to_string_lossy().into_owned();
+                let cp: Vec<String> =
+                    ["docker", "cp", crate::proxy::CA_IN_CONTAINER, crt_str.as_str()]
+                        .map(String::from)
+                        .into();
+                let _ = run_command(&cp, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+                if !crt.is_file() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: "the proxy has not generated its certificate authority \
+                                  yet — enable a local domain first, then retry"
+                            .into(),
+                    });
+                }
+                self.nss_add_proxy_ca(handle, op, &crt_str).await;
                 self.hint();
                 Ok(())
             }

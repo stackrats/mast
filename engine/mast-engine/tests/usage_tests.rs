@@ -222,6 +222,8 @@ fn observation(
         health: None,
         exit_code: None,
         config_hash: Some("hash".into()),
+        networks: vec![format!("{project_name}_default")],
+        published_ports: Vec::new(),
     }
 }
 

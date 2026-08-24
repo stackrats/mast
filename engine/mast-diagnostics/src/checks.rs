@@ -3,12 +3,14 @@
 //! tells the user everything passed).
 
 use crate::{
-    repair_spec, Check, DiagCtx, Finding, ProjectFacts, RepairSpec, RiskTier, Severity,
+    repair_spec, Check, DiagCtx, Finding, NssTrustGap, ProjectFacts, RepairSpec, RiskTier,
+    Severity, REPAIR_INSTALL_CERTUTIL, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
-    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS,
+    REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -1157,6 +1159,137 @@ impl Check for ConfigDrift {
     }
 }
 
+/// Running containers that are attached to no network and publish none of
+/// the ports the model says they should. The container answers `docker ps`
+/// with "running" while nothing on the host can reach it — the app 500s on
+/// every DB call too, since the compose network is how it finds mysql. Left
+/// behind by a start whose port/network setup failed halfway (e.g. a bind
+/// lost a race with another process) and a later plain `docker start`.
+/// Unlike config drift the config-hash still matches, so Start (`up -d`)
+/// shrugs; only a force-recreate reattaches the container.
+struct DetachedContainers;
+impl Check for DetachedContainers {
+    fn id(&self) -> &'static str {
+        "detached-containers"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.detached_services.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| !p.detached_services.is_empty())
+            .map(|p| {
+                let services = p.detached_services.join(" ");
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{}: running containers nothing can reach", p.name),
+                    format!(
+                        "{} report \"running\" but sit on no docker network and publish \
+                         none of their ports — the leftovers of a start that failed \
+                         halfway through port/network setup. The app is unreachable from \
+                         the browser and cannot see its own services. A restart keeps the \
+                         broken state and Start is a no-op (the configuration never \
+                         changed); recreating the container is the fix.",
+                        p.detached_services.join(", ")
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_RECREATE_SERVICE, Some(&services));
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// `APP_URL` pins a port the project does not publish while `APP_PORT`
+/// names another. [`mast_laravel::app_url`] gives an explicit `APP_URL`
+/// port the last word, so the Browser button keeps opening the dead
+/// address. The current remap drags `APP_URL` along when it moves
+/// `APP_PORT`; this check heals the projects an older move (or a
+/// hand-edit) already left behind.
+struct StaleAppUrl;
+impl Check for StaleAppUrl {
+    fn id(&self) -> &'static str {
+        "stale-app-url"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.app_url_mismatch.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| p.app_url_mismatch.map(|m| (p, m)))
+            .map(|(p, (url_port, app_port))| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!("{}: the Browser link points at a dead port", p.name),
+                    format!(
+                        "APP_URL pins port {url_port}, but the project publishes nothing \
+                         there — the app is forwarded on APP_PORT={app_port}. The Browser \
+                         button (and anything else reading APP_URL) opens a refused \
+                         connection. This is what a port move leaves behind when APP_URL \
+                         had the old port written in."
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_FIX_APP_URL, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// The database answers with the `.env` credentials but holds no
+/// `migrations` table — the first `artisan migrate` never ran. Laravel
+/// keeps sessions, users and cache in the database by default, so every
+/// page 500s on a missing-table QueryException while everything *looks*
+/// healthy: containers up, credentials fine. The fresh-bootstrap trap.
+struct DbNotMigrated;
+impl Check for DbNotMigrated {
+    fn id(&self) -> &'static str {
+        "db-not-migrated"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| {
+            p.is_laravel
+                && p.db.as_ref().is_some_and(|db| {
+                    db.failure.is_none() && db.migrations_table == Some(false)
+                })
+        })
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.is_laravel)
+            .filter_map(|p| {
+                p.db
+                    .as_ref()
+                    .filter(|db| db.failure.is_none() && db.migrations_table == Some(false))
+                    .map(|db| (p, db))
+            })
+            .map(|(p, db)| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{}: the database has never been migrated", p.name),
+                    format!(
+                        "The {} database \"{}\" is reachable with the .env credentials but \
+                         holds no `migrations` table. Laravel keeps sessions, users and \
+                         cache there by default, so requests fail with a QueryException \
+                         naming a missing table (SQLSTATE 42S02) until the first `artisan \
+                         migrate` runs.",
+                        db.kind.as_str(),
+                        db.database
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_ARTISAN_MIGRATE, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// Files under storage/ or bootstrap/cache owned by someone else — root
 /// from a sudo'd installer, 1337 from a container that ran without WWWUSER
 /// mapping. The cure for Sail's most-commented issue ever (#81), whose
@@ -1558,6 +1691,51 @@ impl Check for WorkspaceIntegrity {
     }
 }
 
+/// The half-trusted HTTPS state: the system store accepts the proxy's CA
+/// (so curl and the trust check are happy) while Chromium-family browsers
+/// still show ERR_CERT_AUTHORITY_INVALID, because on Linux they read the
+/// NSS user store instead. The user did everything Mast asked and still
+/// sees the scary interstitial — worth naming precisely.
+struct BrowserTrust;
+impl Check for BrowserTrust {
+    fn id(&self) -> &'static str {
+        "browser-trust"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.system.proxy_nss_gap.is_some()
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let Some(gap) = ctx.system.proxy_nss_gap else { return Vec::new() };
+        let (detail, repair) = match gap {
+            NssTrustGap::CertutilMissing => (
+                "The system trust store accepts the local HTTPS certificate authority, \
+                 but Chrome, Vivaldi, Brave and Edge read the NSS user store \
+                 (~/.pki/nssdb) — and certutil, the tool that writes it, is not \
+                 installed. Until it is, those browsers show \
+                 ERR_CERT_AUTHORITY_INVALID on every local https:// domain. The \
+                 repair installs the NSS tools package and finishes the job.",
+                REPAIR_INSTALL_CERTUTIL,
+            ),
+            NssTrustGap::CaMissing => (
+                "The system trust store accepts the local HTTPS certificate authority, \
+                 but the NSS user store (~/.pki/nssdb) that Chrome, Vivaldi, Brave and \
+                 Edge read does not hold it yet — they show \
+                 ERR_CERT_AUTHORITY_INVALID until it does. Applying the repair adds it \
+                 (a full browser restart follows).",
+                REPAIR_TRUST_PROXY_CA,
+            ),
+        };
+        let mut f = finding(
+            self.id(),
+            Severity::Warning,
+            "Chromium-family browsers do not trust the local HTTPS authority yet",
+            detail,
+        );
+        f.repair = repair_spec(repair, None);
+        vec![f]
+    }
+}
+
 pub fn all_checks() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(DockerRunning),
@@ -1567,6 +1745,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(SnapDocker),
         Box::new(DiskSpace),
         Box::new(SelinuxInfo),
+        Box::new(BrowserTrust),
         Box::new(ContextSanity),
         Box::new(EnvMissing),
         Box::new(VendorMissing),
@@ -1582,6 +1761,9 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(PhpRuntime),
         Box::new(StorageOwnership),
         Box::new(ConfigDrift),
+        Box::new(DetachedContainers),
+        Box::new(StaleAppUrl),
+        Box::new(DbNotMigrated),
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
         Box::new(DockerDesktopLinux),
@@ -1638,6 +1820,7 @@ mod tests {
             selinux_enforcing: false,
             uid: 1000,
             gid: 1000,
+            proxy_nss_gap: None,
         }
     }
 
@@ -1666,12 +1849,14 @@ mod tests {
             resolution_error: None,
             db: None,
             db_versions: Vec::new(),
+            app_url_mismatch: None,
             config_cached: false,
             dotted_services: Vec::new(),
             sail_builds: Vec::new(),
             available_runtimes: Vec::new(),
             foreign_owned: None,
             drifted_services: Vec::new(),
+            detached_services: Vec::new(),
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
@@ -1709,6 +1894,7 @@ mod tests {
             username: "sail".into(),
             failure,
             admin_access,
+            migrations_table: None,
         }
     }
 
@@ -1726,6 +1912,25 @@ mod tests {
         let (ran, findings) = run_all(&ctx(vec![sail_project("a")]));
         assert!(findings.is_empty(), "unexpected findings: {findings:?}");
         assert!(ran >= 5);
+    }
+
+    #[test]
+    fn a_browser_trust_gap_warns_with_the_trust_repair() {
+        for gap in [NssTrustGap::CertutilMissing, NssTrustGap::CaMissing] {
+            let mut c = ctx(vec![]);
+            c.system.proxy_nss_gap = Some(gap);
+            let (_, findings) = run_all(&c);
+            let f = findings.iter().find(|f| f.check == "browser-trust").unwrap();
+            assert_eq!(f.severity, Severity::Warning);
+            assert!(f.detail.contains("ERR_CERT_AUTHORITY_INVALID"), "{}", f.detail);
+            // A missing certutil offers the installer; a missing CA entry
+            // only needs the trust repair re-applied.
+            let expected = match gap {
+                NssTrustGap::CertutilMissing => REPAIR_INSTALL_CERTUTIL,
+                NssTrustGap::CaMissing => REPAIR_TRUST_PROXY_CA,
+            };
+            assert_eq!(f.repair.as_ref().unwrap().id, expected);
+        }
     }
 
     #[test]
@@ -2153,6 +2358,68 @@ mod tests {
         assert!(f.detail.contains("laravel.test, mysql"), "{}", f.detail);
         assert!(f.detail.contains("restart changes nothing"), "{}", f.detail);
         assert!(f.repair.is_none(), "the Start button is the repair");
+    }
+
+    #[test]
+    fn detached_containers_error_with_a_force_recreate_repair() {
+        let mut p = sail_project("a");
+        p.detached_services = vec!["laravel.test".into()];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "detached-containers").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.detail.contains("no docker network"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_RECREATE_SERVICE);
+        assert_eq!(repair.risk, RiskTier::Caution);
+        assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
+    }
+
+    #[test]
+    fn a_stale_app_url_warns_with_the_env_repair() {
+        let mut p = sail_project("a");
+        p.app_url_mismatch = Some((8000, 8082));
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "stale-app-url").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.detail.contains("APP_URL pins port 8000"), "{}", f.detail);
+        assert!(f.detail.contains("APP_PORT=8082"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_FIX_APP_URL);
+        assert_eq!(repair.risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn an_unmigrated_database_errors_with_the_migrate_repair() {
+        let mut p = sail_project("a");
+        p.running = true;
+        let mut db = db_facts(None, false);
+        db.migrations_table = Some(false);
+        p.db = Some(db);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "db-not-migrated").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.detail.contains("no `migrations` table"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_ARTISAN_MIGRATE);
+        assert_eq!(repair.risk, RiskTier::Caution);
+
+        // A migrated database (or an unprobeable one) raises nothing.
+        for table in [Some(true), None] {
+            let mut p = sail_project("a");
+            let mut db = db_facts(None, false);
+            db.migrations_table = table;
+            p.db = Some(db);
+            let (_, findings) = run_all(&ctx(vec![p]));
+            assert!(findings.iter().all(|f| f.check != "db-not-migrated"), "{table:?}");
+        }
+        // Broken credentials are the DbCredentials check's finding, not ours
+        // — a migrations answer gathered anyway must not double-report.
+        let mut p = sail_project("a");
+        let mut db = db_facts(Some(ProbeFailure::AccessDenied), false);
+        db.migrations_table = Some(false);
+        p.db = Some(db);
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(findings.iter().all(|f| f.check != "db-not-migrated"));
     }
 
     #[test]

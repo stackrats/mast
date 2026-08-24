@@ -36,6 +36,14 @@ pub struct ContainerObservation {
     /// labelling with the code it died on.
     pub exit_code: Option<i32>,
     pub config_hash: Option<String>,
+    /// Networks the container is attached to, by name. A compose-created
+    /// container always joins at least one — a *running* container with none
+    /// is the wreckage of a start whose network/port setup failed halfway.
+    pub networks: Vec<String>,
+    /// Host ports actually published right now (what `docker ps` shows) —
+    /// which can be empty even when the container was *configured* to
+    /// publish, see `networks`.
+    pub published_ports: Vec<u16>,
 }
 
 /// Coarse observation hint: something changed, re-inspect. Inputs are hints,
@@ -215,6 +223,20 @@ impl RuntimeAdapter for BollardAdapter {
                 continue;
             };
             let status_text = c.status.unwrap_or_default();
+            let mut networks: Vec<String> = c
+                .network_settings
+                .and_then(|ns| ns.networks)
+                .map(|nets| nets.into_keys().collect())
+                .unwrap_or_default();
+            networks.sort();
+            let mut published_ports: Vec<u16> = c
+                .ports
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| p.public_port)
+                .collect();
+            published_ports.sort_unstable();
+            published_ports.dedup();
             observations.push(ContainerObservation {
                 id: c.id.unwrap_or_default(),
                 name: c
@@ -234,6 +256,8 @@ impl RuntimeAdapter for BollardAdapter {
                 health: parse_health(&status_text),
                 exit_code: parse_exit_code(&status_text),
                 config_hash: labels.get(COMPOSE_CONFIG_HASH_LABEL).cloned(),
+                networks,
+                published_ports,
             });
         }
         Ok(observations)

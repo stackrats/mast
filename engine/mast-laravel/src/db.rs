@@ -149,6 +149,48 @@ pub fn probe_tail(creds: &DbCreds) -> (Vec<String>, Vec<(String, String)>) {
     }
 }
 
+/// Command tail asking an already-reachable database whether Laravel's
+/// `migrations` table exists — prints `1` or `0`. Run only after
+/// [`probe_tail`] succeeded: a login failure is its own finding, and this
+/// question only means something once the credentials work.
+pub fn migrations_probe_tail(creds: &DbCreds) -> (Vec<String>, Vec<(String, String)>) {
+    let client = client_binary(creds.kind);
+    match creds.kind {
+        DbKind::Mysql | DbKind::Mariadb => (
+            [
+                client,
+                "-u",
+                &creds.username,
+                "-D",
+                &creds.database,
+                "-N",
+                "-e",
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = \
+                 DATABASE() AND table_name = 'migrations'",
+            ]
+            .map(String::from)
+            .to_vec(),
+            vec![("MYSQL_PWD".into(), creds.password.clone())],
+        ),
+        DbKind::Pgsql => (
+            [
+                client,
+                "-w",
+                "-U",
+                &creds.username,
+                "-d",
+                &creds.database,
+                "-tAc",
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = \
+                 current_schema() AND table_name = 'migrations'",
+            ]
+            .map(String::from)
+            .to_vec(),
+            vec![("PGPASSWORD".into(), creds.password.clone())],
+        ),
+    }
+}
+
 /// One way an administrative login might still work on the initialized
 /// volume, tried in order.
 #[derive(Debug, Clone, PartialEq, Eq)]

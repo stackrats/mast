@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 
-import type { WorkspaceSummary } from "./bindings";
+import type { ProjectSummary, WorkspaceSummary } from "./bindings";
 import AboutDialog from "./components/AboutDialog.vue";
 import AppMenubar from "./components/AppMenubar.vue";
 import DiagnosticsDialog from "./components/DiagnosticsDialog.vue";
@@ -26,6 +26,13 @@ import { useEngineStore } from "./stores/engine";
 const store = useEngineStore();
 const settingsOpen = ref(false);
 const diagnosticsOpen = ref(false);
+// A project's Diagnose button scopes the dialog to it; the menubar entry
+// runs the full set.
+const diagnosticsScope = ref<ProjectSummary | null>(null);
+function openDiagnostics(scope: ProjectSummary | null = null) {
+  diagnosticsScope.value = scope;
+  diagnosticsOpen.value = true;
+}
 const newProjectOpen = ref(false);
 const aboutOpen = ref(false);
 const workspaceDialogOpen = ref(false);
@@ -81,7 +88,7 @@ function editWorkspace(ws: WorkspaceSummary) {
       <AppMenubar
         @open-settings="settingsOpen = true"
         @new-workspace="newWorkspace"
-        @open-diagnostics="diagnosticsOpen = true"
+        @open-diagnostics="openDiagnostics()"
         @new-project="newProjectOpen = true"
         @open-about="aboutOpen = true"
       />
@@ -103,7 +110,7 @@ function editWorkspace(ws: WorkspaceSummary) {
             @edit="editWorkspace(selectedWorkspace)"
           />
           <div v-else-if="selectedProject" class="mx-auto max-w-2xl">
-            <ProjectCard :project="selectedProject" />
+            <ProjectCard :project="selectedProject" @diagnose="openDiagnostics(selectedProject)" />
           </div>
           <HomePane v-else @open-settings="settingsOpen = true" />
         </main>
@@ -131,7 +138,7 @@ function editWorkspace(ws: WorkspaceSummary) {
       </div>
 
       <SettingsDialog v-model:open="settingsOpen" />
-      <DiagnosticsDialog v-model:open="diagnosticsOpen" />
+      <DiagnosticsDialog v-model:open="diagnosticsOpen" :scope="diagnosticsScope" />
       <NewProjectDialog v-model:open="newProjectOpen" />
       <WorkspaceDialog v-model:open="workspaceDialogOpen" :editing="editingWorkspace" />
       <AboutDialog v-model:open="aboutOpen" />
