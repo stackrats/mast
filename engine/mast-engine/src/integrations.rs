@@ -355,7 +355,7 @@ pub fn open_terminal(
         ));
     }
     let argv = terminal_argv(&terminal, cwd, command);
-    spawn_detached(&argv, Some(cwd)).map_err(|e| e.to_string())
+    spawn_detached(&argv, Some(cwd), true).map_err(|e| e.to_string())
 }
 
 pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> {
@@ -367,7 +367,7 @@ pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> 
         // Last resort: let the desktop decide.
         None => vec![OPENER.into(), argv_path(path)],
     };
-    spawn_detached(&argv, None).map_err(|e| e.to_string())
+    spawn_detached(&argv, None, false).map_err(|e| e.to_string())
 }
 
 /// The target is a project directory, and both openers show a directory in
@@ -375,11 +375,11 @@ pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> 
 /// Open a file with the desktop's default application (xdg-open/open) —
 /// the manual fallback for files Mast must not edit itself (/etc/hosts).
 pub fn open_path(path: &Path) -> Result<(), String> {
-    spawn_detached(&[OPENER.into(), argv_path(path)], None).map_err(|e| e.to_string())
+    spawn_detached(&[OPENER.into(), argv_path(path)], None, false).map_err(|e| e.to_string())
 }
 
 pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    spawn_detached(&[OPENER.into(), argv_path(path)], None).map_err(|e| e.to_string())
+    spawn_detached(&[OPENER.into(), argv_path(path)], None, false).map_err(|e| e.to_string())
 }
 
 /// Hand a URL to the desktop's default browser. The scheme is re-checked
@@ -392,7 +392,7 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
     if !scheme_ok {
         return Err(format!("not an http(s) address: {url}"));
     }
-    spawn_detached(&[OPENER.into(), url.to_string()], None).map_err(|e| e.to_string())
+    spawn_detached(&[OPENER.into(), url.to_string()], None, false).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

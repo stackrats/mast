@@ -177,10 +177,40 @@ const OVERRIDE_CANDIDATES: [&str; 4] = [
 /// Resolve the invocation for `project_dir`. `process_env` is the real
 /// environment (wins over `.env` per-key, ADR-0001 finding 3) — injected so
 /// tests are hermetic.
+/// std's canonicalize on Windows returns `\\?\`-verbatim paths — correct for
+/// the filesystem, hostile everywhere they escape it: compose resolves bind
+/// mount sources against the `-f` file's directory, and Docker Desktop
+/// refuses `\\?\C:\…` sources outright ("mount denied"). Everything an
+/// invocation carries must be in plain form.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else { return path };
+    match rest.strip_prefix(r"UNC\") {
+        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+        None => PathBuf::from(rest),
+    }
+}
+
+#[cfg(test)]
+mod verbatim_tests {
+    use super::strip_verbatim;
+    use std::path::PathBuf;
+
+    /// Pure string logic, so the Windows behavior is provable everywhere.
+    #[test]
+    fn verbatim_prefixes_strip_and_plain_paths_pass_through() {
+        let s = |p: &str| strip_verbatim(PathBuf::from(p));
+        assert_eq!(s(r"\\?\C:\Users\m\project"), PathBuf::from(r"C:\Users\m\project"));
+        assert_eq!(s(r"\\?\UNC\server\share\p"), PathBuf::from(r"\\server\share\p"));
+        assert_eq!(s("/home/m/project"), PathBuf::from("/home/m/project"));
+        assert_eq!(s(r"C:\plain"), PathBuf::from(r"C:\plain"));
+    }
+}
+
 pub fn resolve_invocation(
     project_dir: &Path,
     process_env: &HashMap<String, String>,
 ) -> Result<ComposeInvocation, ComposeError> {
+    let project_dir = &strip_verbatim(project_dir.to_path_buf());
     let dotenv = parse_env_file(&project_dir.join(".env"));
     let get = |key: &str| -> Option<(String, bool)> {
         // (value, from_real_env)

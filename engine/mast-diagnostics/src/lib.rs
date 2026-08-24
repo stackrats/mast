@@ -56,6 +56,7 @@ pub const REPAIR_ADD_HOST_GATEWAY: &str = "add-host-gateway";
 pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
+pub const REPAIR_DISCONNECT_STALE: &str = "disconnect-stale-endpoints";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
 pub const REPAIR_INSTALL_CERTUTIL: &str = "install-certutil";
 
@@ -373,6 +374,20 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             },
             risk: RiskTier::Safe,
             description: "Runs `docker network create` (idempotent).".into(),
+            arg: arg.map(String::from),
+        }),
+        REPAIR_DISCONNECT_STALE => Some(RepairSpec {
+            id: REPAIR_DISCONNECT_STALE,
+            title: match arg {
+                Some(net) => format!("Clear stale endpoints from network \"{net}\""),
+                None => "Clear stale network endpoints".into(),
+            },
+            risk: RiskTier::Safe,
+            description: "Force-disconnects endpoint records whose container no longer \
+                          exists — the residue of force-removed containers, which blocks \
+                          `docker compose down`/`up` with \"is not connected to the \
+                          network\". Containers that still exist are left untouched."
+                .into(),
             arg: arg.map(String::from),
         }),
         REPAIR_NODE_INSTALL => Some(RepairSpec {

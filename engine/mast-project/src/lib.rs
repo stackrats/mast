@@ -85,6 +85,19 @@ pub fn project_warnings(dir: &Path) -> Vec<String> {
     warnings
 }
 
+/// std's canonicalize on Windows returns `\\?\`-verbatim paths. They are
+/// right for the filesystem but hostile everywhere else — docker mount
+/// sources, compose `-f` arguments, every path the UI shows — so records
+/// store the plain form. [`project_id`] canonicalizes again internally, so
+/// identity is unaffected by the stored spelling.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else { return path };
+    match rest.strip_prefix(r"UNC\") {
+        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+        None => PathBuf::from(rest),
+    }
+}
+
 /// Stable project identity: hash of the canonical path (plan §5 keying).
 pub fn project_id(path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -109,7 +122,7 @@ pub fn scan_directories(directories: &[PathBuf]) -> Vec<DiscoveredCandidate> {
     let mut out: Vec<DiscoveredCandidate> = Vec::new();
     let mut push = |dir: PathBuf| {
         if has_compose_file(&dir) || is_sail_project(&dir) {
-            let canonical = dir.canonicalize().unwrap_or(dir);
+            let canonical = strip_verbatim(dir.canonicalize().unwrap_or(dir));
             if out.iter().any(|c| c.path == canonical) {
                 return;
             }
@@ -333,7 +346,14 @@ impl MetadataStore {
     }
 
     pub fn load_projects(&self) -> Result<Vec<ProjectRecord>, ProjectError> {
-        self.read_json("projects.json")
+        // Existing stores may hold verbatim paths from before strip_verbatim
+        // — normalize on the way in so old records heal themselves.
+        self.read_json("projects.json").map(|mut records: Vec<ProjectRecord>| {
+            for record in &mut records {
+                record.path = strip_verbatim(std::mem::take(&mut record.path));
+            }
+            records
+        })
     }
 
     pub fn save_projects(&self, projects: &[ProjectRecord]) -> Result<(), ProjectError> {
@@ -345,6 +365,7 @@ impl MetadataStore {
     pub fn import_project(&self, path: &Path) -> Result<ProjectRecord, ProjectError> {
         let canonical = path
             .canonicalize()
+            .map(strip_verbatim)
             .map_err(|source| ProjectError::Io { path: path.to_path_buf(), source })?;
         if !canonical.is_dir() {
             return Err(ProjectError::NotADirectory(canonical));
