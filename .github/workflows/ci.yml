@@ -59,15 +59,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      # Pinned to the same version the pnpm catalog pins — the curl
+      # installer tracks upstream's latest, which can (and did) reference
+      # not-yet-published packages and take CI down with it.
       - name: Install Vite Plus
-        run: curl -fsSL https://vite.plus | bash
+        run: npm install -g vite-plus@0.2.6
       - name: vp install
-        run: |
-          export PATH="$HOME/.vite-plus/bin:$PATH"
-          vp install
+        run: vp install
       - name: vp check + test + build
         run: |
-          export PATH="$HOME/.vite-plus/bin:$PATH"
           vp check
           vp test run
           vp build
