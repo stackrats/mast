@@ -1253,6 +1253,11 @@ impl Engine {
                         &container[..container.len().min(12)]
                     ));
                 }
+                summary.push(
+                    "remove every STOPPED container with the network's compose project \
+                     label — what a successful `down` would have removed (volumes stay)"
+                        .into(),
+                );
                 summary.push("running containers are never touched".into());
                 Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op: false })
             }
@@ -2063,6 +2068,78 @@ impl Engine {
                         }
                         // Already gone: the endpoint sweep above was the fix.
                         _ => {}
+                    }
+                }
+                // One named leftover is rarely alone (field lesson: the user
+                // found a second by hand). Sweep every STOPPED container
+                // carrying the network's compose project label — exactly the
+                // set a successful `down` would have removed; running ones
+                // are reported and left alone.
+                let label_probe: Vec<String> = [
+                    "docker",
+                    "network",
+                    "inspect",
+                    "--format",
+                    "{{index .Labels \"com.docker.compose.project\"}}",
+                    net,
+                ]
+                .map(String::from)
+                .into();
+                let project_label = run_command(&label_probe, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .ok()
+                    .filter(|o| o.success())
+                    .map(|o| o.stdout.trim().to_string())
+                    .filter(|l| !l.is_empty() && *l != "<no value>");
+                if let Some(project_label) = project_label {
+                    let ps: Vec<String> = [
+                        "docker",
+                        "ps",
+                        "-a",
+                        "--filter",
+                        &format!("label=com.docker.compose.project={project_label}"),
+                        "--format",
+                        "{{.ID}} {{.Names}} {{.State}}",
+                    ]
+                    .map(String::from)
+                    .into();
+                    let out = run_command(&ps, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                        .map_err(crate::internal_err)?;
+                    for row in out.stdout.lines() {
+                        let mut parts = row.split_whitespace();
+                        let (Some(id), name, state) = (parts.next(), parts.next(), parts.next())
+                        else {
+                            continue;
+                        };
+                        let name = name.unwrap_or(id);
+                        if state == Some("running") {
+                            self.emit_op(
+                                handle,
+                                op,
+                                OperationEventKind::Output {
+                                    line: format!("{name} is running — left untouched"),
+                                    stderr: false,
+                                },
+                            );
+                            continue;
+                        }
+                        let rm: Vec<String> =
+                            ["docker", "rm", "-f", id].map(String::from).into();
+                        let out = run_command(&rm, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                            .await
+                            .map_err(crate::internal_err)?;
+                        let line = if out.success() {
+                            cleared += 1;
+                            format!("removed stopped container {name} (project {project_label})")
+                        } else {
+                            format!("could not remove {name}: {}", out.stderr.trim())
+                        };
+                        self.emit_op(
+                            handle,
+                            op,
+                            OperationEventKind::Output { line, stderr: false },
+                        );
                     }
                 }
                 if cleared == 0 {

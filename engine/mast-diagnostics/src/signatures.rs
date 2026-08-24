@@ -128,6 +128,23 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         repair: Some(crate::REPAIR_CREATE_NETWORK),
     },
     ErrorSignature {
+        id: "vendor-missing",
+        needles: &["vendor/autoload.php"],
+        explanation: "the PHP dependencies have never been installed in this checkout — \
+                      vendor/ is missing, so nothing Laravel can start",
+        advice: "run composer install — Mast can do it in a container, no local PHP needed",
+        repair: Some(crate::REPAIR_COMPOSER_INSTALL),
+    },
+    ErrorSignature {
+        id: "node-modules-missing",
+        needles: &["multiplex: not found", "concurrently: not found", "vite: not found"],
+        explanation: "the frontend dependencies are not installed (node_modules is \
+                      missing), so the dev script's runner cannot be found",
+        advice: "install them inside the app container, so native modules are built \
+                 against the runtime that loads them",
+        repair: Some(crate::REPAIR_NODE_INSTALL),
+    },
+    ErrorSignature {
         id: "stale-network-endpoint",
         needles: &["is not connected to the network"],
         explanation: "the project network still holds an endpoint record for a container \
