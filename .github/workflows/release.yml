@@ -35,11 +35,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      # Pinned like ci.yml: the curl installer tracks upstream's latest,
+      # which can reference not-yet-published packages.
       - name: Install Vite Plus
-        run: curl -fsSL https://vite.plus | bash
+        run: npm install -g vite-plus@0.2.6
       - name: vp install + build
         run: |
-          export PATH="$HOME/.vite-plus/bin:$PATH"
           vp install
           vp build
       - uses: actions/upload-artifact@v4
