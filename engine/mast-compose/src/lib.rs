@@ -252,7 +252,12 @@ pub fn resolve_invocation(
         .unwrap_or_default();
 
     let sail_script = project_dir.join("vendor/bin/sail");
-    let runner = if is_executable(&sail_script) {
+    // The sail wrapper is a bash script, which Windows' CreateProcess refuses
+    // outright (error 193) — so ADR-0001's parity rule inverts there: parity
+    // with a Windows terminal IS `docker compose`, the only thing a WSL-less
+    // shell could run either. The project still reads as Sail everywhere
+    // (badges, catalog); only the runner changes.
+    let runner = if cfg!(unix) && is_executable(&sail_script) {
         Runner::Sail { script: sail_script }
     } else {
         Runner::DockerCompose
