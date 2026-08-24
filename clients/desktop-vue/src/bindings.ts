@@ -409,6 +409,12 @@ export type Action =
  */
 { type: "rebuildProject"; id: ProjectId } | 
 /**
+ * Remove one orphaned service's leftover container (`docker rm -f`) —
+ * the targeted disposal for a single [`ServiceState::orphaned`] chip,
+ * where a whole-project Rebuild would be overkill.
+ */
+{ type: "removeOrphanContainer"; id: ProjectId; service: string } | 
+/**
  * Switch a Sail-built service to another vendored PHP runtime, as ONE
  * operation: rewrites `build.context` and the `sail-X.Y/app` image tag
  * together, rebuilds without cache, recreates the container when the

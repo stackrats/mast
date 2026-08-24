@@ -840,6 +840,20 @@ async function clearAppLog() {
                   <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
                 </DropdownMenuItem>
               </template>
+              <DropdownMenuItem
+                v-if="service.orphaned"
+                :class="menuItemClass"
+                :disabled="store.readOnly"
+                @select="
+                  store.runLifecycle(project.id, `remove ${service.name}`, {
+                    type: 'removeOrphanContainer',
+                    id: project.id,
+                    service: service.name,
+                  })
+                "
+              >
+                <Trash2 class="h-3.5 w-3.5 text-slate-400" /> Remove container
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>

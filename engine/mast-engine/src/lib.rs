@@ -504,6 +504,9 @@ impl Engine {
             Action::RebuildProject { id } => {
                 return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Rebuild, None);
             }
+            Action::RemoveOrphanContainer { id, service } => {
+                return self.dispatch_remove_orphan(id.clone(), service.clone());
+            }
             Action::StartService { id, service } => {
                 return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Up, Some(service.clone()));
             }
@@ -1201,6 +1204,7 @@ impl Engine {
             | Action::StopProject { .. }
             | Action::RestartProject { .. }
             | Action::RebuildProject { .. }
+            | Action::RemoveOrphanContainer { .. }
             | Action::StartService { .. }
             | Action::StopService { .. }
             | Action::RestartService { .. }
