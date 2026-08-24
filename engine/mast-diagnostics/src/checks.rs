@@ -7,8 +7,8 @@ use crate::{
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
-    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
-    REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT,
+    REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -1157,6 +1157,49 @@ impl Check for ConfigDrift {
     }
 }
 
+/// Running containers that are attached to no network and publish none of
+/// the ports the model says they should. The container answers `docker ps`
+/// with "running" while nothing on the host can reach it — the app 500s on
+/// every DB call too, since the compose network is how it finds mysql. Left
+/// behind by a start whose port/network setup failed halfway (e.g. a bind
+/// lost a race with another process) and a later plain `docker start`.
+/// Unlike config drift the config-hash still matches, so Start (`up -d`)
+/// shrugs; only a force-recreate reattaches the container.
+struct DetachedContainers;
+impl Check for DetachedContainers {
+    fn id(&self) -> &'static str {
+        "detached-containers"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.detached_services.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| !p.detached_services.is_empty())
+            .map(|p| {
+                let services = p.detached_services.join(" ");
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{}: running containers nothing can reach", p.name),
+                    format!(
+                        "{} report \"running\" but sit on no docker network and publish \
+                         none of their ports — the leftovers of a start that failed \
+                         halfway through port/network setup. The app is unreachable from \
+                         the browser and cannot see its own services. A restart keeps the \
+                         broken state and Start is a no-op (the configuration never \
+                         changed); recreating the container is the fix.",
+                        p.detached_services.join(", ")
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_RECREATE_SERVICE, Some(&services));
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// Files under storage/ or bootstrap/cache owned by someone else — root
 /// from a sudo'd installer, 1337 from a container that ran without WWWUSER
 /// mapping. The cure for Sail's most-commented issue ever (#81), whose
@@ -1582,6 +1625,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(PhpRuntime),
         Box::new(StorageOwnership),
         Box::new(ConfigDrift),
+        Box::new(DetachedContainers),
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
         Box::new(DockerDesktopLinux),
@@ -1672,6 +1716,7 @@ mod tests {
             available_runtimes: Vec::new(),
             foreign_owned: None,
             drifted_services: Vec::new(),
+            detached_services: Vec::new(),
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
@@ -2153,6 +2198,20 @@ mod tests {
         assert!(f.detail.contains("laravel.test, mysql"), "{}", f.detail);
         assert!(f.detail.contains("restart changes nothing"), "{}", f.detail);
         assert!(f.repair.is_none(), "the Start button is the repair");
+    }
+
+    #[test]
+    fn detached_containers_error_with_a_force_recreate_repair() {
+        let mut p = sail_project("a");
+        p.detached_services = vec!["laravel.test".into()];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "detached-containers").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.detail.contains("no docker network"), "{}", f.detail);
+        let repair = f.repair.as_ref().unwrap();
+        assert_eq!(repair.id, REPAIR_RECREATE_SERVICE);
+        assert_eq!(repair.risk, RiskTier::Caution);
+        assert_eq!(repair.arg.as_deref(), Some("laravel.test"));
     }
 
     #[test]

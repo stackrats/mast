@@ -41,6 +41,7 @@ pub const REPAIR_DOCKER_GROUP: &str = "docker-group";
 pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
+pub const REPAIR_RECREATE_SERVICE: &str = "recreate-service";
 pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
 pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
@@ -222,6 +223,14 @@ pub struct ProjectFacts {
     /// `config-hash` label vs current `config --hash`). A restart will NOT
     /// pick the changes up; only a recreate does.
     pub drifted_services: Vec<String>,
+    /// Running services whose containers are attached to no docker network
+    /// and publish none of the host ports the model says they should — the
+    /// wreckage of a start whose port/network setup failed halfway (say, a
+    /// bind lost a race) followed by a plain `docker start`. The container
+    /// reports "running" while nothing can reach it, and — unlike drift —
+    /// its config-hash still matches, so `up -d` is a no-op: only a
+    /// force-recreate reattaches it.
+    pub detached_services: Vec<String>,
     /// Vite's `public/hot` marker, when present: the dev-server URL it pins
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
@@ -367,6 +376,20 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           the transactional writer. The compose file is untouched."
                 .into(),
             arg: None,
+        }),
+        REPAIR_RECREATE_SERVICE => Some(RepairSpec {
+            id: REPAIR_RECREATE_SERVICE,
+            title: match arg {
+                Some(services) => format!("Recreate {services} from the current configuration"),
+                None => "Recreate the unreachable containers".into(),
+            },
+            risk: RiskTier::Caution,
+            description: "Runs compose `up -d --force-recreate --no-deps` on exactly the \
+                          named services — the one thing that replaces a running container \
+                          whose config-hash still matches. Named volumes and their data are \
+                          untouched."
+                .into(),
+            arg: arg.map(String::from),
         }),
         REPAIR_GENERATE_APP_KEY => Some(RepairSpec {
             id: REPAIR_GENERATE_APP_KEY,
