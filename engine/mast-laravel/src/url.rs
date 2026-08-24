@@ -57,6 +57,50 @@ fn normalize(raw: &str, port: Option<u16>) -> Option<String> {
     })
 }
 
+/// Rewrite the explicit port in an `APP_URL` value when it is `from`,
+/// preserving everything else about the string.
+///
+/// [`app_url`] gives an explicit port in `APP_URL` the last word over
+/// `APP_PORT` — right for a hand-pinned URL, wrong the moment a port remap
+/// moves `APP_PORT` out from under it: the Browser button would keep opening
+/// a port nothing serves. A URL naming any *other* port than the one that
+/// moved is exactly such a hand-pin, so `None` leaves it alone.
+pub fn rewrite_explicit_port(raw: &str, from: u16, to: u16) -> Option<String> {
+    let raw = raw.trim();
+    if raw.contains("${") {
+        return None;
+    }
+    let (prefix, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), raw),
+    };
+    let (authority, suffix) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || port.parse::<u16>().ok() != Some(from) {
+        return None;
+    }
+    Some(format!("{prefix}{host}:{to}{suffix}"))
+}
+
+/// The port an `APP_URL` value pins explicitly, if any — the half of
+/// [`rewrite_explicit_port`]'s condition that detection needs on its own.
+pub fn explicit_port(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    if raw.contains("${") {
+        return None;
+    }
+    let rest = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// `host` or `host:1234`. Deliberately narrow — it is also what stops a
 /// scheme-less `javascript:alert(1)` from being read as a bare host.
 fn is_host_port(authority: &str) -> bool {
@@ -121,6 +165,37 @@ mod tests {
             Some("http://localhost:8080/admin".into())
         );
         assert_eq!(app_url(&env(&[("APP_URL", "myapp.test")])), Some("http://myapp.test".into()));
+    }
+
+    #[test]
+    fn explicit_ports_are_read_out_of_url_shapes() {
+        assert_eq!(explicit_port("http://localhost:8000"), Some(8000));
+        assert_eq!(explicit_port("https://myapp.test:8000/admin"), Some(8000));
+        assert_eq!(explicit_port("myapp.test:8000"), Some(8000));
+        assert_eq!(explicit_port("http://localhost"), None);
+        assert_eq!(explicit_port("http://${APP_HOST}:8000"), None);
+        assert_eq!(explicit_port(""), None);
+    }
+
+    #[test]
+    fn explicit_port_rewrites_follow_a_moved_app_port() {
+        assert_eq!(
+            rewrite_explicit_port("http://localhost:8000", 8000, 8082),
+            Some("http://localhost:8082".into())
+        );
+        // Path and scheme survive untouched.
+        assert_eq!(
+            rewrite_explicit_port("https://myapp.test:8000/admin", 8000, 8082),
+            Some("https://myapp.test:8082/admin".into())
+        );
+        // A bare host:port hand-edit still counts.
+        assert_eq!(rewrite_explicit_port("myapp.test:8000", 8000, 8082), Some("myapp.test:8082".into()));
+        // A different pinned port was chosen by hand — not ours to move.
+        assert_eq!(rewrite_explicit_port("http://localhost:3000", 8000, 8082), None);
+        // No explicit port: app_url() already follows APP_PORT.
+        assert_eq!(rewrite_explicit_port("http://localhost", 8000, 8082), None);
+        // Unexpanded interpolation is not an address we can edit.
+        assert_eq!(rewrite_explicit_port("http://${APP_HOST}:8000", 8000, 8082), None);
     }
 
     #[test]

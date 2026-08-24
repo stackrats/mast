@@ -310,8 +310,11 @@ async fn custom_service_preview(
 
 #[tauri::command]
 #[specta::specta]
-async fn run_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticReport, String> {
-    state.client.run_diagnostics().await.map_err(|e| e.to_string())
+async fn run_diagnostics(
+    state: State<'_, AppState>,
+    project: Option<ProjectId>,
+) -> Result<DiagnosticReport, String> {
+    state.client.run_diagnostics(project).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

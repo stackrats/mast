@@ -273,7 +273,10 @@ async fn handle_request(
             let snapshot: String = param(&params, "snapshot")?;
             ok(engine.snapshot_report(&snapshot).await?)
         }
-        "runDiagnostics" => ok(engine.run_diagnostics().await?),
+        "runDiagnostics" => {
+            let project: Option<ProjectId> = param(&params, "project").unwrap_or(None);
+            ok(engine.run_diagnostics_scoped(project.as_ref()).await?)
+        }
         "repairPreview" => {
             let repair: String = param(&params, "repair")?;
             let arg: Option<String> = param(&params, "arg").unwrap_or(None);

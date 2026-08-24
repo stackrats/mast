@@ -41,6 +41,9 @@ pub const REPAIR_DOCKER_GROUP: &str = "docker-group";
 pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
+pub const REPAIR_RECREATE_SERVICE: &str = "recreate-service";
+pub const REPAIR_FIX_APP_URL: &str = "fix-app-url";
+pub const REPAIR_ARTISAN_MIGRATE: &str = "artisan-migrate";
 pub const REPAIR_GENERATE_APP_KEY: &str = "generate-app-key";
 pub const REPAIR_STORAGE_LINK: &str = "storage-link";
 pub const REPAIR_DB_RECONCILE: &str = "db-reconcile";
@@ -54,6 +57,7 @@ pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
+pub const REPAIR_INSTALL_CERTUTIL: &str = "install-certutil";
 
 /// A repair a finding offers. `arg` carries the repair's target when the id
 /// alone is ambiguous (e.g. which network to create).
@@ -85,6 +89,20 @@ pub struct SocketFacts {
     pub writable: bool,
 }
 
+/// Why Chromium-family browsers (Chrome, Vivaldi, Brave, Edge) still warn
+/// about the local HTTPS proxy on Linux even though the *system* store
+/// trusts its certificate authority: they read the NSS user store
+/// (`~/.pki/nssdb`), which is a separate step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NssTrustGap {
+    /// `certutil` (libnss3-tools / nss-tools) is not installed, so the
+    /// trust repair could only fill the system store.
+    CertutilMissing,
+    /// `certutil` exists but the CA is not in `~/.pki/nssdb` yet —
+    /// re-applying the trust repair adds it.
+    CaMissing,
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemFacts {
     pub docker_connected: bool,
@@ -108,6 +126,10 @@ pub struct SystemFacts {
     pub selinux_enforcing: bool,
     pub uid: u32,
     pub gid: u32,
+    /// The system store trusts the HTTPS proxy's CA but Chromium-family
+    /// browsers still would not (Linux; probed only once the trust repair
+    /// has filled the system store). `None` = no gap or not applicable.
+    pub proxy_nss_gap: Option<NssTrustGap>,
 }
 
 /// Outcome of probing the project's database service with the credentials
@@ -126,6 +148,11 @@ pub struct DbProbeFacts {
     /// (probed only after a failure) — the gate between a live reconcile
     /// and a destructive volume recreate.
     pub admin_access: bool,
+    /// The database holds Laravel's `migrations` table (probed only when
+    /// the credentials work). `Some(false)` is the fresh-bootstrap trap:
+    /// every request touching the database 500s on a missing table until
+    /// the first `artisan migrate` runs. `None` = not determinable.
+    pub migrations_table: Option<bool>,
 }
 
 /// A database service whose pinned image version disagrees with what its
@@ -202,6 +229,11 @@ pub struct ProjectFacts {
     /// version (checked even when stopped — the point is warning BEFORE the
     /// crash-loop).
     pub db_versions: Vec<DbVersionIssue>,
+    /// `APP_URL` pins an explicit port the project does not publish while
+    /// `APP_PORT` names another — `(url_port, app_port)`. What a port remap
+    /// leaves behind when `APP_URL` had the old port written in: the
+    /// Browser button opens a refused connection until the URL follows.
+    pub app_url_mismatch: Option<(u16, u16)>,
     /// `bootstrap/cache/config.php` exists — Laravel is not reading `.env`.
     pub config_cached: bool,
     /// Compose service names containing a dot (`laravel.test`) — the shape
@@ -222,6 +254,14 @@ pub struct ProjectFacts {
     /// `config-hash` label vs current `config --hash`). A restart will NOT
     /// pick the changes up; only a recreate does.
     pub drifted_services: Vec<String>,
+    /// Running services whose containers are attached to no docker network
+    /// and publish none of the host ports the model says they should — the
+    /// wreckage of a start whose port/network setup failed halfway (say, a
+    /// bind lost a race) followed by a plain `docker start`. The container
+    /// reports "running" while nothing can reach it, and — unlike drift —
+    /// its config-hash still matches, so `up -d` is a no-op: only a
+    /// force-recreate reattaches it.
+    pub detached_services: Vec<String>,
     /// Vite's `public/hot` marker, when present: the dev-server URL it pins
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
@@ -365,6 +405,41 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             description: "Writes free port numbers to the `.env` keys that publish the \
                           contested ports (`APP_PORT`, `VITE_PORT`, `FORWARD_*_PORT`), through \
                           the transactional writer. The compose file is untouched."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_RECREATE_SERVICE => Some(RepairSpec {
+            id: REPAIR_RECREATE_SERVICE,
+            title: match arg {
+                Some(services) => format!("Recreate {services} from the current configuration"),
+                None => "Recreate the unreachable containers".into(),
+            },
+            risk: RiskTier::Caution,
+            description: "Runs compose `up -d --force-recreate --no-deps` on exactly the \
+                          named services — the one thing that replaces a running container \
+                          whose config-hash still matches. Named volumes and their data are \
+                          untouched."
+                .into(),
+            arg: arg.map(String::from),
+        }),
+        REPAIR_FIX_APP_URL => Some(RepairSpec {
+            id: REPAIR_FIX_APP_URL,
+            title: "Point APP_URL at the app's real port".into(),
+            risk: RiskTier::Safe,
+            description: "Rewrites the port pinned in `APP_URL` to the current `APP_PORT`, \
+                          through the transactional env writer — nothing else about the URL \
+                          changes."
+                .into(),
+            arg: None,
+        }),
+        REPAIR_ARTISAN_MIGRATE => Some(RepairSpec {
+            id: REPAIR_ARTISAN_MIGRATE,
+            title: "Run the database migrations".into(),
+            risk: RiskTier::Caution,
+            description: "Runs `php artisan migrate --force` inside the running app service \
+                          — the project's own migrations, applied to the database `.env` \
+                          names. Creates and alters tables; nothing is dropped or rolled \
+                          back."
                 .into(),
             arg: None,
         }),
@@ -519,6 +594,18 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             }
             .into(),
             arg: arg.map(str::to_string),
+        }),
+        REPAIR_INSTALL_CERTUTIL => Some(RepairSpec {
+            id: REPAIR_INSTALL_CERTUTIL,
+            title: "Install certutil and finish browser trust".into(),
+            risk: RiskTier::HighRisk,
+            description: "Installs the NSS tools package (libnss3-tools / nss-tools) with \
+                          your distribution's package manager via pkexec, then adds the \
+                          local HTTPS certificate authority to ~/.pki/nssdb so \
+                          Chromium-family browsers trust it — the half the system trust \
+                          store cannot reach."
+                .into(),
+            arg: None,
         }),
         REPAIR_TRUST_PROXY_CA => Some(RepairSpec {
             id: REPAIR_TRUST_PROXY_CA,

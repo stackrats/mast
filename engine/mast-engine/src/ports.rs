@@ -9,7 +9,7 @@
 //! means a backup and the external-edit guard come for free.
 
 use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
 use mast_contract::{ContainerState, ErrorInfo, ProjectId};
 use mast_laravel::{is_host_port_key, next_free_port};
@@ -92,21 +92,54 @@ pub(crate) fn plan_remap(
 
 /// Is something listening here right now?
 ///
-/// Both the wildcard and the loopback address are tried: a container
-/// published as `127.0.0.1:8080:80` binds only the latter, and on BSD-derived
-/// stacks (macOS) a wildcard bind can succeed alongside it.
+/// Both the wildcard and the loopback address are tried, in both address
+/// families: a container published as `127.0.0.1:8080:80` binds only the v4
+/// loopback, a Node dev server may sit on `[::1]` alone — invisible to any
+/// v4 probe, yet docker's own `[::]` publish bind still collides with it —
+/// and on BSD-derived stacks (macOS) a wildcard bind can succeed alongside a
+/// specific one.
 pub(crate) fn port_is_bound(port: u16) -> bool {
-    for addr in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST] {
+    let addrs: [IpAddr; 4] = [
+        Ipv4Addr::UNSPECIFIED.into(),
+        Ipv4Addr::LOCALHOST.into(),
+        Ipv6Addr::UNSPECIFIED.into(),
+        Ipv6Addr::LOCALHOST.into(),
+    ];
+    for addr in addrs {
         match TcpListener::bind(SocketAddr::from((addr, port))) {
             Ok(listener) => drop(listener),
-            // Anything else (a permission error on a privileged port, say)
-            // is not evidence of a conflict, and guessing would move a port
-            // that was fine.
+            // Anything else (a permission error on a privileged port, or a
+            // host with no IPv6 at all) is not evidence of a conflict, and
+            // guessing would move a port that was fine.
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return true,
             Err(_) => {}
         }
     }
     false
+}
+
+/// Apply the planned moves to a parsed `.env`, dragging along an `APP_URL`
+/// that explicitly pins the old `APP_PORT` — [`mast_laravel::app_url`] gives
+/// such a pin the last word, so leaving it behind would keep the Browser
+/// button on a port nothing serves. Returns a note when the URL moved too,
+/// for the caller to report next to the port moves.
+pub(crate) fn apply_remaps(
+    file: &mut mast_laravel::EnvFile,
+    remaps: &[PortRemap],
+) -> Result<Option<String>, mast_laravel::EnvError> {
+    for remap in remaps {
+        file.set(&remap.key, &remap.to.to_string())?;
+    }
+    if let Some(remap) = remaps.iter().find(|r| r.key == "APP_PORT")
+        && let Some(url) = file.get("APP_URL").map(|e| e.value.clone())
+        && let Some(rewritten) = mast_laravel::rewrite_explicit_port(&url, remap.from, remap.to)
+    {
+        file.set("APP_URL", &rewritten)?;
+        return Ok(Some(format!(
+            "APP_URL pinned the old port — updated it to {rewritten}"
+        )));
+    }
+    Ok(None)
 }
 
 /// Ports a project's own containers are holding: only states that keep the
@@ -174,13 +207,12 @@ impl crate::Engine {
         let facts = self.remap_facts(project)?;
         let path = self.project_path(project)?.join(".env");
         tokio::task::spawn_blocking(move || {
-            let (remaps, notes) = plan_remap(&facts, mode, port_is_bound);
+            let (remaps, mut notes) = plan_remap(&facts, mode, port_is_bound);
             let before = std::fs::read_to_string(&path).unwrap_or_default();
             let mut file = mast_laravel::EnvFile::parse(&before);
-            for remap in &remaps {
-                file.set(&remap.key, &remap.to.to_string())
-                    .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
-            }
+            let url_note = apply_remaps(&mut file, &remaps)
+                .map_err(|e| ErrorInfo::InvalidInput { message: e.to_string() })?;
+            notes.extend(url_note);
             Ok((remaps, notes, before, file.to_string()))
         })
         .await
@@ -203,17 +235,19 @@ impl crate::Engine {
         let backups = self.inner.deps.store.backups_dir();
 
         let (remaps, notes) = tokio::task::spawn_blocking(move || {
-            let (remaps, notes) = plan_remap(&facts, mode, port_is_bound);
+            let (remaps, mut notes) = plan_remap(&facts, mode, port_is_bound);
             if remaps.is_empty() {
                 return Ok((remaps, notes));
             }
+            let mut url_note = None;
             mast_laravel::edit_env_file(&path, Some(&backups), |f| {
-                for remap in &remaps {
-                    f.set(&remap.key, &remap.to.to_string())?;
-                }
+                url_note = apply_remaps(f, &remaps)?;
                 Ok(())
             })
-            .map(|_| (remaps, notes))
+            .map(|_| {
+                notes.extend(url_note);
+                (remaps, notes)
+            })
         })
         .await
         .map_err(crate::internal_err)?
@@ -343,8 +377,38 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_app_port_drags_a_pinned_app_url_with_it() {
+        let remaps = vec![PortRemap { key: "APP_PORT".into(), from: 8000, to: 8082 }];
+        let mut file =
+            mast_laravel::EnvFile::parse("APP_URL=http://localhost:8000\nAPP_PORT=8000\n");
+        let note = apply_remaps(&mut file, &remaps).unwrap();
+        assert!(note.is_some());
+        assert_eq!(file.get("APP_PORT").unwrap().value, "8082");
+        assert_eq!(file.get("APP_URL").unwrap().value, "http://localhost:8082");
+
+        // A URL pinning some other port was chosen by hand — left alone.
+        let mut file =
+            mast_laravel::EnvFile::parse("APP_URL=http://localhost:3000\nAPP_PORT=8000\n");
+        assert!(apply_remaps(&mut file, &remaps).unwrap().is_none());
+        assert_eq!(file.get("APP_URL").unwrap().value, "http://localhost:3000");
+    }
+
+    #[test]
     fn binding_detects_a_real_listener() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_is_bound(port));
+        drop(listener);
+        assert!(!port_is_bound(port));
+    }
+
+    #[test]
+    fn binding_detects_a_listener_on_the_ipv6_loopback_alone() {
+        // A vite/node dev server bound only to [::1] — invisible to a v4
+        // probe, but docker's wildcard publish still collides with it.
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            return; // no IPv6 on this host — nothing to prove
+        };
         let port = listener.local_addr().unwrap().port();
         assert!(port_is_bound(port));
         drop(listener);

@@ -19,5 +19,5 @@ pub use app_key::generate_app_key;
 pub use env::{EnvEntry, EnvError, EnvFile, EnvItem, Quoting};
 pub use env_write::{EnvWriteError, edit_env_file};
 pub use ports::{is_host_port_key, next_free_port};
-pub use url::app_url;
+pub use url::{app_url, explicit_port, rewrite_explicit_port};
 pub use validate::{Finding, Severity, is_secret_key, validate};

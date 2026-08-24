@@ -15,6 +15,7 @@ import type {
   DiagnosticFinding,
   DiagnosticReport,
   DiagnosticsHistory,
+  ProjectSummary,
   RepairPlan,
 } from "../bindings";
 import { runActionCollecting } from "../lib/operations";
@@ -25,6 +26,9 @@ import Checkbox from "./ui/Checkbox.vue";
 import Modal from "./ui/Modal.vue";
 
 const open = defineModel<boolean>("open", { default: false });
+// When set, the run is scoped to this project: only its findings, no
+// probes into the neighbours, and no history (history tracks full passes).
+const { scope = null } = defineProps<{ scope?: ProjectSummary | null }>();
 const store = useEngineStore();
 
 const report = ref<DiagnosticReport | null>(null);
@@ -45,8 +49,8 @@ const applyError = ref<string | null>(null);
 async function refresh() {
   running.value = true;
   try {
-    report.value = await runDiagnostics();
-    history.value = await diagnosticsHistory();
+    report.value = await runDiagnostics(scope?.id ?? null);
+    history.value = scope ? null : await diagnosticsHistory();
   } catch (e) {
     store.error = e instanceof Error ? e.message : String(e);
   } finally {
@@ -138,7 +142,7 @@ const riskLabel: Record<string, string> = {
 </script>
 
 <template>
-  <Modal v-model:open="open" title="Diagnostics" wide>
+  <Modal v-model:open="open" :title="scope ? `Diagnostics — ${scope.name}` : 'Diagnostics'" wide>
     <!-- Repair preview / consent view -->
     <div v-if="activeFinding" class="space-y-3">
       <p class="text-xs font-medium text-slate-700 dark:text-slate-200">
@@ -237,7 +241,9 @@ const riskLabel: Record<string, string> = {
           <template v-if="running">running checks…</template>
           <template v-else-if="report">
             {{ report.checksRun }} checks ·
-            <span v-if="report.findings.length === 0" class="text-emerald-600">all passed</span>
+            <span v-if="report.findings.length === 0" class="text-emerald-600">
+              {{ scope ? "nothing to fix for this project" : "all passed" }}
+            </span>
             <template v-else>
               <span v-if="counts.error" class="text-red-600">{{ counts.error }} errors</span>
               <span v-if="counts.error && (counts.warning || counts.info)"> · </span>
