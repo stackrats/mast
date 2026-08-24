@@ -54,10 +54,12 @@ fn light_taskbar() -> bool {
         .unwrap_or(false)
 }
 
-/// The icon the tray should show right now: the dark variant on a light
-/// Windows taskbar, the bundled light mark everywhere else. macOS never gets
-/// here for theming — its icon is a template (see [`setup_tray`]) and the
-/// menu bar recolors it natively. Linux panels are almost universally dark.
+/// The icon the tray should show right now: the bare mark, dark on a light
+/// Windows taskbar, light everywhere else — NOT the bundled app icon, which
+/// is the mark on a tile (taskbar/Start identity) and would read as a blob
+/// at tray size. macOS never gets here for theming — its icon is a template
+/// (see [`setup_tray`]) and the menu bar recolors it natively. Linux panels
+/// are almost universally dark.
 fn tray_icon(app: &AppHandle) -> tauri::image::Image<'static> {
     #[cfg(windows)]
     if light_taskbar()
@@ -66,8 +68,17 @@ fn tray_icon(app: &AppHandle) -> tauri::image::Image<'static> {
     {
         return icon;
     }
-    let bundled = app.default_window_icon().expect("bundled icon");
-    tauri::image::Image::new_owned(bundled.rgba().to_vec(), bundled.width(), bundled.height())
+    match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-light-32x32.png")) {
+        Ok(icon) => icon,
+        Err(_) => {
+            let bundled = app.default_window_icon().expect("bundled icon");
+            tauri::image::Image::new_owned(
+                bundled.rgba().to_vec(),
+                bundled.width(),
+                bundled.height(),
+            )
+        }
+    }
 }
 
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
