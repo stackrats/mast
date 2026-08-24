@@ -332,6 +332,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             .get("APP_SERVICE")
             .cloned()
             .unwrap_or_else(|| "laravel.test".to_string()),
+        app_reachability: None, // filled by the gather probe
         vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
             .ok()
             .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
@@ -773,6 +774,71 @@ impl Engine {
                 {
                     xdebug.extension_loaded = Some(modules.iter().any(|m| m == "xdebug"));
                 }
+            }
+            // Reachability doctor: a "Running" badge can hide a dead app
+            // server (the ready probe falls back to a grace timeout). Probe
+            // the app's published port from the host; when it refuses, probe
+            // again from INSIDE the app container to split "not serving"
+            // from "published port not reaching the host".
+            for (facts, _) in &mut inspected {
+                if !facts.running || !facts.sail_flavored {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                let host_port = facts
+                    .host_ports
+                    .iter()
+                    .find(|(label, _)| label == "APP_PORT")
+                    .or_else(|| {
+                        facts.host_ports.iter().find(|(label, _)| *label == facts.app_service)
+                    })
+                    .map(|(_, port)| *port);
+                let Some(host_port) = host_port else { continue };
+                let connect = |addr: &'static str| async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tokio::net::TcpStream::connect((addr, host_port)),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                };
+                // Both families: docker can publish v6-only (the remap
+                // blind-spot lesson).
+                let host_ok = connect("127.0.0.1").await || connect("::1").await;
+                let inner_ok = if host_ok {
+                    None
+                } else {
+                    // Sail's container-side app port is 80; `-f` makes curl
+                    // fail on HTTP >= 400, and exit 22 still means something
+                    // IS serving — reachability is what's on trial here.
+                    let tail: Vec<String> =
+                        ["curl", "-sf", "-o", "/dev/null", "--max-time", "3", "http://localhost:80/"]
+                            .map(String::from)
+                            .to_vec();
+                    let argv = crate::project_ops::compose_exec_argv(
+                        invocation,
+                        &facts.app_service,
+                        &tail,
+                    );
+                    match run_command(
+                        &argv,
+                        Some(&invocation.project_dir),
+                        &[],
+                        PROBE_TIMEOUT,
+                        PROBE_CAP,
+                    )
+                    .await
+                    {
+                        Ok(out) if out.success() || out.status == 22 => Some(true),
+                        // 127: no curl in the image — unknowable, not "down".
+                        Ok(out) if out.status == 127 => None,
+                        Ok(_) => Some(false),
+                        Err(_) => None,
+                    }
+                };
+                facts.app_reachability =
+                    Some(mast_diagnostics::AppReachability { host_port, host_ok, inner_ok });
             }
             // Volume-vs-image version scan — deliberately including stopped
             // projects: the point is warning before the crash-loop.
