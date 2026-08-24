@@ -415,7 +415,66 @@ fn specta_builder() -> tauri_specta::Builder {
         .events(tauri_specta::collect_events![PatchStreamItem])
 }
 
+/// A Finder/Dock/Spotlight launch inherits launchd's bare
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, not the login shell's `PATH` — so the
+/// docker CLI (`/usr/local/bin`), Homebrew tools and editor shims are all
+/// invisible to a packaged Mast even though every terminal sees them. Ask the
+/// user's login shell what `PATH` it would give a terminal and adopt it,
+/// before the engine snapshots the environment. Marker-delimited so profile
+/// banners can't corrupt the value; abandoned after 3s so a hung profile
+/// can't stall launch (the well-known-location fallbacks in mast-docker and
+/// integrations still apply).
+#[cfg(target_os = "macos")]
+fn adopt_login_shell_path() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    const MARK: &str = "__MAST_PATH__";
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    // `-l -c`: login (profile-reading) but non-interactive, so no rc-file
+    // prompts, and one printf instead of a shell session.
+    let Ok(mut child) = Command::new(&shell)
+        .args(["-l", "-c", "printf '%s' \"__MAST_PATH__${PATH}__MAST_PATH__\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(mut stdout) = child.stdout.take() else { return };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(out) => {
+            let _ = child.wait();
+            out
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+    let Some(start) = out.find(MARK) else { return };
+    let rest = &out[start + MARK.len()..];
+    let Some(end) = rest.rfind(MARK) else { return };
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        return;
+    }
+    // SAFETY: runs at the top of `run()`, before the tauri builder, the async
+    // runtime and the engine exist — no other thread reads the environment.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    adopt_login_shell_path();
     let builder = specta_builder();
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())

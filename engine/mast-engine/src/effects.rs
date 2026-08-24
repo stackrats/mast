@@ -11,7 +11,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use mast_contract::{DiscoveredProject, DockerStatus, PatchEvent, ServiceState};
 use mast_docker::{
-    BollardAdapter, ContainerObservation, DockerError, RuntimeAdapter, resolve_endpoint,
+    BollardAdapter, CommandError, ContainerObservation, DockerError, RuntimeAdapter,
+    resolve_endpoint,
 };
 use tokio::sync::mpsc;
 
@@ -75,11 +76,27 @@ async fn docker_loop(engine: Engine) {
             }
             Err(e) => {
                 *engine.inner.adapter.lock().unwrap() = None;
-                engine.update_docker_status_unavailable(&e.to_string());
+                engine.update_docker_status_unavailable(&connect_error_text(&e));
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(15));
+    }
+}
+
+/// A missing docker CLI is the first thing a newcomer hits, and the raw spawn
+/// error ("program not found") reads like a crash. Name the actual repair —
+/// the retry loop re-probes the well-known install locations, so installing
+/// is genuinely all it takes.
+fn connect_error_text(e: &DockerError) -> String {
+    match e {
+        DockerError::Command(CommandError::Spawn { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "docker CLI not found — install Docker Desktop (or Docker Engine) and start it"
+                .to_string()
+        }
+        _ => e.to_string(),
     }
 }
 
@@ -742,7 +759,7 @@ fn build_services(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_host_ports, parse_git_status};
+    use super::{CommandError, DockerError, connect_error_text, merge_host_ports, parse_git_status};
 
     fn model(services: &[(&str, &[u16])]) -> mast_compose::ResolvedModel {
         mast_compose::ResolvedModel {
@@ -820,5 +837,17 @@ mod tests {
             (Some("detached".into()), Some(false))
         );
         assert_eq!(parse_git_status(""), (None, Some(false)));
+    }
+
+    #[test]
+    fn missing_docker_cli_gets_repair_instructions() {
+        let spawn_failed = DockerError::Command(CommandError::Spawn {
+            argv0: "docker".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        assert!(connect_error_text(&spawn_failed).contains("install Docker Desktop"));
+        // Every other failure keeps its own words.
+        let api = DockerError::Api("boom".into());
+        assert_eq!(connect_error_text(&api), api.to_string());
     }
 }
