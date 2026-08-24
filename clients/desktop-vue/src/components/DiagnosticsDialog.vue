@@ -74,6 +74,24 @@ const counts = computed(() => {
   };
 });
 
+// Fixes the engine matched to this project's last FAILED operation. Every
+// repair lives here — the card shows only a hint icon on Diagnose — so the
+// failure's fix and the proactive findings read as one list.
+const opFixes = computed<DiagnosticFinding[]>(() => {
+  if (!scope) return [];
+  const op = store.operations[scope.id];
+  if (!op || op.terminal !== "failed") return [];
+  return op.fixes.map((f) => ({
+    check: "operation-failure",
+    severity: "error" as const,
+    title: f.repair.title,
+    detail: `matched to the failure of: ${op.label}`,
+    project: f.project,
+    projectName: scope.name,
+    repair: f.repair,
+  }));
+});
+
 async function openRepair(finding: DiagnosticFinding) {
   if (!finding.repair) return;
   activeFinding.value = finding;
@@ -122,6 +140,18 @@ async function apply() {
       },
       (line) => applyLines.value.push(line),
     );
+    // A fix that came from the failed operation clears that operation once
+    // applied — same behavior the old inline Fix button had.
+    if (scope) {
+      const op = store.operations[scope.id];
+      if (
+        op?.fixes.some(
+          (f) => f.repair.id === finding.repair?.id && f.repair.arg === finding.repair?.arg,
+        )
+      ) {
+        store.dismissOperation(scope.id);
+      }
+    }
     closeRepair();
     await refresh();
   } catch (e) {
@@ -261,11 +291,49 @@ const riskLabel: Record<string, string> = {
       </div>
 
       <p
-        v-if="report && report.findings.length === 0 && !running"
+        v-if="report && report.findings.length === 0 && opFixes.length === 0 && !running"
         class="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 p-2.5 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300"
       >
         <Check class="h-4 w-4" /> Everything looks healthy.
       </p>
+
+      <!-- Fixes matched to the last failed operation lead the list: they are
+           why the Diagnose button was hinting. -->
+      <template v-if="opFixes.length">
+        <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
+          From the last failed operation
+        </p>
+        <ul class="space-y-1.5">
+          <li
+            v-for="(finding, i) in opFixes"
+            :key="`op-${i}`"
+            class="rounded-md border border-amber-200 p-2.5 dark:border-amber-900"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <p
+                  class="flex items-start gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-200"
+                >
+                  <TriangleAlert class="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+                  {{ finding.title }}
+                </p>
+                <p class="mt-1 ml-5 text-xs text-slate-500 dark:text-slate-400">
+                  {{ finding.detail }}
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                class="shrink-0"
+                :disabled="store.readOnly"
+                @click="openRepair(finding)"
+              >
+                <Wrench class="h-3.5 w-3.5" /> Repair
+              </Button>
+            </div>
+          </li>
+        </ul>
+      </template>
 
       <ul v-if="report" class="space-y-1.5">
         <li
