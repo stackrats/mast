@@ -92,12 +92,13 @@ pub fn lifecycle_argv(
 
 /// The sail wrapper exports `WWWUSER=${WWWUSER:-$UID}` / `WWWGROUP` before
 /// invoking compose (ADR-0001 finding 8), so a Sail-flavored file driven
-/// through bare `docker compose` — the vendorless-clone path — interpolates
-/// them to empty strings and builds a container owned by the wrong user
-/// (finding 9). Mirror the wrapper: real environment and `.env` win, the
-/// uid/gid default only fills the gap.
+/// through bare `docker compose` — the vendorless-clone path, and EVERY sail
+/// project on Windows — interpolates them to empty strings and builds a
+/// container owned by the wrong user (finding 9). Mirror the wrapper: real
+/// environment and `.env` win, the uid/gid default only fills the gap
+/// (0/0 on Windows, where unix ownership is not a host concern and the
+/// bootstrap flow pins the same values into `.env`).
 pub(crate) fn parity_env(invocation: &ComposeInvocation) -> Vec<(String, String)> {
-    #[cfg(unix)]
     if matches!(invocation.runner, Runner::DockerCompose) {
         let dotenv = mast_compose::parse_env_file(&invocation.project_dir.join(".env"));
         let (uid, gid) = crate::diagnostics::uid_gid();
@@ -109,7 +110,6 @@ pub(crate) fn parity_env(invocation: &ComposeInvocation) -> Vec<(String, String)
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
     }
-    let _ = invocation;
     Vec::new()
 }
 
@@ -138,6 +138,20 @@ pub trait LifecycleRunner: Send + Sync {
     ) -> Result<CommandOutcome, String> {
         let _ = (verb, container_id, lines, cancel);
         Err("container-direct verbs are not supported by this runner".into())
+    }
+
+    /// Remove one container outright (`docker rm -f`) — the disposal path for
+    /// orphans. Compose's own `--remove-orphans` stumbles over a leftover in
+    /// a half-torn state ("is not connected to the network …"); removal by id
+    /// has no such bookkeeping to trip on. Defaulted like [`Self::run_container`].
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        lines: mpsc::Sender<OutputLine>,
+        cancel: CancellationToken,
+    ) -> Result<CommandOutcome, String> {
+        let _ = (container_id, lines, cancel);
+        Err("container removal is not supported by this runner".into())
     }
 }
 
@@ -186,6 +200,26 @@ impl LifecycleRunner for RealLifecycleRunner {
             }
         };
         let argv: Vec<String> = ["docker", cmd, container_id].map(String::from).to_vec();
+        run_streaming(
+            &argv,
+            None,
+            &[],
+            lines,
+            cancel,
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(8),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        lines: mpsc::Sender<OutputLine>,
+        cancel: CancellationToken,
+    ) -> Result<CommandOutcome, String> {
+        let argv: Vec<String> = ["docker", "rm", "-f", container_id].map(String::from).to_vec();
         run_streaming(
             &argv,
             None,

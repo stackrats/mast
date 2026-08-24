@@ -607,7 +607,7 @@ impl Engine {
         project: &ProjectId,
         name: &str,
     ) -> Result<(), ErrorInfo> {
-        let (path, redactor, command, cwd) = {
+        let (path, redactor, command, cwd, invocation) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -624,6 +624,7 @@ impl Engine {
                 entry.redactor.clone(),
                 cmd.command.clone(),
                 cmd.cwd.clone(),
+                entry.invocation.clone(),
             )
         };
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
@@ -667,8 +668,28 @@ impl Engine {
                         .into(),
                 });
             }
-            argv[0] = script.to_string_lossy().into_owned();
+            #[cfg(unix)]
+            {
+                argv[0] = script.to_string_lossy().into_owned();
+            }
+            // Windows cannot execute the bash wrapper (CreateProcess error
+            // 193) — map the command onto what the wrapper would have run:
+            // compose verbs pass through the resolved invocation, everything
+            // else execs in the app service (sail's own dispatch for
+            // artisan/php/composer/npm).
+            #[cfg(not(unix))]
+            {
+                let invocation = invocation.ok_or_else(|| ErrorInfo::InvalidInput {
+                    message: "project not resolved yet".into(),
+                })?;
+                argv = sail_fallback_argv(&invocation, &app_service_of(&path), &argv[1..])
+                    .ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "sail needs a subcommand".into(),
+                    })?;
+            }
         }
+        #[cfg(unix)]
+        let _ = invocation;
         self.emit_op(
             handle,
             op,
@@ -692,7 +713,7 @@ impl Engine {
         verb: LifecycleVerb,
         service: Option<String>,
     ) -> Result<OperationId, ErrorInfo> {
-        let (invocation, redactor, project_name, orphan_container, orphan_running) = {
+        let (invocation, redactor, project_name, orphan_container, orphan_running, orphan_remove) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -740,12 +761,27 @@ impl Engine {
                 } else {
                     Vec::new()
                 };
+            // A whole-project rebuild reaps every observed leftover itself,
+            // before compose runs — any state, not just running.
+            let orphan_remove: Vec<(String, String)> =
+                if service.is_none() && verb == LifecycleVerb::Rebuild {
+                    entry
+                        .summary
+                        .services
+                        .iter()
+                        .filter(|s| s.orphaned)
+                        .filter_map(|s| s.container_id.clone().map(|id| (s.name.clone(), id)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             (
                 invocation,
                 entry.redactor.clone(),
                 entry.summary.name.clone(),
                 orphan_container,
                 orphan_running,
+                orphan_remove,
             )
         };
         if orphan_container.is_some() && verb == LifecycleVerb::Rebuild {
@@ -875,6 +911,30 @@ impl Engine {
                             )
                             .await;
                     }
+                    // Rebuild reaps observed leftovers itself before compose
+                    // runs. `--remove-orphans` stays as the backstop for
+                    // leftovers Mast never saw, but it stumbles over a
+                    // half-torn one ("is not connected to the network"),
+                    // while removal by id has no bookkeeping to trip on. A
+                    // failed removal is only logged — compose gets its
+                    // chance at it next.
+                    for (name, container_id) in &orphan_remove {
+                        let _ = line_tx
+                            .send(mast_docker::OutputLine {
+                                line: format!("removing {name} (no longer in the compose file)"),
+                                stderr: false,
+                            })
+                            .await;
+                        if let Ok(CommandOutcome::Cancelled) = engine
+                            .inner
+                            .deps
+                            .runner
+                            .remove_container(container_id, line_tx.clone(), handle.cancel.clone())
+                            .await
+                        {
+                            return Ok(CommandOutcome::Cancelled);
+                        }
+                    }
                     let mut outcome = engine
                         .inner
                         .deps
@@ -956,6 +1016,115 @@ impl Engine {
             engine.inner.busy_projects.lock().unwrap().remove(&project.0);
             engine.emit_op(&handle, id, kind);
             // Whatever happened, inspection is truth: reconcile settles state.
+            engine.hint();
+        });
+        Ok(id)
+    }
+
+    /// Remove one orphaned service's leftover container — `docker rm -f` by
+    /// observed id, with the same op plumbing (busy lock, journal, capture,
+    /// streamed output) as a lifecycle verb. Refuses non-orphans: a declared
+    /// service's container belongs to compose.
+    pub(crate) fn dispatch_remove_orphan(
+        &self,
+        project: ProjectId,
+        service: String,
+    ) -> Result<OperationId, ErrorInfo> {
+        let (container_id, redactor, project_name) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            let state = entry
+                .summary
+                .services
+                .iter()
+                .find(|s| s.name == service)
+                .ok_or(ErrorInfo::NotFound { what: format!("service {service}") })?;
+            if !state.orphaned {
+                return Err(ErrorInfo::InvalidInput {
+                    message: format!(
+                        "{service} is declared by the compose file — remove it there \
+                         (or via the catalog), not by deleting its container"
+                    ),
+                });
+            }
+            let container_id = state.container_id.clone().ok_or(ErrorInfo::NotFound {
+                what: format!("a container for {service}"),
+            })?;
+            (container_id, entry.redactor.clone(), entry.summary.name.clone())
+        };
+        {
+            let mut busy = self.inner.busy_projects.lock().unwrap();
+            if !busy.insert(project.0.clone()) {
+                return Err(ErrorInfo::Conflict {
+                    message: format!("an operation is already running on {}", project.0),
+                });
+            }
+        }
+        let (id, handle) = self.new_operation();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _ = engine.inner.deps.store.journal_push(mast_project::OperationJournalEntry {
+                operation: id.0,
+                project_id: project.0.clone(),
+                verb: format!("remove {service}"),
+                started_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            });
+            engine.emit_op(&handle, id, OperationEventKind::Started);
+            // Removal takes the retained log with it — capture first.
+            let reason = CaptureReason::Teardown { verb: "remove".to_string() };
+            if let Some(request) = engine.capture_request(&project, &service, reason) {
+                engine.run_capture(request).await;
+            }
+            let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
+            let forwarder = {
+                let engine = engine.clone();
+                let handle = handle.clone();
+                let redactor = redactor.clone();
+                tokio::spawn(async move {
+                    while let Some(line) = line_rx.recv().await {
+                        engine.emit_op(
+                            &handle,
+                            id,
+                            OperationEventKind::Output {
+                                line: redactor.redact(&line.line),
+                                stderr: line.stderr,
+                            },
+                        );
+                    }
+                })
+            };
+            let result = crate::history::with_context(
+                crate::history::CommandContext {
+                    label: format!("Remove {project_name} ({service})"),
+                    project: Some(project.clone()),
+                    operation: Some(id),
+                },
+                engine.inner.deps.runner.remove_container(
+                    &container_id,
+                    line_tx.clone(),
+                    handle.cancel.clone(),
+                ),
+            )
+            .await;
+            drop(line_tx);
+            let _ = forwarder.await;
+            let kind = match result {
+                Ok(CommandOutcome::Exited(0)) => OperationEventKind::Completed,
+                Ok(CommandOutcome::Exited(code)) => OperationEventKind::Failed {
+                    error: format!("remove exited with status {code}"),
+                },
+                Ok(CommandOutcome::Cancelled) => OperationEventKind::Cancelled,
+                Err(e) => OperationEventKind::Failed { error: redactor.redact(&e) },
+            };
+            let _ = engine.inner.deps.store.journal_remove(id.0);
+            engine.inner.busy_projects.lock().unwrap().remove(&project.0);
+            engine.emit_op(&handle, id, kind);
             engine.hint();
         });
         Ok(id)
@@ -1129,6 +1298,44 @@ pub(crate) fn app_service_of(dir: &Path) -> String {
         .unwrap_or_else(|| "laravel.test".to_string())
 }
 
+/// What `sail <tail…>` means when the wrapper itself cannot run (Windows,
+/// where CreateProcess refuses bash scripts): compose verbs pass straight
+/// through the resolved invocation — the wrapper's own passthrough — and
+/// everything else execs in the app service, with sail's artisan sugar
+/// (`artisan`/`art`/`tinker`/`test` become `php artisan …`). `None` when
+/// there is no subcommand to map.
+#[cfg(any(not(unix), test))]
+fn sail_fallback_argv(
+    invocation: &ComposeInvocation,
+    app_service: &str,
+    tail: &[String],
+) -> Option<Vec<String>> {
+    const COMPOSE_VERBS: [&str; 12] = [
+        "up", "down", "stop", "restart", "ps", "build", "pull", "push", "logs", "config", "exec",
+        "run",
+    ];
+    let first = tail.first()?;
+    if COMPOSE_VERBS.contains(&first.as_str()) {
+        let refs: Vec<&str> = tail.iter().map(String::as_str).collect();
+        let (argv, _env) = crate::db_repair::scoped_compose_argv(invocation, &refs);
+        return Some(argv);
+    }
+    let exec_tail: Vec<String> = match first.as_str() {
+        "artisan" | "art" => ["php", "artisan"]
+            .into_iter()
+            .map(String::from)
+            .chain(tail[1..].iter().cloned())
+            .collect(),
+        "tinker" | "test" => ["php", "artisan"]
+            .into_iter()
+            .map(String::from)
+            .chain(tail.iter().cloned())
+            .collect(),
+        _ => tail.to_vec(),
+    };
+    Some(compose_exec_argv(invocation, app_service, &exec_tail))
+}
+
 /// `docker compose <files/profiles> exec -T <service> <tail…>` — the exact
 /// resolved invocation, non-interactive.
 pub(crate) fn compose_exec_argv(
@@ -1175,5 +1382,32 @@ mod tests {
         assert!(argv.contains(&"--profile".to_string()));
         let exec_at = argv.iter().position(|a| a == "exec").unwrap();
         assert_eq!(&argv[exec_at..], ["exec", "-T", "app", "php", "artisan"]);
+    }
+
+    /// The Windows stand-in for the sail wrapper: compose verbs pass
+    /// through, artisan sugar becomes `php artisan`, everything else execs
+    /// in the app service.
+    #[test]
+    fn sail_fallback_maps_the_wrapper_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let inv =
+            mast_compose::resolve_invocation(tmp.path(), &std::collections::HashMap::new())
+                .unwrap();
+        let strings = |words: &[&str]| words.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let argv = sail_fallback_argv(&inv, "app", &strings(&["up", "-d"])).unwrap();
+        assert_eq!(&argv[argv.len() - 2..], ["up", "-d"]);
+        assert_eq!(argv[..2], ["docker", "compose"]);
+
+        let argv = sail_fallback_argv(&inv, "app", &strings(&["artisan", "migrate"])).unwrap();
+        let exec_at = argv.iter().position(|a| a == "exec").unwrap();
+        assert_eq!(&argv[exec_at..], ["exec", "-T", "app", "php", "artisan", "migrate"]);
+
+        let argv = sail_fallback_argv(&inv, "app", &strings(&["npm", "run", "dev"])).unwrap();
+        let exec_at = argv.iter().position(|a| a == "exec").unwrap();
+        assert_eq!(&argv[exec_at..], ["exec", "-T", "app", "npm", "run", "dev"]);
+
+        assert!(sail_fallback_argv(&inv, "app", &[]).is_none());
     }
 }
