@@ -263,6 +263,11 @@ pub struct ProjectFacts {
     /// its config-hash still matches, so `up -d` is a no-op: only a
     /// force-recreate reattaches it.
     pub detached_services: Vec<String>,
+    /// Layered reachability of the app's own HTTP endpoint, probed for a
+    /// RUNNING sail-flavored project that publishes an app port. A "Running"
+    /// badge can hide a dead app server — the ready probe falls back to a
+    /// grace timeout — and this is the check that refuses to look away.
+    pub app_reachability: Option<AppReachability>,
     /// Vite's `public/hot` marker, when present: the dev-server URL it pins
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
@@ -320,6 +325,18 @@ pub struct XdebugFacts {
 pub struct ViteHotFacts {
     pub url: String,
     pub dev_server_listening: Option<bool>,
+}
+
+/// `host_ok`: a TCP connect to `localhost:<host_port>` from the host.
+/// `inner_ok`: an HTTP probe from INSIDE the app container — taken only when
+/// the host side refused, to split "the app is not serving at all" from "the
+/// app serves but the published port does not reach the host". `None` means
+/// the inner probe could not run (no curl in the image, exec failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppReachability {
+    pub host_port: u16,
+    pub host_ok: bool,
+    pub inner_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

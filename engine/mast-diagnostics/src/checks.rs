@@ -1240,6 +1240,74 @@ impl Check for StaleAppUrl {
     }
 }
 
+/// Status says Running, the browser says refused: the ready probe's grace
+/// fallback can mark a project Running while nothing answers on its app
+/// port. The layered probe (host connect, then in-container HTTP) splits
+/// the two real causes — a dead app process inside a live container, and a
+/// published port that never reached the host — and both end in the same
+/// previewed recreate.
+struct AppUnreachable;
+impl Check for AppUnreachable {
+    fn id(&self) -> &'static str {
+        "app-unreachable"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.app_reachability.is_some_and(|r| !r.host_ok))
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter_map(|p| {
+                p.app_reachability.filter(|r| !r.host_ok).map(|r| (p, r))
+            })
+            .map(|(p, r)| {
+                let mut f = match r.inner_ok {
+                    Some(true) => finding(
+                        self.id(),
+                        Severity::Error,
+                        format!(
+                            "{}: the app serves inside its container, but \
+                             localhost:{} refuses",
+                            p.name, r.host_port
+                        ),
+                        "The web process answers from inside the container, so the \
+                         published port is not reaching the host — the wreckage of a \
+                         port/network setup that failed halfway. Recreating the app \
+                         service re-publishes the port."
+                            .to_string(),
+                    ),
+                    Some(false) => finding(
+                        self.id(),
+                        Severity::Error,
+                        format!("{}: nothing is serving inside the app container", p.name),
+                        "The container runs, but its web process is not listening — it \
+                         likely crashed at startup. Its last words are in the App log \
+                         and Captures; recreating the app service starts it clean."
+                            .to_string(),
+                    ),
+                    None => finding(
+                        self.id(),
+                        Severity::Warning,
+                        format!(
+                            "{}: localhost:{} refuses and the in-container probe \
+                             could not run",
+                            p.name, r.host_port
+                        ),
+                        "The app's published port answers nothing from the host, and \
+                         the inside-the-container check could not run (no curl in the \
+                         image?). Check the App log for whether the web process is up."
+                            .to_string(),
+                    ),
+                };
+                if r.inner_ok.is_some() {
+                    f.repair = repair_spec(REPAIR_RECREATE_SERVICE, Some(&p.app_service));
+                }
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// The database answers with the `.env` credentials but holds no
 /// `migrations` table — the first `artisan migrate` never ran. Laravel
 /// keeps sessions, users and cache in the database by default, so every
@@ -1763,6 +1831,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(ConfigDrift),
         Box::new(DetachedContainers),
         Box::new(StaleAppUrl),
+        Box::new(AppUnreachable),
         Box::new(DbNotMigrated),
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
@@ -1857,6 +1926,7 @@ mod tests {
             foreign_owned: None,
             drifted_services: Vec::new(),
             detached_services: Vec::new(),
+            app_reachability: None,
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
@@ -2386,6 +2456,37 @@ mod tests {
         let repair = f.repair.as_ref().unwrap();
         assert_eq!(repair.id, REPAIR_FIX_APP_URL);
         assert_eq!(repair.risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn app_unreachable_splits_dead_app_from_broken_publish() {
+        // Serves inside, refused on the host → the publish is broken.
+        let mut p = sail_project("shop");
+        p.running = true;
+        p.app_reachability =
+            Some(crate::AppReachability { host_port: 8082, host_ok: false, inner_ok: Some(true) });
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "app-unreachable").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.title.contains("localhost:8082"), "{}", f.title);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_RECREATE_SERVICE);
+
+        // Dead inside the container → the app process is the story.
+        let mut p = sail_project("shop");
+        p.running = true;
+        p.app_reachability =
+            Some(crate::AppReachability { host_port: 8082, host_ok: false, inner_ok: Some(false) });
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "app-unreachable").unwrap();
+        assert!(f.title.contains("nothing is serving"), "{}", f.title);
+
+        // Reachable host side → no finding at all.
+        let mut p = sail_project("shop");
+        p.running = true;
+        p.app_reachability =
+            Some(crate::AppReachability { host_port: 8082, host_ok: true, inner_ok: None });
+        let (_, findings) = run_all(&ctx(vec![p]));
+        assert!(!findings.iter().any(|f| f.check == "app-unreachable"));
     }
 
     #[test]
