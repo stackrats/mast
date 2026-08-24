@@ -4,7 +4,7 @@
 
 use crate::{
     repair_spec, Check, DiagCtx, Finding, NssTrustGap, ProjectFacts, RepairSpec, RiskTier,
-    Severity, REPAIR_TRUST_PROXY_CA,
+    Severity, REPAIR_INSTALL_CERTUTIL, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_CHOWN_STORAGE, REPAIR_COMPOSER_INSTALL, REPAIR_CONFIG_CLEAR,
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
@@ -1706,23 +1706,24 @@ impl Check for BrowserTrust {
     }
     fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
         let Some(gap) = ctx.system.proxy_nss_gap else { return Vec::new() };
-        let detail = match gap {
-            NssTrustGap::CertutilMissing => {
+        let (detail, repair) = match gap {
+            NssTrustGap::CertutilMissing => (
                 "The system trust store accepts the local HTTPS certificate authority, \
                  but Chrome, Vivaldi, Brave and Edge read the NSS user store \
                  (~/.pki/nssdb) — and certutil, the tool that writes it, is not \
                  installed. Until it is, those browsers show \
-                 ERR_CERT_AUTHORITY_INVALID on every local https:// domain. Install \
-                 libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora), then apply this \
-                 repair."
-            }
-            NssTrustGap::CaMissing => {
+                 ERR_CERT_AUTHORITY_INVALID on every local https:// domain. The \
+                 repair installs the NSS tools package and finishes the job.",
+                REPAIR_INSTALL_CERTUTIL,
+            ),
+            NssTrustGap::CaMissing => (
                 "The system trust store accepts the local HTTPS certificate authority, \
                  but the NSS user store (~/.pki/nssdb) that Chrome, Vivaldi, Brave and \
                  Edge read does not hold it yet — they show \
                  ERR_CERT_AUTHORITY_INVALID until it does. Applying the repair adds it \
-                 (a full browser restart follows)."
-            }
+                 (a full browser restart follows).",
+                REPAIR_TRUST_PROXY_CA,
+            ),
         };
         let mut f = finding(
             self.id(),
@@ -1730,7 +1731,7 @@ impl Check for BrowserTrust {
             "Chromium-family browsers do not trust the local HTTPS authority yet",
             detail,
         );
-        f.repair = repair_spec(REPAIR_TRUST_PROXY_CA, None);
+        f.repair = repair_spec(repair, None);
         vec![f]
     }
 }
@@ -1922,10 +1923,13 @@ mod tests {
             let f = findings.iter().find(|f| f.check == "browser-trust").unwrap();
             assert_eq!(f.severity, Severity::Warning);
             assert!(f.detail.contains("ERR_CERT_AUTHORITY_INVALID"), "{}", f.detail);
-            assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_TRUST_PROXY_CA);
-            if gap == NssTrustGap::CertutilMissing {
-                assert!(f.detail.contains("libnss3-tools"), "{}", f.detail);
-            }
+            // A missing certutil offers the installer; a missing CA entry
+            // only needs the trust repair re-applied.
+            let expected = match gap {
+                NssTrustGap::CertutilMissing => REPAIR_INSTALL_CERTUTIL,
+                NssTrustGap::CaMissing => REPAIR_TRUST_PROXY_CA,
+            };
+            assert_eq!(f.repair.as_ref().unwrap().id, expected);
         }
     }
 

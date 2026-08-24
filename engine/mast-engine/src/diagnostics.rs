@@ -16,8 +16,8 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
-    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE,
-    REPAIR_TRUST_PROXY_CA,
+    REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_INSTALL_CERTUTIL, REPAIR_REASSIGN_PORTS,
+    REPAIR_RECREATE_SERVICE, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -965,6 +965,58 @@ impl Engine {
         .map_err(crate::internal_err)?
     }
 
+    /// The Chromium half of Linux trust: add the proxy CA to `~/.pki/nssdb`
+    /// via certutil. Best-effort — an unavailable certutil only means a
+    /// browser warning remains, and the outcome line says so plainly. On
+    /// macOS the keychain covers those browsers, so this does nothing.
+    async fn nss_add_proxy_ca(
+        &self,
+        handle: &std::sync::Arc<crate::OpHandle>,
+        op: OperationId,
+        crt_str: &str,
+    ) {
+        let nssdb = if cfg!(target_os = "macos") {
+            None
+        } else {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
+        };
+        let Some(nssdb) = nssdb else { return };
+        let _ = tokio::fs::create_dir_all(&nssdb).await;
+        let db = format!("sql:{}", nssdb.display());
+        let add: Vec<String> = [
+            "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
+            crate::proxy::NSS_NICKNAME, "-i", crt_str,
+        ]
+        .map(String::from)
+        .into();
+        let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+        let (line, stderr) = match nss {
+            Ok(o) if o.success() => (
+                "added to ~/.pki/nssdb — Chromium-family browsers (Chrome, Vivaldi, \
+                 Brave, Edge) trust it after a full restart"
+                    .to_string(),
+                false,
+            ),
+            Ok(o) => (
+                format!(
+                    "could not add to ~/.pki/nssdb ({}) — Chromium-family browsers \
+                     will keep warning",
+                    o.stderr.trim().lines().next().unwrap_or("certutil failed")
+                ),
+                true,
+            ),
+            Err(_) => (
+                "certutil is not installed, so the NSS store Chromium-family browsers \
+                 (Chrome, Vivaldi, Brave, Edge) read was NOT updated — they will keep \
+                 warning. The \"Install certutil\" fix installs it and finishes this \
+                 step."
+                    .to_string(),
+                true,
+            ),
+        };
+        self.emit_op(handle, op, OperationEventKind::Output { line, stderr });
+    }
+
     /// What `artisan-migrate` needs: the invocation and the app service
     /// (`APP_SERVICE`, default laravel.test) read fresh from `.env` and
     /// validated against the resolved model before it lands in an argv.
@@ -1620,8 +1672,8 @@ impl Engine {
                              writes it — is not installed, so there is nothing this \
                              fix can do yet"
                                 .into(),
-                            "install libnss3-tools (Debian/Ubuntu) or nss-tools \
-                             (Fedora), then open this fix again"
+                            "use the \"Install certutil\" fix instead — it installs \
+                             the NSS tools and finishes this step in one go"
                                 .into(),
                         ],
                         None => vec![
@@ -1663,6 +1715,44 @@ impl Engine {
                             exported.display()
                         ),
                     ]
+                };
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
+            }
+            REPAIR_INSTALL_CERTUTIL => {
+                let installed = crate::proxy::on_path("certutil");
+                let script = crate::proxy::certutil_install_script();
+                let (summary, no_op) = if installed {
+                    (
+                        vec![
+                            "certutil is already installed — apply the trust fix \
+                             instead; it adds the CA to ~/.pki/nssdb"
+                                .to_string(),
+                        ],
+                        true,
+                    )
+                } else {
+                    match &script {
+                        Some((package, script)) => (
+                            vec![
+                                format!("install the {package} package: {script}"),
+                                crate::proxy::elevation_note().into(),
+                                "then add the proxy CA to ~/.pki/nssdb (certutil, no \
+                                 further elevation) — Chromium-family browsers trust \
+                                 it after a full restart"
+                                    .into(),
+                            ],
+                            false,
+                        ),
+                        None => (
+                            vec![
+                                "no supported package manager found (apt-get, dnf, \
+                                 yum, pacman, zypper) — install the NSS tools \
+                                 (certutil) manually, then apply the trust fix"
+                                    .to_string(),
+                            ],
+                            true,
+                        ),
+                    }
                 };
                 Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
             }
@@ -2472,51 +2562,7 @@ impl Engine {
                     )
                     .await?;
                 }
-                // Chrome/Chromium on Linux read NSS, not the system store;
-                // best-effort, and its absence only means a browser warning
-                // remains. On macOS the keychain covers them already.
-                let nssdb = if cfg!(target_os = "macos") {
-                    None
-                } else {
-                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pki/nssdb"))
-                };
-                if let Some(nssdb) = nssdb {
-                    let _ = tokio::fs::create_dir_all(&nssdb).await;
-                    let db = format!("sql:{}", nssdb.display());
-                    let add: Vec<String> = [
-                        "certutil", "-d", db.as_str(), "-A", "-t", "C,,", "-n",
-                        crate::proxy::NSS_NICKNAME, "-i", crt_str.as_str(),
-                    ]
-                    .map(String::from)
-                    .into();
-                    let nss = run_command(&add, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
-                    let (line, stderr) = match nss {
-                        Ok(o) if o.success() => (
-                            "added to ~/.pki/nssdb — Chromium-family browsers (Chrome, \
-                             Vivaldi, Brave, Edge) trust it after a full restart"
-                                .to_string(),
-                            false,
-                        ),
-                        Ok(o) => (
-                            format!(
-                                "could not add to ~/.pki/nssdb ({}) — Chromium-family \
-                                 browsers will keep warning",
-                                o.stderr.trim().lines().next().unwrap_or("certutil failed")
-                            ),
-                            true,
-                        ),
-                        Err(_) => (
-                            "certutil is not installed, so the NSS store Chromium-family \
-                             browsers (Chrome, Vivaldi, Brave, Edge) read was NOT updated \
-                             — they will keep warning. Install libnss3-tools \
-                             (Debian/Ubuntu) or nss-tools (Fedora) and apply this fix \
-                             again."
-                                .to_string(),
-                            true,
-                        ),
-                    };
-                    self.emit_op(handle, op, OperationEventKind::Output { line, stderr });
-                }
+                self.nss_add_proxy_ca(handle, op, &crt_str).await;
                 let done = if cfg!(target_os = "macos") {
                     "added to the System keychain — restart the browser; Firefox needs \
                      the certificate imported manually"
@@ -2529,6 +2575,74 @@ impl Engine {
                     op,
                     OperationEventKind::Output { line: done.into(), stderr: false },
                 );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_INSTALL_CERTUTIL => {
+                if !crate::proxy::on_path("certutil") {
+                    let (_, script) =
+                        crate::proxy::certutil_install_script().ok_or_else(|| {
+                            ErrorInfo::InvalidInput {
+                                message: "no supported package manager found — install \
+                                          the NSS tools (certutil) manually, then apply \
+                                          the trust fix"
+                                    .into(),
+                            }
+                        })?;
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: format!("$ {script}"),
+                            stderr: false,
+                        },
+                    );
+                    let argv = crate::proxy::privileged_shell_argv(&script);
+                    self.run_streamed_command(
+                        handle,
+                        op,
+                        &argv,
+                        None,
+                        &crate::Redactor::default(),
+                        Duration::from_secs(10 * 60),
+                    )
+                    .await?;
+                    if !crate::proxy::on_path("certutil") {
+                        return Err(ErrorInfo::Internal {
+                            message: "the install finished but certutil is still not on \
+                                      PATH — install the NSS tools manually, then apply \
+                                      the trust fix"
+                                .into(),
+                        });
+                    }
+                } else {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "certutil is already installed".into(),
+                            stderr: false,
+                        },
+                    );
+                }
+                // Finish the reason it was installed: the CA into nssdb.
+                let dir = self.inner.deps.store.proxy_dir();
+                tokio::fs::create_dir_all(&dir).await.map_err(crate::internal_err)?;
+                let crt = dir.join("root.crt");
+                let crt_str = crt.to_string_lossy().into_owned();
+                let cp: Vec<String> =
+                    ["docker", "cp", crate::proxy::CA_IN_CONTAINER, crt_str.as_str()]
+                        .map(String::from)
+                        .into();
+                let _ = run_command(&cp, None, &[], PROBE_TIMEOUT, PROBE_CAP).await;
+                if !crt.is_file() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: "the proxy has not generated its certificate authority \
+                                  yet — enable a local domain first, then retry"
+                            .into(),
+                    });
+                }
+                self.nss_add_proxy_ca(handle, op, &crt_str).await;
                 self.hint();
                 Ok(())
             }
