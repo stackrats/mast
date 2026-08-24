@@ -501,6 +501,16 @@ pub fn run() {
             {
                 let _ = window.hide();
             }
+            // Belt and braces for the taskbar button: set the window icon
+            // explicitly so the tiled mark shows even where Windows' icon
+            // cache still serves the exe's old art for the shortcut.
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main")
+                && let Ok(icon) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
+            {
+                let _ = window.set_icon(icon);
+            }
             let store = MetadataStore::open(MetadataStore::default_dir())?;
             let engine = Engine::new(
                 EngineConfig::default(),
