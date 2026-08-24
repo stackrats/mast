@@ -316,7 +316,13 @@ impl Engine {
                         editor: settings.editor.clone(),
                         auto_port_remap: settings.auto_port_remap,
                     },
-                    watched_directories: settings.watched_directories,
+                    // Heal pre-strip_verbatim stores: `\\?\C:\…` entries
+                    // display broken and never match a remove.
+                    watched_directories: settings
+                        .watched_directories
+                        .into_iter()
+                        .map(mast_compose::strip_verbatim)
+                        .collect(),
                     discovered: Vec::new(),
                     projects,
                     workspaces,
@@ -632,7 +638,8 @@ impl Engine {
                             message: format!("not a directory: {path}"),
                         });
                     }
-                    let directory = directory.canonicalize().unwrap_or(directory);
+                    let directory =
+                        mast_compose::strip_verbatim(directory.canonicalize().unwrap_or(directory));
                     engine.update_watched_directories(|directories| {
                         if !directories.contains(&directory) {
                             directories.push(directory.clone());
@@ -649,7 +656,8 @@ impl Engine {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
                     let directory = PathBuf::from(&path);
-                    let directory = directory.canonicalize().unwrap_or(directory);
+                    let directory =
+                        mast_compose::strip_verbatim(directory.canonicalize().unwrap_or(directory));
                     engine.update_watched_directories(|directories| {
                         let before = directories.len();
                         directories.retain(|f| f != &directory);
