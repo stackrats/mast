@@ -1237,20 +1237,24 @@ impl Engine {
                 })
             }
             REPAIR_DISCONNECT_STALE => {
-                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                let packed = arg.ok_or_else(|| ErrorInfo::InvalidInput {
                     message: "disconnect-stale-endpoints needs a network name".into(),
                 })?;
-                Ok(RepairPlan {
-                    summary: vec![
-                        format!("inspect network {net} for endpoint records"),
-                        "force-disconnect every record whose container no longer exists"
-                            .into(),
-                        "containers that still exist are left untouched".into(),
-                    ],
-                    repair: offer,
-                    file_preview: None,
-                    no_op: false,
-                })
+                let mut parts = packed.split_whitespace();
+                let net = parts.next().unwrap_or_default().to_string();
+                let container = parts.next();
+                let mut summary = vec![
+                    format!("inspect network {net} for endpoint records"),
+                    "force-disconnect every record whose container no longer exists".into(),
+                ];
+                if let Some(container) = container {
+                    summary.push(format!(
+                        "remove leftover container {} if it exists and is not running",
+                        &container[..container.len().min(12)]
+                    ));
+                }
+                summary.push("running containers are never touched".into());
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op: false })
             }
             REPAIR_FIX_APP_URL => {
                 let path = self.project_path(self.require_project(project)?)?;
@@ -1942,9 +1946,12 @@ impl Engine {
                 }
             }
             REPAIR_DISCONNECT_STALE => {
-                let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
+                let packed = arg.ok_or_else(|| ErrorInfo::InvalidInput {
                     message: "disconnect-stale-endpoints needs a network name".into(),
                 })?;
+                let mut parts = packed.split_whitespace();
+                let net = parts.next().unwrap_or_default();
+                let leftover = parts.next();
                 let inspect: Vec<String> = [
                     "docker",
                     "network",
@@ -2004,6 +2011,59 @@ impl Engine {
                         format!("could not clear {name}: {}", out.stderr.trim())
                     };
                     self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+                }
+                // The failing command may have named a container that still
+                // EXISTS — a leftover carrying this project name from another
+                // directory, which compose enumerates but cannot disconnect.
+                // Stopped: remove it. Running: report and leave it alone.
+                if let Some(leftover) = leftover {
+                    let probe: Vec<String> =
+                        ["docker", "inspect", "--format", "{{.State.Running}} {{.Name}}", leftover]
+                            .map(String::from)
+                            .into();
+                    let short = &leftover[..leftover.len().min(12)];
+                    match run_command(&probe, None, &[], PROBE_TIMEOUT, PROBE_CAP).await {
+                        Ok(out) if out.success() => {
+                            let running = out.stdout.trim().starts_with("true");
+                            let name = out.stdout.split_whitespace().nth(1).unwrap_or(short);
+                            if running {
+                                self.emit_op(
+                                    handle,
+                                    op,
+                                    OperationEventKind::Output {
+                                        line: format!(
+                                            "leftover container {name} is RUNNING — stop it \
+                                             before removing (left untouched)"
+                                        ),
+                                        stderr: true,
+                                    },
+                                );
+                            } else {
+                                let rm: Vec<String> =
+                                    ["docker", "rm", "-f", leftover].map(String::from).into();
+                                let out =
+                                    run_command(&rm, None, &[], PROBE_TIMEOUT, PROBE_CAP)
+                                        .await
+                                        .map_err(crate::internal_err)?;
+                                let line = if out.success() {
+                                    cleared += 1;
+                                    format!(
+                                        "removed leftover container {name} — compose kept \
+                                         tripping on it"
+                                    )
+                                } else {
+                                    format!("could not remove {name}: {}", out.stderr.trim())
+                                };
+                                self.emit_op(
+                                    handle,
+                                    op,
+                                    OperationEventKind::Output { line, stderr: false },
+                                );
+                            }
+                        }
+                        // Already gone: the endpoint sweep above was the fix.
+                        _ => {}
+                    }
                 }
                 if cleared == 0 {
                     self.emit_op(
@@ -2483,36 +2543,70 @@ impl Engine {
                 Ok(())
             }
             REPAIR_STORAGE_LINK => {
-                let path = self.project_path(self.require_project(project)?)?;
+                let project_id = self.require_project(project)?;
+                let path = self.project_path(project_id)?;
+                let check_path = path.clone();
                 tokio::task::spawn_blocking(move || -> Result<(), ErrorInfo> {
-                    if !path.join("storage/app/public").is_dir() {
+                    if !check_path.join("storage/app/public").is_dir() {
                         return Err(ErrorInfo::InvalidInput {
                             message: "storage/app/public does not exist — nothing to link"
                                 .into(),
                         });
                     }
-                    let link = path.join("public/storage");
-                    if std::fs::symlink_metadata(&link).is_ok() {
+                    if std::fs::symlink_metadata(check_path.join("public/storage")).is_ok() {
                         return Err(ErrorInfo::Conflict {
                             message: "public/storage already exists — refusing to replace it"
                                 .into(),
                         });
                     }
-                    #[cfg(unix)]
-                    {
-                        std::os::unix::fs::symlink("../storage/app/public", &link)
-                            .map_err(crate::internal_err)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = link;
-                        Err(ErrorInfo::Internal {
-                            message: "storage links are unix-only for now".into(),
-                        })
-                    }
+                    Ok(())
                 })
                 .await
                 .map_err(crate::internal_err)??;
+                #[cfg(unix)]
+                {
+                    let link = path.join("public/storage");
+                    tokio::task::spawn_blocking(move || {
+                        std::os::unix::fs::symlink("../storage/app/public", &link)
+                            .map_err(crate::internal_err)
+                    })
+                    .await
+                    .map_err(crate::internal_err)??;
+                }
+                // Windows cannot create a symlink without Developer Mode or
+                // elevation — but the app container is Linux and shares the
+                // bind mount, so make the (relative) link from inside it.
+                #[cfg(not(unix))]
+                {
+                    let invocation = {
+                        let st = self.inner.state.lock().unwrap();
+                        let entry = st.projects.get(&project_id.0).ok_or(ErrorInfo::NotFound {
+                            what: format!("project {}", project_id.0),
+                        })?;
+                        entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+                            message: "the project's compose invocation is not resolved".into(),
+                        })?
+                    };
+                    let service = crate::project_ops::app_service_of(&path);
+                    let tail: Vec<String> = ["ln", "-sfn", "../storage/app/public", "public/storage"]
+                        .map(String::from)
+                        .to_vec();
+                    let argv =
+                        crate::project_ops::compose_exec_argv(&invocation, &service, &tail);
+                    let out = run_command(&argv, Some(&path), &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                        .map_err(crate::internal_err)?;
+                    if !out.success() {
+                        return Err(ErrorInfo::InvalidInput {
+                            message: format!(
+                                "could not create the link inside the app container — on \
+                                 Windows the project must be running for this repair \
+                                 ({})",
+                                out.stderr.trim().lines().last().unwrap_or("exec failed")
+                            ),
+                        });
+                    }
+                }
                 self.emit_op(
                     handle,
                     op,

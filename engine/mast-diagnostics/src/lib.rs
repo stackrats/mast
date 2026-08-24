@@ -378,15 +378,18 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
         }),
         REPAIR_DISCONNECT_STALE => Some(RepairSpec {
             id: REPAIR_DISCONNECT_STALE,
-            title: match arg {
+            // The arg may carry "network container-id"; the title shows only
+            // the network.
+            title: match arg.and_then(|a| a.split_whitespace().next()) {
                 Some(net) => format!("Clear stale endpoints from network \"{net}\""),
                 None => "Clear stale network endpoints".into(),
             },
-            risk: RiskTier::Safe,
+            risk: RiskTier::Caution,
             description: "Force-disconnects endpoint records whose container no longer \
-                          exists — the residue of force-removed containers, which blocks \
-                          `docker compose down`/`up` with \"is not connected to the \
-                          network\". Containers that still exist are left untouched."
+                          exists, and removes a stopped leftover container the failing \
+                          command named — the residue that blocks `docker compose \
+                          down`/`up` with \"is not connected to the network\". Running \
+                          containers are never touched."
                 .into(),
             arg: arg.map(String::from),
         }),
