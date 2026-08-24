@@ -581,7 +581,7 @@ async function clearAppLog() {
       </div>
     </div>
 
-    <div class="mt-2 flex gap-1">
+    <div class="mt-2 flex flex-wrap gap-1">
       <Tooltip text="Open a terminal at the project root.">
         <Button
           variant="ghost"
