@@ -16,7 +16,7 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
-    REPAIR_REASSIGN_PORTS, REPAIR_TRUST_PROXY_CA,
+    REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE, REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
 };
@@ -282,6 +282,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             None
         },
         drifted_services: Vec::new(),
+        detached_services: Vec::new(),
         compose_name: None, // filled from the resolved model in gather
         dir_basename: seed
             .path
@@ -488,7 +489,7 @@ fn chown_storage_argv(dir: &Path, uid: u32, gid: u32) -> Option<Vec<String>> {
 
 impl Engine {
     async fn gather_diag_ctx(&self) -> DiagCtx {
-        let (docker, seeds, invocations, db_metas, workspace_issues, docker_host_env) = {
+        let (docker, seeds, invocations, db_metas, publishing, workspace_issues, docker_host_env) = {
             let st = self.inner.state.lock().unwrap();
             let seeds: Vec<ProjectSeed> = st
                 .projects
@@ -546,6 +547,28 @@ impl Engine {
                     })
                 })
                 .collect();
+            // Which of each project's services publish host ports, per the
+            // resolved model — the detached-container scan needs to know a
+            // container *should* be reachable before calling it wreckage.
+            let publishing: std::collections::HashMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = st
+                .projects
+                .values()
+                .filter_map(|e| {
+                    let model = e.model.as_ref()?;
+                    Some((
+                        e.record.id.clone(),
+                        model
+                            .services
+                            .iter()
+                            .filter(|s| !s.published_ports.is_empty())
+                            .map(|s| s.name.clone())
+                            .collect(),
+                    ))
+                })
+                .collect();
             let issues = workspace_summaries(&st)
                 .into_iter()
                 .filter_map(|w| w.graph_error.map(|g| (w.name, g)))
@@ -556,7 +579,7 @@ impl Engine {
                 .process_env
                 .get("DOCKER_HOST")
                 .is_some_and(|v| !v.is_empty());
-            (st.docker.clone(), seeds, invocations, db_metas, issues, docker_host_env)
+            (st.docker.clone(), seeds, invocations, db_metas, publishing, issues, docker_host_env)
         };
 
         let compose_version = {
@@ -724,6 +747,27 @@ impl Engine {
                     if running.is_empty() {
                         continue;
                     }
+                    // Detached wreckage first — it does not depend on the
+                    // config-hash probe below, and a detached container's
+                    // hash still matches anyway.
+                    let mut detached: Vec<String> = running
+                        .iter()
+                        .filter(|o| {
+                            o.networks.is_empty()
+                                && o.published_ports.is_empty()
+                                && publishing
+                                    .get(&meta.project_id)
+                                    .is_some_and(|svcs| svcs.contains(&o.service))
+                        })
+                        .map(|o| o.service.clone())
+                        .collect();
+                    detached.sort();
+                    detached.dedup();
+                    if let Some((facts, _)) =
+                        inspected.iter_mut().find(|(f, _)| f.id == meta.project_id)
+                    {
+                        facts.detached_services = detached;
+                    }
                     let Some(invocation) = invocations.get(&meta.project_id) else { continue };
                     let Some(current) = config_hashes(invocation).await else { continue };
                     let mut drifted: Vec<String> = running
@@ -844,6 +888,45 @@ impl Engine {
         })
         .await
         .map_err(crate::internal_err)?
+    }
+
+    /// Validate a `recreate-service` arg and gather what its compose command
+    /// needs. The arg travels through the UI, so every named service must
+    /// exist in the resolved model before it lands in an argv.
+    fn recreate_targets(
+        &self,
+        project: &ProjectId,
+        arg: Option<&str>,
+    ) -> Result<
+        (Vec<String>, mast_compose::ComposeInvocation, PathBuf, crate::Redactor),
+        ErrorInfo,
+    > {
+        let services: Vec<String> =
+            arg.unwrap_or_default().split_whitespace().map(str::to_string).collect();
+        if services.is_empty() {
+            return Err(ErrorInfo::InvalidInput {
+                message: "recreate-service needs the service name(s)".into(),
+            });
+        }
+        let st = self.inner.state.lock().unwrap();
+        let entry = st
+            .projects
+            .get(&project.0)
+            .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+        let invocation = entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+            message: "the project's compose invocation is not resolved".into(),
+        })?;
+        let known: std::collections::BTreeSet<&str> = entry
+            .model
+            .as_ref()
+            .map(|m| m.services.iter().map(|s| s.name.as_str()).collect())
+            .unwrap_or_default();
+        if let Some(unknown) = services.iter().find(|s| !known.contains(s.as_str())) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!("\"{unknown}\" is not a service of this project"),
+            });
+        }
+        Ok((services, invocation, entry.record.path.clone(), entry.redactor.clone()))
     }
 
     /// What a repair will do, before consent. Env-file repairs return a full
@@ -981,6 +1064,25 @@ impl Engine {
                 })?;
                 Ok(RepairPlan {
                     summary: vec![format!("run: docker network create {net}")],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_RECREATE_SERVICE => {
+                let project = self.require_project(project)?;
+                let (services, invocation, path, _) = self.recreate_targets(project, arg)?;
+                let mut tail: Vec<&str> = vec!["up", "-d", "--force-recreate", "--no-deps"];
+                tail.extend(services.iter().map(String::as_str));
+                let (argv, _) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
+                Ok(RepairPlan {
+                    summary: vec![
+                        format!("run: {}", argv.join(" ")),
+                        format!("in: {}", path.display()),
+                        "replaces exactly these containers — named volumes and their data \
+                         are untouched"
+                            .into(),
+                    ],
                     repair: offer,
                     file_preview: None,
                     no_op: false,
@@ -1554,6 +1656,34 @@ impl Engine {
                         },
                     );
                 }
+                Ok(())
+            }
+            REPAIR_RECREATE_SERVICE => {
+                let project = self.require_project(project)?;
+                let (services, invocation, path, redactor) =
+                    self.recreate_targets(project, arg)?;
+                let mut tail: Vec<&str> = vec!["up", "-d", "--force-recreate", "--no-deps"];
+                tail.extend(services.iter().map(String::as_str));
+                let (argv, env) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("$ {}", argv.join(" ")),
+                        stderr: false,
+                    },
+                );
+                self.run_streamed_command_env(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &env,
+                    &redactor,
+                    Duration::from_secs(15 * 60),
+                )
+                .await?;
+                self.hint();
                 Ok(())
             }
             REPAIR_COMPOSER_INSTALL => {
