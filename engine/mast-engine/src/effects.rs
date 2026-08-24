@@ -618,11 +618,17 @@ fn collect_deaths(
 /// a fallback; shell git is that fallback and already proven by snapshots).
 /// One subprocess per project per reconcile; (None, None) outside a repo.
 fn git_info(dir: &std::path::Path) -> (Option<String>, Option<bool>) {
-    let output = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(dir)
-        .args(["status", "--porcelain", "--branch"])
-        .output();
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C"]).arg(dir).args(["status", "--porcelain", "--branch"]);
+    // This is the one spawn that bypasses mast-docker's runner, so it needs
+    // its own CREATE_NO_WINDOW — per project per reconcile, it was an
+    // endless console flicker on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = cmd.output();
     let Ok(output) = output else { return (None, None) };
     if !output.status.success() {
         return (None, None);
