@@ -32,12 +32,28 @@ pub fn extract_repair_arg(sig: &ErrorSignature, line: &str) -> Option<String> {
             (!name.is_empty()).then(|| name.to_string())
         }
         // "container 9765fe… is not connected to the network thinksolar_api_net"
-        // — the network name follows the LAST "network" token.
+        // — the network name follows the LAST "network" token. When the line
+        // also names the container, pack it as a second word: the repair can
+        // then dispose of a container that still EXISTS but compose cannot
+        // disconnect (a leftover from the same project name in another
+        // directory — outside Mast's own orphan view by design).
         "stale-network-endpoint" => {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             let at = tokens.iter().rposition(|t| *t == "network")?;
             let name = tokens.get(at + 1)?.trim_matches(['"', '\'', '`', '.', ':']);
-            (!name.is_empty()).then(|| name.to_string())
+            if name.is_empty() {
+                return None;
+            }
+            let container = tokens
+                .iter()
+                .position(|t| *t == "container")
+                .and_then(|at| tokens.get(at + 1))
+                .map(|t| t.trim_matches(['"', '\'', '`', '.', ':']))
+                .filter(|t| t.len() >= 12 && t.chars().all(|c| c.is_ascii_hexdigit()));
+            Some(match container {
+                Some(container) => format!("{name} {container}"),
+                None => name.to_string(),
+            })
         }
         _ => None,
     }
@@ -261,12 +277,20 @@ mod tests {
         assert_eq!(extract_repair_arg(port, "bind: address already in use"), None);
 
         // The exact daemon wording seen live: the network name follows the
-        // LAST "network" token, past the container id.
+        // LAST "network" token; the container id is packed as a second word
+        // so the repair can dispose of a leftover that still exists.
         let line = "Error response from daemon: container 9765fe4e8e62cd621b90d7dbbc92a16d \
                     is not connected to the network thinksolar_api_net";
         let stale = classify_line(line).unwrap();
         assert_eq!(stale.repair, Some(crate::REPAIR_DISCONNECT_STALE));
-        assert_eq!(extract_repair_arg(stale, line).as_deref(), Some("thinksolar_api_net"));
+        assert_eq!(
+            extract_repair_arg(stale, line).as_deref(),
+            Some("thinksolar_api_net 9765fe4e8e62cd621b90d7dbbc92a16d")
+        );
+        // Without a container id on the line, the network stands alone.
+        let bare = "network thinksolar_api_net has an endpoint that is not connected \
+                    to the network thinksolar_api_net";
+        assert_eq!(extract_repair_arg(stale, bare).as_deref(), Some("thinksolar_api_net"));
     }
 
     #[test]
