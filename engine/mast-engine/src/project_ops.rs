@@ -9,8 +9,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use mast_compose::ComposeInvocation;
 use mast_contract::{
-    CaptureReason, EnvEntryView, EnvFinding, EnvReport, ErrorInfo, FindingSeverity, LogLine,
-    OperationEventKind, OperationId, PatchEvent, ProjectId, ProjectStatus,
+    CaptureReason, ContainerState, EnvEntryView, EnvFinding, EnvReport, ErrorInfo,
+    FindingSeverity, LogLine, OperationEventKind, OperationId, PatchEvent, ProjectId,
+    ProjectStatus,
 };
 use tokio::sync::mpsc;
 
@@ -691,7 +692,7 @@ impl Engine {
         verb: LifecycleVerb,
         service: Option<String>,
     ) -> Result<OperationId, ErrorInfo> {
-        let (invocation, redactor, project_name) = {
+        let (invocation, redactor, project_name, orphan_container, orphan_running) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
@@ -704,8 +705,58 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| "project not resolved yet".into()),
             })?;
-            (invocation, entry.redactor.clone(), entry.summary.name.clone())
+            // An orphaned service (observed container, gone from the compose
+            // file) cannot be addressed through compose — its verb goes
+            // straight to the docker CLI against the container.
+            let orphan_container = service.as_deref().and_then(|name| {
+                entry
+                    .summary
+                    .services
+                    .iter()
+                    .find(|s| s.orphaned && s.name == name)
+                    .and_then(|s| s.container_id.clone())
+            });
+            // A whole-project stop must reach the leftovers too, or "Stop"
+            // leaves half the project running (the post-git-pull trap).
+            let orphan_running: Vec<(String, String)> =
+                if service.is_none() && verb == LifecycleVerb::Stop {
+                    entry
+                        .summary
+                        .services
+                        .iter()
+                        .filter(|s| {
+                            s.orphaned
+                                && matches!(
+                                    s.state,
+                                    Some(
+                                        ContainerState::Running
+                                            | ContainerState::Restarting
+                                            | ContainerState::Paused
+                                    )
+                                )
+                        })
+                        .filter_map(|s| s.container_id.clone().map(|id| (s.name.clone(), id)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            (
+                invocation,
+                entry.redactor.clone(),
+                entry.summary.name.clone(),
+                orphan_container,
+                orphan_running,
+            )
         };
+        if orphan_container.is_some() && verb == LifecycleVerb::Rebuild {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!(
+                    "{} is no longer in the compose file — Rebuild the whole project to \
+                     replace it",
+                    service.as_deref().unwrap_or_default()
+                ),
+            });
+        }
         // A deliberate new operation supersedes any crash notice.
         self.inner.crash_notices.lock().unwrap().remove(&project.0);
         {
@@ -736,8 +787,15 @@ impl Engine {
             });
             engine.emit_op(&handle, id, OperationEventKind::Started);
             // Whole-project starts flip status optimistically; per-service
-            // verbs let observation settle the service's state instead.
-            if service.is_none() && (verb == LifecycleVerb::Up || verb == LifecycleVerb::Restart) {
+            // verbs let observation settle the service's state instead. A
+            // rebuild ends with everything up, and its port preflight matters
+            // most of all — a stale config is exactly when ports moved.
+            if service.is_none()
+                && matches!(
+                    verb,
+                    LifecycleVerb::Up | LifecycleVerb::Restart | LifecycleVerb::Rebuild
+                )
+            {
                 engine.with_state(|st, events| {
                     if let Some(entry) = st.projects.get_mut(&project.0)
                         && entry.summary.status != ProjectStatus::Starting
@@ -801,13 +859,81 @@ impl Engine {
                     project: Some(project.clone()),
                     operation: Some(id),
                 },
-                engine
-                    .inner
-                    .deps
-                    .runner
-                    .run(&invocation, verb, service.as_deref(), line_tx, handle.cancel.clone()),
+                async {
+                    if let Some(container_id) = &orphan_container {
+                        // The file no longer knows this service — drive the
+                        // container itself.
+                        return engine
+                            .inner
+                            .deps
+                            .runner
+                            .run_container(
+                                verb,
+                                container_id,
+                                line_tx.clone(),
+                                handle.cancel.clone(),
+                            )
+                            .await;
+                    }
+                    let mut outcome = engine
+                        .inner
+                        .deps
+                        .runner
+                        .run(
+                            &invocation,
+                            verb,
+                            service.as_deref(),
+                            line_tx.clone(),
+                            handle.cancel.clone(),
+                        )
+                        .await;
+                    for (name, container_id) in &orphan_running {
+                        let _ = line_tx
+                            .send(mast_docker::OutputLine {
+                                line: format!("stopping {name} (no longer in the compose file)"),
+                                stderr: false,
+                            })
+                            .await;
+                        match engine
+                            .inner
+                            .deps
+                            .runner
+                            .run_container(
+                                LifecycleVerb::Stop,
+                                container_id,
+                                line_tx.clone(),
+                                handle.cancel.clone(),
+                            )
+                            .await
+                        {
+                            Ok(CommandOutcome::Exited(0)) => {}
+                            Ok(CommandOutcome::Cancelled) => {
+                                outcome = Ok(CommandOutcome::Cancelled);
+                                break;
+                            }
+                            // The compose verb's own failure stays the
+                            // headline; a leftover that would not stop only
+                            // fails an otherwise-clean operation.
+                            Ok(CommandOutcome::Exited(code)) => {
+                                if matches!(outcome, Ok(CommandOutcome::Exited(0))) {
+                                    outcome = Err(format!(
+                                        "failed to stop leftover container {name} (exit {code})"
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                if matches!(outcome, Ok(CommandOutcome::Exited(0))) {
+                                    outcome =
+                                        Err(format!("failed to stop leftover container {name}: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    outcome
+                },
             )
             .await;
+            drop(line_tx);
             let _ = forwarder.await;
 
             let kind = match result {

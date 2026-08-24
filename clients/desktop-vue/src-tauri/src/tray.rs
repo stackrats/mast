@@ -40,6 +40,36 @@ fn reveal_window(app: &AppHandle) {
     }
 }
 
+/// The bundled mark is near-white — right for dark taskbars, invisible on a
+/// light one. Windows' taskbar follows `SystemUsesLightTheme` ("Windows
+/// mode"), NOT the app theme the window API reports — the two split under
+/// Settings > Personalization > Custom, and the taskbar is where the tray
+/// lives.
+#[cfg(windows)]
+fn light_taskbar() -> bool {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("SystemUsesLightTheme"))
+        .map(|value| value == 1)
+        .unwrap_or(false)
+}
+
+/// The icon the tray should show right now: the dark variant on a light
+/// Windows taskbar, the bundled light mark everywhere else. macOS never gets
+/// here for theming — its icon is a template (see [`setup_tray`]) and the
+/// menu bar recolors it natively. Linux panels are almost universally dark.
+fn tray_icon(app: &AppHandle) -> tauri::image::Image<'static> {
+    #[cfg(windows)]
+    if light_taskbar()
+        && let Ok(icon) =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-dark-32x32.png"))
+    {
+        return icon;
+    }
+    let bundled = app.default_window_icon().expect("bundled icon");
+    tauri::image::Image::new_owned(bundled.rgba().to_vec(), bundled.width(), bundled.height())
+}
+
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::Manager;
     use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -48,9 +78,14 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "Open Mast").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&open, &quit]).build()?;
-    TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().cloned().expect("bundled icon"))
-        .tooltip("Mast")
+    let builder = TrayIconBuilder::with_id("main")
+        .icon(tray_icon(app.handle()))
+        .tooltip("Mast");
+    // The mark's alpha channel is the template shape; macOS then paints it
+    // to match the menu bar in either theme.
+    #[cfg(target_os = "macos")]
+    let builder = builder.icon_as_template(true);
+    builder
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
@@ -273,5 +308,16 @@ async fn rebuild_tray(app: &AppHandle, client: &dyn MastClient) -> tauri::Result
         tooltip.push_str(" · docker offline");
     }
     tray.set_tooltip(Some(tooltip))?;
+    // Keep the icon matched to the taskbar theme, but only touch it on a
+    // flip — resetting it on every patch would flicker.
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static LAST_LIGHT: AtomicU8 = AtomicU8::new(u8::MAX);
+        let light = light_taskbar() as u8;
+        if LAST_LIGHT.swap(light, Ordering::Relaxed) != light {
+            let _ = tray.set_icon(Some(tray_icon(app)));
+        }
+    }
     Ok(())
 }
