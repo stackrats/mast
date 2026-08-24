@@ -4,7 +4,7 @@
 //! cancellation (SIGTERM to the group, SIGKILL after a grace period).
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +33,80 @@ pub enum CommandError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// The argv0 actually handed to the OS. `Command::new("docker")` resolves
+/// through `PATH` — which a packaged GUI app does not inherit from the user's
+/// shell. A Finder/Dock launch carries launchd's bare
+/// `/usr/bin:/bin:/usr/sbin:/sbin` (no `/usr/local/bin`, where Docker Desktop
+/// links its CLI), and a Windows session started before Docker Desktop's
+/// install misses its `PATH` edit. So a bare `docker` that `PATH` cannot see
+/// is re-pointed at the first well-known install location that exists.
+/// Probed on every spawn (a few stats, dwarfed by the spawn itself): install
+/// Docker while Mast runs and the connect retry loop finds it, no restart.
+fn effective_argv0(argv0: &str) -> String {
+    if argv0 != "docker" || found_in_path(argv0) {
+        return argv0.to_string();
+    }
+    docker_fallbacks()
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| argv0.to_string())
+}
+
+fn found_in_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&paths).any(|dir| {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        let candidate = dir.join(binary);
+        if cfg!(windows) { candidate.with_extension("exe").is_file() } else { candidate.is_file() }
+    })
+}
+
+/// Everywhere a docker CLI lands that launchd's `PATH` cannot see: Docker
+/// Desktop's `/usr/local/bin` symlink (and the bundle's own copy, which
+/// survives a broken symlink), Homebrew/MacPorts for colima and friends, and
+/// the per-user bins OrbStack and Rancher Desktop create.
+#[cfg(target_os = "macos")]
+fn docker_fallbacks() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = [
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/opt/local/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+    ]
+    .iter()
+    .map(|dir| Path::new(dir).join("docker"))
+    .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home);
+        candidates.push(home.join(".orbstack/bin/docker"));
+        candidates.push(home.join(".rd/bin/docker"));
+    }
+    candidates
+}
+
+/// Docker Desktop's machine-wide CLI directory — reachable even when this
+/// login session predates the install's `PATH` edit.
+#[cfg(windows)]
+fn docker_fallbacks() -> Vec<PathBuf> {
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    vec![program_files.join(r"Docker\Docker\resources\bin\docker.exe")]
+}
+
+/// A Linux desktop session inherits a sane `PATH`; these cover the package
+/// locations anyway so the AppImage behaves no worse than the terminal.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn docker_fallbacks() -> Vec<PathBuf> {
+    ["/usr/bin", "/usr/local/bin", "/snap/bin"]
+        .iter()
+        .map(|dir| Path::new(dir).join("docker"))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +167,7 @@ async fn run_command_inner(
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<CommandOutput, CommandError> {
-    let argv0 = argv.first().cloned().unwrap_or_default();
+    let argv0 = effective_argv0(argv.first().map(String::as_str).unwrap_or_default());
     let mut cmd = tokio::process::Command::new(&argv0);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -239,7 +313,7 @@ async fn run_streaming_inner(
     tail: Option<Tail>,
 ) -> Result<CommandOutcome, CommandError> {
     const MAX_LINE: usize = 8 * 1024;
-    let argv0 = argv.first().cloned().unwrap_or_default();
+    let argv0 = effective_argv0(argv.first().map(String::as_str).unwrap_or_default());
     let mut cmd = tokio::process::Command::new(&argv0);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -387,6 +461,22 @@ mod tests {
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome, CommandOutcome::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(5), "cancel was not prompt");
+    }
+
+    #[test]
+    fn only_a_bare_docker_argv0_is_rewritten() {
+        // Other programs and explicit paths are the caller's decision.
+        assert_eq!(effective_argv0("bash"), "bash");
+        assert_eq!(effective_argv0("/no/such/docker"), "/no/such/docker");
+    }
+
+    /// Environment-dependent by nature: on a box with docker on PATH the name
+    /// stays bare; anywhere else the fallback must only ever substitute a
+    /// path that exists (or give the name back for the honest spawn error).
+    #[test]
+    fn docker_resolves_to_bare_name_or_existing_path() {
+        let resolved = effective_argv0("docker");
+        assert!(resolved == "docker" || Path::new(&resolved).is_file(), "{resolved}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

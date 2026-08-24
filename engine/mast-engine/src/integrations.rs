@@ -78,10 +78,15 @@ fn pick(configured: Option<&str>, candidates: &[&str]) -> Option<String> {
     {
         return Some(configured.trim().to_string());
     }
-    candidates
-        .iter()
-        .find(|c| is_app_bundle(c) || find_in_path(c).is_some())
-        .map(|c| c.to_string())
+    // Return the path the probe proved, not the bare name: the spawn resolves
+    // argv0 through PATH alone, which — pared down to launchd's four dirs in
+    // a Finder-launched app — cannot see EXTRA_BIN_DIRS the probe just did.
+    candidates.iter().find_map(|c| {
+        if is_app_bundle(c) {
+            return Some(c.to_string());
+        }
+        find_in_path(c).map(|p| p.to_string_lossy().into_owned())
+    })
 }
 
 /// Wrap `s` so a POSIX shell reads it as one literal word. Words made only of
