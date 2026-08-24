@@ -402,6 +402,13 @@ export type Action =
  */
 { type: "rebuildService"; id: ProjectId; service: string } | 
 /**
+ * Rebuild the whole project: rebuild service images, pull newer ones and
+ * recreate every container, dropping orphans — the recovery for a compose
+ * config that changed underneath the project (a git pull), which
+ * `restart` (reuses containers) and `up` (reuses images) both miss.
+ */
+{ type: "rebuildProject"; id: ProjectId } | 
+/**
  * Switch a Sail-built service to another vendored PHP runtime, as ONE
  * operation: rewrites `build.context` and the `sail-X.Y/app` image tag
  * together, rebuilds without cache, recreates the container when the
@@ -1004,7 +1011,14 @@ uiUrl?: string | null;
  * Host-side port of a recognized database service — what a GUI client
  * on the host connects to (with the credentials from `.env`).
  */
-dbPort?: number | null }
+dbPort?: number | null; 
+/**
+ * Observed as a container but no longer declared by the compose file —
+ * a leftover from an earlier config (the post-git-pull trap). Compose
+ * verbs cannot address it ("no such service"), so its lifecycle goes
+ * straight to the docker CLI, and a whole-project Rebuild reaps it.
+ */
+orphaned?: boolean }
 /**
  * One service's share of the machine, over one sampling interval.
  */

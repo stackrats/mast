@@ -63,6 +63,14 @@ enum Command {
         #[arg(long)]
         service: Option<String>,
     },
+    /// Rebuild images, pull newer ones and recreate the containers — the
+    /// recovery for a compose config that changed underneath the project
+    /// (or, with --service, refresh just that container).
+    Rebuild {
+        project: String,
+        #[arg(long)]
+        service: Option<String>,
+    },
     /// Run the diagnostic check set — everything, or one project's findings.
     Diagnose {
         /// Project name (or path suffix) to scope the report to.
@@ -107,6 +115,9 @@ async fn main() {
         }
         Command::Restart { project, service } => {
             lifecycle(client.as_ref(), &project, service, "restart").await
+        }
+        Command::Rebuild { project, service } => {
+            lifecycle(client.as_ref(), &project, service, "rebuild").await
         }
         Command::Diagnose { project } => diagnose(client.as_ref(), project).await,
         Command::History { background, limit } => {
@@ -330,9 +341,11 @@ async fn lifecycle(
         ("start", None) => Action::StartProject { id },
         ("stop", None) => Action::StopProject { id },
         ("restart", None) => Action::RestartProject { id },
+        ("rebuild", None) => Action::RebuildProject { id },
         ("start", Some(service)) => Action::StartService { id, service },
         ("stop", Some(service)) => Action::StopService { id, service },
         ("restart", Some(service)) => Action::RestartService { id, service },
+        ("rebuild", Some(service)) => Action::RebuildService { id, service },
         _ => unreachable!(),
     };
     let op = match client.dispatch(action).await {

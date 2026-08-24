@@ -17,6 +17,8 @@ pub enum LifecycleVerb {
     Restart,
     /// Pull and recreate. `restart` reuses the existing container, so it does
     /// not pick up an edited service block — a retagged image needs this.
+    /// Scoped to one service it leaves dependencies alone; run project-wide
+    /// it also rebuilds images and drops orphans (see [`lifecycle_argv`]).
     Rebuild,
 }
 
@@ -64,13 +66,26 @@ pub fn lifecycle_argv(
         }
     };
     argv.extend(verb.args().iter().map(|s| s.to_string()));
-    if let Some(service) = service {
-        // Recreating one service must not drag its dependencies down with it;
-        // for the other verbs compose already scopes to the named service.
-        if verb == LifecycleVerb::Rebuild {
-            argv.push("--no-deps".into());
+    match service {
+        Some(service) => {
+            // Recreating one service must not drag its dependencies down with
+            // it; for the other verbs compose already scopes to the service.
+            if verb == LifecycleVerb::Rebuild {
+                argv.push("--no-deps".into());
+            }
+            argv.push(service.to_string());
         }
-        argv.push(service.to_string());
+        // The whole-project rebuild answers a config that changed underneath
+        // the project: `--build` refreshes images built from local Dockerfiles
+        // and `--remove-orphans` clears containers whose service is gone from
+        // the file. Both are wrong for the scoped form — a one-service retag
+        // must not rebuild or reap its neighbours.
+        None => {
+            if verb == LifecycleVerb::Rebuild {
+                argv.push("--build".into());
+                argv.push("--remove-orphans".into());
+            }
+        }
     }
     (argv, parity_env(invocation))
 }
@@ -109,6 +124,21 @@ pub trait LifecycleRunner: Send + Sync {
         lines: mpsc::Sender<OutputLine>,
         cancel: CancellationToken,
     ) -> Result<CommandOutcome, String>;
+
+    /// Drive one container directly with the docker CLI — the fallback for an
+    /// orphaned service (observed container, no longer declared by the file),
+    /// which compose verbs cannot address ("no such service"). Defaulted so
+    /// test fakes that never meet an orphan need not implement it.
+    async fn run_container(
+        &self,
+        verb: LifecycleVerb,
+        container_id: &str,
+        lines: mpsc::Sender<OutputLine>,
+        cancel: CancellationToken,
+    ) -> Result<CommandOutcome, String> {
+        let _ = (verb, container_id, lines, cancel);
+        Err("container-direct verbs are not supported by this runner".into())
+    }
 }
 
 pub struct RealLifecycleRunner;
@@ -132,6 +162,37 @@ impl LifecycleRunner for RealLifecycleRunner {
             cancel,
             // Generous: first `up` may pull images.
             Duration::from_secs(15 * 60),
+            Duration::from_secs(8),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn run_container(
+        &self,
+        verb: LifecycleVerb,
+        container_id: &str,
+        lines: mpsc::Sender<OutputLine>,
+        cancel: CancellationToken,
+    ) -> Result<CommandOutcome, String> {
+        let cmd = match verb {
+            LifecycleVerb::Up => "start",
+            LifecycleVerb::Stop => "stop",
+            LifecycleVerb::Restart => "restart",
+            // A single orphan has no compose service to rebuild from; the
+            // dispatch layer refuses this before it gets here.
+            LifecycleVerb::Rebuild => {
+                return Err("an orphaned container has no compose service to rebuild".into());
+            }
+        };
+        let argv: Vec<String> = ["docker", cmd, container_id].map(String::from).to_vec();
+        run_streaming(
+            &argv,
+            None,
+            &[],
+            lines,
+            cancel,
+            Duration::from_secs(5 * 60),
             Duration::from_secs(8),
         )
         .await
@@ -209,11 +270,15 @@ mod tests {
             ["up", "-d", "--force-recreate", "--pull", "always", "--no-deps", "mysql"]
         );
 
-        // Whole-project rebuild has no single service to isolate, so --no-deps
-        // would wrongly skip everything it depends on.
+        // Whole-project rebuild has no single service to isolate (--no-deps
+        // would wrongly skip dependencies); it answers a changed config, so it
+        // additionally rebuilds local images and reaps orphaned containers.
         let (argv, _) = lifecycle_argv(&inv, LifecycleVerb::Rebuild, None);
         assert!(!argv.contains(&"--no-deps".to_string()), "{argv:?}");
-        assert_eq!(&argv[argv.len() - 5..], ["up", "-d", "--force-recreate", "--pull", "always"]);
+        assert_eq!(
+            &argv[argv.len() - 7..],
+            ["up", "-d", "--force-recreate", "--pull", "always", "--build", "--remove-orphans"]
+        );
     }
 
     #[test]

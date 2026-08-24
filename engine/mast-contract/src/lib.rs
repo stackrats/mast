@@ -77,6 +77,12 @@ pub struct ServiceState {
     /// on the host connects to (with the credentials from `.env`).
     #[serde(default)]
     pub db_port: Option<u16>,
+    /// Observed as a container but no longer declared by the compose file —
+    /// a leftover from an earlier config (the post-git-pull trap). Compose
+    /// verbs cannot address it ("no such service"), so its lifecycle goes
+    /// straight to the docker CLI, and a whole-project Rebuild reaps it.
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 /// A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
@@ -926,6 +932,11 @@ pub enum Action {
     /// Pull the service's image and recreate just that container, so a retag
     /// (or any edited service block) takes effect.
     RebuildService { id: ProjectId, service: String },
+    /// Rebuild the whole project: rebuild service images, pull newer ones and
+    /// recreate every container, dropping orphans — the recovery for a compose
+    /// config that changed underneath the project (a git pull), which
+    /// `restart` (reuses containers) and `up` (reuses images) both miss.
+    RebuildProject { id: ProjectId },
     /// Switch a Sail-built service to another vendored PHP runtime, as ONE
     /// operation: rewrites `build.context` and the `sail-X.Y/app` image tag
     /// together, rebuilds without cache, recreates the container when the
@@ -1085,6 +1096,7 @@ mod tests {
             health: ServiceHealth::Healthy,
             ui_url: None,
             db_port: None,
+            orphaned: false,
         }
     }
 
@@ -1249,6 +1261,7 @@ mod tests {
             Action::StartProject { id: ProjectId("p1".into()) },
             Action::StopProject { id: ProjectId("p1".into()) },
             Action::RestartProject { id: ProjectId("p1".into()) },
+            Action::RebuildProject { id: ProjectId("p1".into()) },
             Action::OpenTerminal { id: ProjectId("p1".into()) },
             Action::ShellIntoContainer { id: ProjectId("p1".into()), service: "app".into() },
             Action::OpenInEditor { id: ProjectId("p1".into()) },
