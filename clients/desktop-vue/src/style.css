@@ -19,3 +19,37 @@
   --color-slate-900: var(--color-neutral-900);
   --color-slate-950: var(--color-neutral-950);
 }
+
+/* Slim, theme-following scrollbars everywhere. WebKitGTK already draws
+   overlay ones; WebView2 (Windows) and WKWebView (macOS) fall back to
+   chunky native light widgets that glare in dark mode. Chromium ≥121
+   prefers the standard properties and ignores the -webkit- ones when both
+   are present — each engine picks its lane, both land slim and themed. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-neutral-400) transparent;
+}
+.dark * {
+  scrollbar-color: var(--color-neutral-600) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-400);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-500);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-600);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-500);
+}
