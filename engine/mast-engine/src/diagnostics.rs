@@ -893,19 +893,39 @@ impl Engine {
                 // knob (default "sail"), NOT WWWUSER — a failed
                 // `usermod -u $WWWUSER` leaves the sail user at its image
                 // default, and root's success proves nothing about sail's.
-                let probe_as = |user: Option<String>| {
+                let exec_sh = |user: Option<String>, script: &str| {
                     let mut tail: Vec<String> = vec!["exec".into(), "-T".into()];
                     if let Some(user) = user {
                         tail.push("-u".into());
                         tail.push(user);
                     }
                     tail.push(facts.app_service.clone());
-                    tail.extend(["sh", "-c", WRITABLE_PROBE].map(String::from));
+                    tail.extend(["sh", "-c", script].map(String::from));
                     let refs: Vec<&str> = tail.iter().map(String::as_str).collect();
                     crate::db_repair::scoped_compose_argv(invocation, &refs).0
                 };
-                let php_user =
-                    facts.php_user.clone().unwrap_or_else(|| "sail".to_string());
+                let probe_as = |user: Option<String>| exec_sh(user, WRITABLE_PROBE);
+                // The effective value INSIDE the running container outranks
+                // whatever `.env` or the compose file say now: a container
+                // created before those edits keeps its old environment until
+                // recreated — file-truth and container-truth diverge, and
+                // PHP lives in the container.
+                const EFFECTIVE_USER: &str = "printf %s \"${SUPERVISOR_PHP_USER:-sail}\"";
+                let php_user = match run_command(
+                    &exec_sh(None, EFFECTIVE_USER),
+                    Some(&invocation.project_dir),
+                    &[],
+                    PROBE_TIMEOUT,
+                    PROBE_CAP,
+                )
+                .await
+                {
+                    Ok(out) if out.success() && !out.stdout.trim().is_empty() => {
+                        out.stdout.trim().to_string()
+                    }
+                    _ => facts.php_user.clone().unwrap_or_else(|| "sail".to_string()),
+                };
+                facts.php_user = Some(php_user.clone());
                 let argv = probe_as(Some(php_user));
                 let broken: Option<Vec<String>> =
                     match run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
@@ -1427,10 +1447,10 @@ impl Engine {
             }
             REPAIR_PHP_AS_ROOT => {
                 let project = self.require_project(project)?;
-                let (_, file) = self.catalog_context(project)?;
+                let (invocation, file) = self.catalog_context(project)?;
                 let path = self.project_path(project)?;
                 let service = crate::project_ops::app_service_of(&path);
-                let already = std::fs::read_to_string(&file)
+                let file_has = std::fs::read_to_string(&file)
                     .ok()
                     .and_then(|source| {
                         mast_yaml_edit::get_scalar(
@@ -1444,9 +1464,21 @@ impl Engine {
                         )
                     })
                     .is_some_and(|v| v.trim_matches(['\'', '"']) == "root");
+                // The FILE having the knob is not the fix: a container
+                // created before the edit keeps its old environment until
+                // recreated. Only container-truth makes this a no-op.
+                let container_has =
+                    file_has && self.container_php_user(&invocation, &service).await == Some("root".into());
                 Ok(RepairPlan {
-                    summary: if already {
-                        vec!["the app service already runs PHP as root — nothing to do".into()]
+                    summary: if container_has {
+                        vec!["the app container already runs PHP as root — nothing to do".into()]
+                    } else if file_has {
+                        vec![
+                            "the compose file already carries SUPERVISOR_PHP_USER: 'root', \
+                             but the RUNNING container predates it"
+                                .into(),
+                            "recreate the app service so supervisord picks it up".into(),
+                        ]
                     } else {
                         vec![
                             format!(
@@ -1460,7 +1492,7 @@ impl Engine {
                     },
                     repair: offer,
                     file_preview: None,
-                    no_op: already,
+                    no_op: container_has,
                 })
             }
             REPAIR_STORAGE_WRITABLE => {
@@ -2099,6 +2131,25 @@ impl Engine {
             .map(|(_, port)| *port)
     }
 
+    /// The SUPERVISOR_PHP_USER the RUNNING app container actually carries —
+    /// container-truth, which outranks file-truth until a recreate. `None`
+    /// when the container is not running or the exec fails.
+    async fn container_php_user(
+        &self,
+        invocation: &mast_compose::ComposeInvocation,
+        service: &str,
+    ) -> Option<String> {
+        let tail: Vec<&str> =
+            vec!["exec", "-T", service, "sh", "-c", "printf %s \"${SUPERVISOR_PHP_USER:-sail}\""];
+        let (argv, _env) = crate::db_repair::scoped_compose_argv(invocation, &tail);
+        run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+            .await
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| out.stdout.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
     fn current_username(&self) -> Result<String, ErrorInfo> {
         self.inner
             .deps
@@ -2239,42 +2290,47 @@ impl Engine {
                 // sequence of KEY=val strings, or absent — dry-apply picks
                 // the shape that splices cleanly; the transaction gates
                 // still validate the final file.
-                let candidates: Vec<Edit> =
-                    if mast_yaml_edit::get_scalar(&source, &scalar_path).is_some() {
-                        vec![Edit::SetScalar { path: scalar_path, value: "'root'".into() }]
-                    } else {
-                        vec![
-                            Edit::InsertMapKey {
-                                path: env_path.clone(),
-                                key: "SUPERVISOR_PHP_USER".into(),
-                                value: "'root'".into(),
-                            },
-                            Edit::InsertSeqItem {
-                                path: env_path,
-                                value: "SUPERVISOR_PHP_USER=root".into(),
-                            },
-                            Edit::InsertMapBlock {
-                                path: vec![key("services"), key(&service)],
-                                key: "environment".into(),
-                                lines: vec!["SUPERVISOR_PHP_USER: 'root'".into()],
-                            },
-                        ]
-                    };
-                let chosen = candidates
-                    .into_iter()
-                    .find(|e| mast_yaml_edit::apply(&source, e).is_ok())
-                    .ok_or_else(|| ErrorInfo::Internal {
-                        message: format!(
-                            "could not add SUPERVISOR_PHP_USER to {service} in the compose file"
-                        ),
-                    })?;
-                self.write_compose(
-                    &invocation,
-                    &file,
-                    &[chosen],
-                    vec![format!("{service}: environment SUPERVISOR_PHP_USER -> root")],
-                )
-                .await?;
+                let file_has = mast_yaml_edit::get_scalar(&source, &scalar_path)
+                    .is_some_and(|v| v.trim_matches(['\'', '"']) == "root");
+                if !file_has {
+                    let candidates: Vec<Edit> =
+                        if mast_yaml_edit::get_scalar(&source, &scalar_path).is_some() {
+                            vec![Edit::SetScalar { path: scalar_path, value: "'root'".into() }]
+                        } else {
+                            vec![
+                                Edit::InsertMapKey {
+                                    path: env_path.clone(),
+                                    key: "SUPERVISOR_PHP_USER".into(),
+                                    value: "'root'".into(),
+                                },
+                                Edit::InsertSeqItem {
+                                    path: env_path,
+                                    value: "SUPERVISOR_PHP_USER=root".into(),
+                                },
+                                Edit::InsertMapBlock {
+                                    path: vec![key("services"), key(&service)],
+                                    key: "environment".into(),
+                                    lines: vec!["SUPERVISOR_PHP_USER: 'root'".into()],
+                                },
+                            ]
+                        };
+                    let chosen = candidates
+                        .into_iter()
+                        .find(|e| mast_yaml_edit::apply(&source, e).is_ok())
+                        .ok_or_else(|| ErrorInfo::Internal {
+                            message: format!(
+                                "could not add SUPERVISOR_PHP_USER to {service} in the \
+                                 compose file"
+                            ),
+                        })?;
+                    self.write_compose(
+                        &invocation,
+                        &file,
+                        &[chosen],
+                        vec![format!("{service}: environment SUPERVISOR_PHP_USER -> root")],
+                    )
+                    .await?;
+                }
                 self.emit_op(
                     handle,
                     op,
