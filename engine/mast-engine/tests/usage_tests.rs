@@ -288,11 +288,6 @@ async fn next_measured_sample(
     }
 }
 
-// ---------- tests ----------
-
-/// The claim that makes this safe to ship on a laptop: measuring the machine
-/// costs CPU, so it must not happen when nobody is looking at the answer.
-
 /// Same skip contract as the other docker-gated suites: these tests run
 /// real containers, so a runner without a usable LINUX docker daemon skips
 /// instead of timing out.
@@ -312,6 +307,10 @@ async fn docker_usable() -> bool {
     .unwrap_or(false)
 }
 
+// ---------- tests ----------
+
+/// The claim that makes this safe to ship on a laptop: measuring the machine
+/// costs CPU, so it must not happen when nobody is looking at the answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_is_sampled_while_nobody_is_subscribed() {
     if !docker_usable().await {
