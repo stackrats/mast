@@ -12,11 +12,11 @@
 
 ### Keep Sail. Lose the juggling.
 
-**A Linux-first desktop control center for Laravel Sail.**
+**A desktop control center for Laravel Sail — Linux, macOS and Windows.**
 
 Manage all your Laravel Sail projects, containers, logs, workers, and development services from one place — without replacing Sail or Docker.
 
-**Linux-first · macOS compatible · Open source**
+**Linux · macOS · Windows · Open source**
 
 [**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
 
@@ -65,13 +65,13 @@ Close Mast and go straight back to the terminal whenever you want.
 
 ## Platform support
 
-| Platform       | Status                                      |
-| -------------- | ------------------------------------------- |
-| 🐧 **Linux**   | **Primary platform — tested and supported** |
-| 🍎 **macOS**   | Compatible                                  |
-| 🪟 **Windows** | Not yet tested                              |
+| Platform       | Status                                                                        |
+| -------------- | ----------------------------------------------------------------------------- |
+| 🐧 **Linux**   | **Primary platform — tested and supported**                                   |
+| 🍎 **macOS**   | **Tested and supported** (unsigned build: right-click → Open on first launch) |
+| 🪟 **Windows** | **Tested and supported** (unsigned installer: SmartScreen warns on first run) |
 
-Mast is cross-platform, but **Linux is the primary development and testing platform**.
+Linux remains the primary development platform; macOS and Windows are field-tested against real Sail projects and ship prebuilt binaries with every release.
 
 ## Requirements
 
@@ -112,15 +112,19 @@ After starting Mast, open **Settings**, add the directories containing your proj
 
 ## macOS
 
-Mast also runs on macOS, although prebuilt macOS releases are not currently provided.
+Download the `.dmg` for your chip (Apple Silicon `aarch64` or Intel `x64`) from the latest release. The build is unsigned: right-click the app and choose **Open** on first launch.
 
-Build Mast from source using the instructions under [Development](#development).
+Works with Docker Desktop, OrbStack and colima — Mast finds the docker CLI even when the app is launched from Finder.
 
 ## Windows
 
-Windows has not yet been tested.
+Download the NSIS installer (`Mast_<version>_x64-setup.exe`) from the latest release. The installer is unsigned: SmartScreen will warn on first run (More info → Run anyway).
 
-Mast is built with cross-platform technologies, but Windows should be considered unsupported until it has been properly tested.
+Requirements and notes:
+
+- **Docker Desktop** (WSL2 backend) — Mast observes containers live over its named pipe and drives Sail projects through `docker compose` directly (the `sail` wrapper is a bash script Windows cannot run; Mast handles the translation, including `sail …` custom commands).
+- Keep projects on a plain local path like `C:\dev\myapp` — OneDrive-synced folders fight bind mounts, and projects living _inside_ WSL2 (`\\wsl$\…`) are not supported yet.
+- Fresh projects created by Mast's wizard are configured for Windows automatically (ports, writable storage, in-container PHP user). For projects created elsewhere, the **Diagnose** button knows the Windows-specific traps and fixes each with one click.
 
 ---
 
