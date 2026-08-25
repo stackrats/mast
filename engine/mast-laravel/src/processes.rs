@@ -171,6 +171,9 @@ mod tests {
 
     /// The real thing, on the host: a decoy process matching the pattern is
     /// killed while the killer survives to exit 0.
+    /// linux-only: the kill script walks /proc (as it does inside the
+    /// container in production); macOS has no /proc to exercise it on.
+    #[cfg(target_os = "linux")]
     #[test]
     fn kill_script_kills_the_target_not_itself() {
         // No exec: sh must stay alive with the marker in its cmdline ($0).

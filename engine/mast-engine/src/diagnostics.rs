@@ -3499,11 +3499,17 @@ mod tests {
 
     #[test]
     fn node_install_on_sail_is_the_line_the_developer_would_type() {
+        // unix-only by design: Windows drives sail projects through compose.
+        #[cfg(not(unix))]
+        return;
+        #[cfg(unix)]
+        {
         let tmp = node_project(&[("package.json", "{}"), ("pnpm-lock.yaml", "")], true);
         let node = mast_project::inspect_node_project(tmp.path()).unwrap();
         let argv = node_install_argv(&invocation(tmp.path()), tmp.path(), node.manager, node.frozen);
         assert!(argv[0].ends_with("vendor/bin/sail"), "{argv:?}");
         assert_eq!(&argv[1..], ["pnpm", "install", "--frozen-lockfile"]);
+        }
     }
 
     #[test]

@@ -254,14 +254,11 @@ mod tests {
         assert!(argv.contains(&"debug".to_string()));
         assert_eq!(&argv[argv.len() - 2..], ["up", "-d"]);
         // Bare compose gets the wrapper's WWWUSER/WWWGROUP exports mirrored
-        // (ADR-0001 finding 9) — nothing pins them here, so both are filled.
-        #[cfg(unix)]
-        {
-            let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-            assert_eq!(keys, ["WWWUSER", "WWWGROUP"], "{env:?}");
-        }
-        #[cfg(not(unix))]
-        assert!(env.is_empty());
+        // (ADR-0001 finding 9) on EVERY platform — nothing pins them here,
+        // so both are filled (0/0 off unix, where uid parity is moot but the
+        // interpolations must not go empty).
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["WWWUSER", "WWWGROUP"], "{env:?}");
     }
 
     /// A value the developer pinned in `.env` beats the uid/gid default,
@@ -315,6 +312,8 @@ mod tests {
         );
     }
 
+    /// unix-only by design: Windows never picks the sail-script runner.
+    #[cfg(unix)]
     #[test]
     fn sail_argv_uses_the_script_without_skip_checks() {
         let tmp = tempfile::tempdir().unwrap();
