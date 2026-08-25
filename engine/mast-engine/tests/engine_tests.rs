@@ -249,7 +249,11 @@ fn make_project(dir: &Path, name: &str) -> std::path::PathBuf {
         "services:\n  app:\n    image: alpine:latest\n",
     )
     .unwrap();
-    project
+    // Canonical (and verbatim-stripped) so the fake observations built from
+    // this path match what the engine records: Windows hands out the temp
+    // dir in 8.3 short form (RUNNER~1), the engine canonicalizes to the
+    // long form, and association compares path strings.
+    mast_compose::strip_verbatim(project.canonicalize().unwrap())
 }
 
 fn observation(project_name: &str, project_dir: &Path, service: &str, state: &str) -> ContainerObservation {
@@ -1322,6 +1326,8 @@ async fn env_report_and_env_edits_flow() {
     assert!(std::fs::read_dir(&backups).unwrap().count() >= 1);
 }
 
+/// unix-only: the ownership lock is fail-open on Windows until LockFileEx (documented).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn read_only_engine_refuses_mutations_but_still_observes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1346,6 +1352,8 @@ async fn read_only_engine_refuses_mutations_but_still_observes() {
     assert!(engine.dispatch(Action::RefreshNow).is_ok());
 }
 
+/// unix-only: the app-key repair is unix-only for now (documented degradation).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let tmp = tempfile::tempdir().unwrap();
