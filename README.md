@@ -12,11 +12,11 @@
 
 ### Keep Sail. Lose the juggling.
 
-**A desktop control center for Laravel Sail — Linux, macOS and Windows.**
+**A Linux-first desktop control center for Laravel Sail — now also at home on macOS and Windows.**
 
 Manage all your Laravel Sail projects, containers, logs, workers, and development services from one place — without replacing Sail or Docker.
 
-**Linux · macOS · Windows · Open source**
+**Linux-first · macOS & Windows supported · Open source**
 
 [**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
 
@@ -71,7 +71,7 @@ Close Mast and go straight back to the terminal whenever you want.
 | 🍎 **macOS**   | **Tested and supported** (unsigned build: see the first-launch note below)    |
 | 🪟 **Windows** | **Tested and supported** (unsigned installer: SmartScreen warns on first run) |
 
-Linux remains the primary development platform; macOS and Windows are field-tested against real Sail projects and ship prebuilt binaries with every release.
+Mast is Linux-first: Linux is the primary development and testing platform. macOS and Windows are fully supported — field-tested against real Sail projects, with prebuilt binaries in every release.
 
 ## Requirements
 
