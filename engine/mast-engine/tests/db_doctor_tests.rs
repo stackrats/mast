@@ -31,7 +31,20 @@ async fn preconditions_met() -> bool {
     if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
         return false;
     }
-    let docker = sh(&["docker", "info"], None).await.success();
+    // NOT through `sh` — that helper unwraps the spawn, and a runner with no
+    // docker binary at all must skip, not panic. A LINUX daemon specifically:
+    // Windows runners carry docker in Windows-containers mode, where every
+    // linux-image test would fail at pull instead of skipping.
+    let docker = mast_docker::run_command(
+        &["docker".into(), "info".into(), "--format".into(), "{{.OSType}}".into()],
+        None,
+        &[],
+        Duration::from_secs(10),
+        16 * 1024,
+    )
+    .await
+    .map(|o| o.success() && o.stdout.trim() == "linux")
+    .unwrap_or(false);
     docker && sh(&["docker", "image", "inspect", IMAGE], None).await.success()
 }
 
