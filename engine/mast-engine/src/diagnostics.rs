@@ -875,17 +875,27 @@ impl Engine {
                 }
                 let Some(invocation) = invocations.get(&facts.id) else { continue };
                 // Fixed constant interpreted inside the container (plan §4:
-                // host-side stays a pure argv array).
+                // host-side stays a pure argv array). A REAL write attempt,
+                // not `[ -w ]`: permission bits lie on Windows bind mounts,
+                // and an exec running as root sees writable where PHP's user
+                // does not — the field case that sailed past the first
+                // version of this probe.
                 const WRITABLE_PROBE: &str = "for d in storage/framework/cache \
                      storage/framework/sessions storage/framework/views storage/logs \
-                     bootstrap/cache; do if [ ! -d \"$d\" ] || [ ! -w \"$d\" ]; then \
-                     echo \"$d\"; fi; done";
-                let tail: Vec<String> = ["sh", "-c", WRITABLE_PROBE].map(String::from).to_vec();
-                let argv = crate::project_ops::compose_exec_argv(
-                    invocation,
-                    &facts.app_service,
-                    &tail,
-                );
+                     bootstrap/cache; do if ! touch \"$d/.mast-write-probe\" 2>/dev/null; \
+                     then echo \"$d\"; else rm -f \"$d/.mast-write-probe\"; fi; done";
+                // Probe as the user PHP actually runs as, when `.env` names
+                // one — root's success proves nothing about sail's.
+                let mut tail: Vec<String> = vec!["exec".into(), "-T".into()];
+                if let Some(user) = facts.wwwuser.as_deref().map(str::trim).filter(|u| !u.is_empty())
+                {
+                    tail.push("-u".into());
+                    tail.push(user.to_string());
+                }
+                tail.push(facts.app_service.clone());
+                tail.extend(["sh", "-c", WRITABLE_PROBE].map(String::from));
+                let refs: Vec<&str> = tail.iter().map(String::as_str).collect();
+                let (argv, _env) = crate::db_repair::scoped_compose_argv(invocation, &refs);
                 if let Ok(out) =
                     run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
                         .await
@@ -2122,9 +2132,12 @@ impl Engine {
                     (invocation, entry.record.path.clone())
                 };
                 // Fixed constant interpreted inside the container (plan §4).
+                // `a+rwX`, not `ug`: the dirs may be root-created while PHP
+                // runs as the sail user — the sail-documented remedy for
+                // exactly this state.
                 const MAKE_WRITABLE: &str = "mkdir -p storage/framework/cache/data \
                      storage/framework/sessions storage/framework/views storage/logs \
-                     bootstrap/cache && chmod -R ug+rwX storage bootstrap/cache && \
+                     bootstrap/cache && chmod -R a+rwX storage bootstrap/cache && \
                      echo 'writable directories ready'";
                 let service = crate::project_ops::app_service_of(&path);
                 let tail: Vec<String> = ["sh", "-c", MAKE_WRITABLE].map(String::from).to_vec();

@@ -376,19 +376,70 @@ impl Engine {
             );
             let env_path = target.join(".env");
             let backups = self.inner.deps.store.backups_dir();
-            tokio::task::spawn_blocking({
+            let fixed_url = tokio::task::spawn_blocking({
                 let app_service = app_service.clone();
-                move || {
+                let target = target.clone();
+                move || -> Result<Option<String>, mast_laravel::EnvWriteError> {
+                    // A born project must come out healthy — the doctors are
+                    // for drift, not for the wizard's own output:
+                    // (1) Laravel's writable directories, unconditionally —
+                    // scaffolding through a containerized composer over a
+                    // bind mount has arrived without them (the tempnam-500
+                    // field case), and create_dir_all is free when they
+                    // already exist.
+                    for dir in [
+                        "storage/framework/cache/data",
+                        "storage/framework/sessions",
+                        "storage/framework/views",
+                        "storage/logs",
+                        "bootstrap/cache",
+                    ] {
+                        let _ = std::fs::create_dir_all(target.join(dir));
+                    }
+                    let mut fixed_url = None;
                     mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
+                        // (2) An APP_URL pinning a port sail will not publish
+                        // (installers write :8000, `artisan serve`'s default;
+                        // sail publishes ${APP_PORT:-80}) — the Browser
+                        // button would open a refused connection on first
+                        // click.
+                        if let Some(url) = f.get("APP_URL").map(|e| e.value.clone())
+                            && let Some(from) = mast_laravel::explicit_port(&url)
+                        {
+                            let app_port = f
+                                .get("APP_PORT")
+                                .and_then(|e| e.value.trim().parse::<u16>().ok())
+                                .unwrap_or(80);
+                            if from != app_port
+                                && let Some(to) =
+                                    mast_laravel::rewrite_explicit_port(&url, from, app_port)
+                            {
+                                f.set("APP_URL", &to)?;
+                                fixed_url = Some(to);
+                            }
+                        }
                         f.set("APP_SERVICE", &app_service)?;
                         f.set("WWWUSER", &uid.to_string())?;
                         f.set("WWWGROUP", &gid.to_string())
-                    })
+                    })?;
+                    Ok(fixed_url)
                 }
             })
             .await
             .map_err(internal_err)?
             .map_err(crate::env_write_error)?;
+            if let Some(to) = fixed_url {
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!(
+                            "APP_URL pointed at a port sail does not publish — set to {to}"
+                        ),
+                        stderr: false,
+                    },
+                );
+            }
 
             self.rename_service(handle, op, &target, SAIL_APP_SERVICE, &app_service).await
         }
