@@ -2095,9 +2095,18 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
 
     let env = std::fs::read_to_string(project.join(".env")).unwrap();
     assert!(!env.contains(&format!("APP_PORT={busy}")), "the busy port survived: {env}");
-    assert!(env.contains(&format!("APP_PORT={}", busy + 1)), "{env}");
+    // Not "busy + 1": Windows hands out ephemeral ports sequentially, so a
+    // parallel test's listener routinely holds the neighbor and the remap
+    // rightly skips further. The contract is "moved somewhere free, URL
+    // followed", not any particular number.
+    let new_port = env
+        .lines()
+        .find_map(|l| l.strip_prefix("APP_PORT="))
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("APP_PORT missing after the move: {env}"));
+    assert_ne!(new_port, busy, "{env}");
     // The pinned APP_URL followed the move.
-    assert!(env.contains(&format!("APP_URL=http://localhost:{}", busy + 1)), "{env}");
+    assert!(env.contains(&format!("APP_URL=http://localhost:{new_port}")), "{env}");
     // Untouched keys keep their bytes.
     assert!(env.contains("APP_KEY=base64:x"), "{env}");
     let moved = moved_line.expect("the move is reported in the operation output");
