@@ -400,22 +400,32 @@ impl Engine {
                     mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
                         // (2) An APP_URL pinning a port sail will not publish
                         // (installers write :8000, `artisan serve`'s default;
-                        // sail publishes ${APP_PORT:-80}) — the Browser
-                        // button would open a refused connection on first
-                        // click.
+                        // sail publishes ${APP_PORT:-80}). Honor the URL:
+                        // publish where it points — :80 is a collision magnet
+                        // on dev machines, and the port preflight remaps
+                        // APP_PORT (dragging APP_URL along) if another
+                        // project claims it. Only when APP_PORT is already
+                        // pinned elsewhere does the URL follow the port.
                         if let Some(url) = f.get("APP_URL").map(|e| e.value.clone())
                             && let Some(from) = mast_laravel::explicit_port(&url)
                         {
-                            let app_port = f
-                                .get("APP_PORT")
-                                .and_then(|e| e.value.trim().parse::<u16>().ok())
-                                .unwrap_or(80);
-                            if from != app_port
-                                && let Some(to) =
-                                    mast_laravel::rewrite_explicit_port(&url, from, app_port)
+                            match f.get("APP_PORT").and_then(|e| e.value.trim().parse::<u16>().ok())
                             {
-                                f.set("APP_URL", &to)?;
-                                fixed_url = Some(to);
+                                None => {
+                                    f.set("APP_PORT", &from.to_string())?;
+                                    fixed_url =
+                                        Some(format!("APP_PORT={from} (publishing where \
+                                                      APP_URL points)"));
+                                }
+                                Some(app_port) if app_port != from => {
+                                    if let Some(to) =
+                                        mast_laravel::rewrite_explicit_port(&url, from, app_port)
+                                    {
+                                        f.set("APP_URL", &to)?;
+                                        fixed_url = Some(format!("APP_URL={to}"));
+                                    }
+                                }
+                                Some(_) => {}
                             }
                         }
                         f.set("APP_SERVICE", &app_service)?;
@@ -428,14 +438,12 @@ impl Engine {
             .await
             .map_err(internal_err)?
             .map_err(crate::env_write_error)?;
-            if let Some(to) = fixed_url {
+            if let Some(change) = fixed_url {
                 self.emit_op(
                     handle,
                     op,
                     OperationEventKind::Output {
-                        line: format!(
-                            "APP_URL pointed at a port sail does not publish — set to {to}"
-                        ),
+                        line: format!("reconciled the app URL and port: set {change}"),
                         stderr: false,
                     },
                 );

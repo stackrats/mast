@@ -10,7 +10,7 @@ use crate::{
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
     REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS,
     REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK, REPAIR_STORAGE_WRITABLE,
+    REPAIR_PHP_AS_ROOT, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK, REPAIR_STORAGE_WRITABLE,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -1259,22 +1259,45 @@ impl Check for StorageUnwritable {
             .iter()
             .filter(|p| !p.unwritable_paths.is_empty())
             .map(|p| {
-                let mut f = finding(
-                    self.id(),
-                    Severity::Error,
-                    format!("{}: Laravel's writable directories are broken", p.name),
-                    format!(
-                        "Inside the app container, {} {} missing or not writable. Blade \
-                         compilation, cache and session writes fail there — the classic \
-                         symptom is a 500 on every page with \"tempnam(): file created \
-                         in the system's temporary directory\", while every container \
-                         looks healthy. The repair recreates them and opens permissions, \
-                         inside the container.",
-                        p.unwritable_paths.join(", "),
-                        if p.unwritable_paths.len() == 1 { "is" } else { "are" },
-                    ),
-                );
-                f.repair = repair_spec(REPAIR_STORAGE_WRITABLE, None);
+                let user = p.php_user.as_deref().unwrap_or("sail");
+                let f = if p.writable_as_root {
+                    let mut f = finding(
+                        self.id(),
+                        Severity::Error,
+                        format!("{}: PHP's user cannot write the project files", p.name),
+                        format!(
+                            "Writes to {} fail as `{user}` (the user PHP runs as) but \
+                             succeed as root — the bind-mount ownership trap, where \
+                             chmod is silently ignored. Every page 500s with \
+                             \"tempnam(): file created in the system's temporary \
+                             directory\" while the containers look healthy. The \
+                             supported answer is sail's own knob: run PHP as root \
+                             inside the container.",
+                            p.unwritable_paths.join(", "),
+                        ),
+                    );
+                    f.repair = repair_spec(REPAIR_PHP_AS_ROOT, None);
+                    f
+                } else {
+                    let mut f = finding(
+                        self.id(),
+                        Severity::Error,
+                        format!("{}: Laravel's writable directories are broken", p.name),
+                        format!(
+                            "Inside the app container, {} {} missing or not writable. \
+                             Blade compilation, cache and session writes fail there — \
+                             the classic symptom is a 500 on every page with \
+                             \"tempnam(): file created in the system's temporary \
+                             directory\", while every container looks healthy. The \
+                             repair recreates them and opens permissions, inside the \
+                             container.",
+                            p.unwritable_paths.join(", "),
+                            if p.unwritable_paths.len() == 1 { "is" } else { "are" },
+                        ),
+                    );
+                    f.repair = repair_spec(REPAIR_STORAGE_WRITABLE, None);
+                    f
+                };
                 for_project(f, p)
             })
             .collect()
@@ -1970,6 +1993,8 @@ mod tests {
             detached_services: Vec::new(),
             app_reachability: None,
             unwritable_paths: Vec::new(),
+            php_user: None,
+            writable_as_root: false,
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
@@ -2499,6 +2524,19 @@ mod tests {
         let repair = f.repair.as_ref().unwrap();
         assert_eq!(repair.id, REPAIR_FIX_APP_URL);
         assert_eq!(repair.risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn ownership_trap_offers_php_as_root_instead_of_chmod() {
+        let mut p = sail_project("shop");
+        p.running = true;
+        p.unwritable_paths = vec!["storage/framework/views".into()];
+        p.writable_as_root = true;
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "storage-unwritable").unwrap();
+        assert!(f.title.contains("PHP's user cannot write"), "{}", f.title);
+        assert!(f.detail.contains("as `sail`"), "{}", f.detail);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_PHP_AS_ROOT);
     }
 
     #[test]

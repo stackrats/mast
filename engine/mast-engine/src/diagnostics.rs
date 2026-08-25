@@ -21,7 +21,7 @@ use mast_diagnostics::{
     REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
-    REPAIR_STORAGE_WRITABLE,
+    REPAIR_PHP_AS_ROOT, REPAIR_STORAGE_WRITABLE,
 };
 use mast_docker::run_command;
 
@@ -356,6 +356,11 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             .unwrap_or_else(|| "laravel.test".to_string()),
         app_reachability: None, // filled by the gather probe
         unwritable_paths: Vec::new(), // filled by the gather probe
+        php_user: env
+            .get("SUPERVISOR_PHP_USER")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        writable_as_root: false, // filled by the gather probe
         vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
             .ok()
             .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
@@ -884,30 +889,79 @@ impl Engine {
                      storage/framework/sessions storage/framework/views storage/logs \
                      bootstrap/cache; do if ! touch \"$d/.mast-write-probe\" 2>/dev/null; \
                      then echo \"$d\"; else rm -f \"$d/.mast-write-probe\"; fi; done";
-                // Probe as the user PHP actually runs as, when `.env` names
-                // one — root's success proves nothing about sail's.
-                let mut tail: Vec<String> = vec!["exec".into(), "-T".into()];
-                if let Some(user) = facts.wwwuser.as_deref().map(str::trim).filter(|u| !u.is_empty())
-                {
-                    tail.push("-u".into());
-                    tail.push(user.to_string());
-                }
-                tail.push(facts.app_service.clone());
-                tail.extend(["sh", "-c", WRITABLE_PROBE].map(String::from));
-                let refs: Vec<&str> = tail.iter().map(String::as_str).collect();
-                let (argv, _env) = crate::db_repair::scoped_compose_argv(invocation, &refs);
-                if let Ok(out) =
-                    run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                // Probe as the user PHP ACTUALLY runs as: sail's supervisor
+                // knob (default "sail"), NOT WWWUSER — a failed
+                // `usermod -u $WWWUSER` leaves the sail user at its image
+                // default, and root's success proves nothing about sail's.
+                let probe_as = |user: Option<String>| {
+                    let mut tail: Vec<String> = vec!["exec".into(), "-T".into()];
+                    if let Some(user) = user {
+                        tail.push("-u".into());
+                        tail.push(user);
+                    }
+                    tail.push(facts.app_service.clone());
+                    tail.extend(["sh", "-c", WRITABLE_PROBE].map(String::from));
+                    let refs: Vec<&str> = tail.iter().map(String::as_str).collect();
+                    crate::db_repair::scoped_compose_argv(invocation, &refs).0
+                };
+                let php_user =
+                    facts.php_user.clone().unwrap_or_else(|| "sail".to_string());
+                let argv = probe_as(Some(php_user));
+                let broken: Option<Vec<String>> =
+                    match run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
                         .await
-                    && out.success()
-                {
-                    facts.unwritable_paths = out
-                        .stdout
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect();
+                    {
+                        Ok(out) if out.success() => Some(
+                            out.stdout
+                                .lines()
+                                .map(|l| l.trim().to_string())
+                                .filter(|l| !l.is_empty())
+                                .collect(),
+                        ),
+                        // The exec itself failed (custom image without the
+                        // sail user, say): fall back to the container's
+                        // default user rather than claiming anything.
+                        _ => {
+                            let argv = probe_as(None);
+                            run_command(
+                                &argv,
+                                Some(&invocation.project_dir),
+                                &[],
+                                PROBE_TIMEOUT,
+                                PROBE_CAP,
+                            )
+                            .await
+                            .ok()
+                            .filter(|out| out.success())
+                            .map(|out| {
+                                out.stdout
+                                    .lines()
+                                    .map(|l| l.trim().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .collect()
+                            })
+                        }
+                    };
+                let Some(broken) = broken else { continue };
+                if !broken.is_empty() {
+                    // Root cross-probe: writes that work as root but not as
+                    // PHP's user are the bind-mount ownership trap — chmod
+                    // is a silent no-op there and the repair is sail's
+                    // SUPERVISOR_PHP_USER=root knob instead.
+                    let argv = probe_as(None);
+                    facts.writable_as_root = run_command(
+                        &argv,
+                        Some(&invocation.project_dir),
+                        &[],
+                        PROBE_TIMEOUT,
+                        PROBE_CAP,
+                    )
+                    .await
+                    .ok()
+                    .filter(|out| out.success())
+                    .is_some_and(|out| out.stdout.trim().is_empty());
                 }
+                facts.unwritable_paths = broken;
             }
             // Volume-vs-image version scan — deliberately including stopped
             // projects: the point is warning before the crash-loop.
@@ -1369,6 +1423,27 @@ impl Engine {
                     repair: offer,
                     file_preview: None,
                     no_op: false,
+                })
+            }
+            REPAIR_PHP_AS_ROOT => {
+                let project = self.require_project(project)?;
+                let path = self.project_path(project)?;
+                let already = mast_compose::parse_env_file(&path.join(".env"))
+                    .get("SUPERVISOR_PHP_USER")
+                    .is_some_and(|v| v.trim() == "root");
+                Ok(RepairPlan {
+                    summary: if already {
+                        vec!["SUPERVISOR_PHP_USER is already root — nothing to do".into()]
+                    } else {
+                        vec![
+                            "set SUPERVISOR_PHP_USER=root in .env (sail's own knob)".into(),
+                            "recreate the app service so supervisord picks it up".into(),
+                            "container-only: nothing on the host changes".into(),
+                        ]
+                    },
+                    repair: offer,
+                    file_preview: None,
+                    no_op: already,
                 })
             }
             REPAIR_STORAGE_WRITABLE => {
@@ -2117,6 +2192,55 @@ impl Engine {
                 } else {
                     Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
                 }
+            }
+            REPAIR_PHP_AS_ROOT => {
+                let project = self.require_project(project)?;
+                let (invocation, path, redactor) = {
+                    let st = self.inner.state.lock().unwrap();
+                    let entry = st.projects.get(&project.0).ok_or(ErrorInfo::NotFound {
+                        what: format!("project {}", project.0),
+                    })?;
+                    let invocation =
+                        entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+                            message: "the project's compose invocation is not resolved".into(),
+                        })?;
+                    (invocation, entry.record.path.clone(), entry.redactor.clone())
+                };
+                let backups = self.inner.deps.store.backups_dir();
+                {
+                    let env_path = path.join(".env");
+                    tokio::task::spawn_blocking(move || {
+                        mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
+                            f.set("SUPERVISOR_PHP_USER", "root")
+                        })
+                    })
+                    .await
+                    .map_err(crate::internal_err)?
+                    .map_err(crate::env_write_error)?;
+                }
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "set SUPERVISOR_PHP_USER=root — recreating the app service".into(),
+                        stderr: false,
+                    },
+                );
+                let service = crate::project_ops::app_service_of(&path);
+                let tail: Vec<&str> =
+                    vec!["up", "-d", "--force-recreate", "--no-deps", &service];
+                let (argv, _env) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&path),
+                    &redactor,
+                    Duration::from_secs(10 * 60),
+                )
+                .await?;
+                self.hint();
+                Ok(())
             }
             REPAIR_STORAGE_WRITABLE => {
                 let project = self.require_project(project)?;
