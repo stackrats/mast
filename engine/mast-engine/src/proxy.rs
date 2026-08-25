@@ -60,6 +60,30 @@ pub(crate) fn privileged_shell_argv(script: &str) -> Vec<String> {
     if cfg!(target_os = "macos") { osascript_admin_argv(script) } else { pkexec_argv(script) }
 }
 
+/// Windows elevation: UAC can only launch a program, not a shell string, so
+/// the privileged work lives in a generated `.cmd` that an elevated console
+/// runs. `-Wait -PassThru` + `exit $p.ExitCode` propagate the script's
+/// errorlevel (a declined prompt raises in PowerShell and exits non-zero);
+/// callers still verify the effect afterwards — trust the state, not the
+/// exit code.
+pub(crate) fn windows_elevated_cmd(lines: &[String]) -> std::io::Result<Vec<String>> {
+    let dir = std::env::temp_dir().join("mast-elevate");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("mast-elevated.cmd");
+    std::fs::write(&path, format!("@echo off\r\n{}\r\n", lines.join("\r\n")))?;
+    // PowerShell single-quoted string: double any apostrophe in the path.
+    let file = path.to_string_lossy().replace('\'', "''");
+    Ok(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!(
+            "$p = Start-Process -FilePath '{file}' -Verb RunAs -Wait -PassThru \
+             -WindowStyle Hidden; exit $p.ExitCode"
+        ),
+    ])
+}
+
 /// Is a binary reachable through `PATH`?
 pub(crate) fn on_path(binary: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
@@ -90,6 +114,8 @@ pub(crate) fn certutil_install_script() -> Option<(&'static str, String)> {
 pub(crate) fn elevation_note() -> &'static str {
     if cfg!(target_os = "macos") {
         "asks for your password (macOS administrator privileges)"
+    } else if cfg!(windows) {
+        "asks for elevation via UAC (the Windows administrator prompt)"
     } else {
         "asks for elevation via polkit (pkexec)"
     }
@@ -558,6 +584,26 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The UAC wrapper is pure argv+file construction, so its shape is
+    /// provable everywhere: the generated .cmd carries the lines verbatim
+    /// and the PowerShell command propagates the exit code.
+    #[test]
+    fn windows_elevation_wraps_a_generated_cmd_with_exit_propagation() {
+        let argv = windows_elevated_cmd(&[
+            "echo 127.0.0.1\thoo.test\t# mast local domain>>C:\\hosts".to_string(),
+            "ipconfig /flushdns".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(argv[0], "powershell");
+        assert!(argv[3].contains("-Verb RunAs"), "{}", argv[3]);
+        assert!(argv[3].contains("exit $p.ExitCode"), "{}", argv[3]);
+        let cmd = std::env::temp_dir().join("mast-elevate/mast-elevated.cmd");
+        let body = std::fs::read_to_string(cmd).unwrap();
+        assert!(body.starts_with("@echo off\r\n"), "{body}");
+        assert!(body.contains("hoo.test"), "{body}");
+        assert!(body.contains("ipconfig /flushdns"), "{body}");
+    }
 
     #[test]
     fn domain_validation_admits_test_names_and_nothing_odd() {
