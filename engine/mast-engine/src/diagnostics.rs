@@ -21,6 +21,7 @@ use mast_diagnostics::{
     REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_STORAGE_WRITABLE,
 };
 use mast_docker::run_command;
 
@@ -354,6 +355,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
             .cloned()
             .unwrap_or_else(|| "laravel.test".to_string()),
         app_reachability: None, // filled by the gather probe
+        unwritable_paths: Vec::new(), // filled by the gather probe
         vite_hot: std::fs::read_to_string(seed.path.join("public/hot"))
             .ok()
             .and_then(|contents| mast_laravel::vite::parse_hot_file(&contents))
@@ -861,6 +863,42 @@ impl Engine {
                 facts.app_reachability =
                     Some(mast_diagnostics::AppReachability { host_port, host_ok, inner_ok });
             }
+            // Writability doctor: Blade compilation, cache and session
+            // writes land in storage/* — one missing or read-only directory
+            // 500s every page (tempnam falls back to the system temp dir and
+            // Laravel's strict handler turns the notice fatal) while every
+            // chip stays green. Probed INSIDE the container: host-side
+            // permissions say nothing about what the app's user can write.
+            for (facts, _) in &mut inspected {
+                if !facts.running || !facts.sail_flavored {
+                    continue;
+                }
+                let Some(invocation) = invocations.get(&facts.id) else { continue };
+                // Fixed constant interpreted inside the container (plan §4:
+                // host-side stays a pure argv array).
+                const WRITABLE_PROBE: &str = "for d in storage/framework/cache \
+                     storage/framework/sessions storage/framework/views storage/logs \
+                     bootstrap/cache; do if [ ! -d \"$d\" ] || [ ! -w \"$d\" ]; then \
+                     echo \"$d\"; fi; done";
+                let tail: Vec<String> = ["sh", "-c", WRITABLE_PROBE].map(String::from).to_vec();
+                let argv = crate::project_ops::compose_exec_argv(
+                    invocation,
+                    &facts.app_service,
+                    &tail,
+                );
+                if let Ok(out) =
+                    run_command(&argv, Some(&invocation.project_dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                        .await
+                    && out.success()
+                {
+                    facts.unwritable_paths = out
+                        .stdout
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                }
+            }
             // Volume-vs-image version scan — deliberately including stopped
             // projects: the point is warning before the crash-loop.
             let mut version_issues = crate::db_repair::scan_db_versions(&db_metas).await;
@@ -1318,6 +1356,22 @@ impl Engine {
                 })?;
                 Ok(RepairPlan {
                     summary: vec![format!("run: docker network create {net}")],
+                    repair: offer,
+                    file_preview: None,
+                    no_op: false,
+                })
+            }
+            REPAIR_STORAGE_WRITABLE => {
+                let project = self.require_project(project)?;
+                self.project_path(project)?;
+                Ok(RepairPlan {
+                    summary: vec![
+                        "inside the app container: mkdir -p storage/framework/{cache/data,\
+                         sessions,views} storage/logs bootstrap/cache"
+                            .into(),
+                        "then chmod -R ug+rwX storage bootstrap/cache".into(),
+                        "the project must be running".into(),
+                    ],
                     repair: offer,
                     file_preview: None,
                     no_op: false,
@@ -2053,6 +2107,49 @@ impl Engine {
                 } else {
                     Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
                 }
+            }
+            REPAIR_STORAGE_WRITABLE => {
+                let project = self.require_project(project)?;
+                let (invocation, path) = {
+                    let st = self.inner.state.lock().unwrap();
+                    let entry = st.projects.get(&project.0).ok_or(ErrorInfo::NotFound {
+                        what: format!("project {}", project.0),
+                    })?;
+                    let invocation =
+                        entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
+                            message: "the project's compose invocation is not resolved".into(),
+                        })?;
+                    (invocation, entry.record.path.clone())
+                };
+                // Fixed constant interpreted inside the container (plan §4).
+                const MAKE_WRITABLE: &str = "mkdir -p storage/framework/cache/data \
+                     storage/framework/sessions storage/framework/views storage/logs \
+                     bootstrap/cache && chmod -R ug+rwX storage bootstrap/cache && \
+                     echo 'writable directories ready'";
+                let service = crate::project_ops::app_service_of(&path);
+                let tail: Vec<String> = ["sh", "-c", MAKE_WRITABLE].map(String::from).to_vec();
+                let argv = crate::project_ops::compose_exec_argv(&invocation, &service, &tail);
+                let out = run_command(&argv, Some(&path), &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !out.success() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: format!(
+                            "could not fix the directories inside the app container — the \
+                             project must be running ({})",
+                            out.stderr.trim().lines().last().unwrap_or("exec failed")
+                        ),
+                    });
+                }
+                for line in out.stdout.lines().filter(|l| !l.trim().is_empty()) {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output { line: line.to_string(), stderr: false },
+                    );
+                }
+                self.hint();
+                Ok(())
             }
             REPAIR_DISCONNECT_STALE => {
                 let packed = arg.ok_or_else(|| ErrorInfo::InvalidInput {
