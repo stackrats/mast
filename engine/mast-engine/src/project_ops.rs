@@ -449,7 +449,8 @@ impl Engine {
                 );
             }
 
-            self.rename_service(handle, op, &target, SAIL_APP_SERVICE, &app_service).await
+            self.rename_service(handle, op, &target, SAIL_APP_SERVICE, &app_service).await?;
+            self.force_php_root_for_windows(handle, op, &target, &app_service).await
         }
         .await;
         self.discard_scaffold_on_error(handle, op, &target, scaffold).await?;
@@ -512,6 +513,80 @@ impl Engine {
     /// by `docker compose`, backed up, refused on an external edit). Used on
     /// the freshly scaffolded project, which is not imported yet, so the
     /// invocation is resolved straight from the directory.
+    /// Windows bind mounts hand every project file to root and silently
+    /// ignore chmod, so the sail user PHP runs as can never write storage/ —
+    /// a fresh project 500s on its first page ("tempnam(): file created in
+    /// the system's temporary directory"). Bake sail's own answer in at
+    /// birth: SUPERVISOR_PHP_USER=root through the compose file (the stub
+    /// does not forward it from `.env`). Runtime-gated so a project born on
+    /// Windows is immune; elsewhere the uid/gid parity story already works.
+    async fn force_php_root_for_windows(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        dir: &Path,
+        service: &str,
+    ) -> Result<(), ErrorInfo> {
+        if !cfg!(windows) {
+            return Ok(());
+        }
+        let env = self.inner.deps.process_env.clone();
+        let invocation = tokio::task::spawn_blocking({
+            let dir = dir.to_path_buf();
+            move || mast_compose::resolve_invocation(&dir, &env)
+        })
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+        let file = invocation
+            .files
+            .first()
+            .map(|f| f.path.clone())
+            .ok_or(ErrorInfo::Internal { message: "invocation has no files".into() })?;
+        let source = std::fs::read_to_string(&file).map_err(internal_err)?;
+        use mast_yaml_edit::{Edit, key};
+        let env_path = vec![key("services"), key(service), key("environment")];
+        let candidates = vec![
+            Edit::InsertMapKey {
+                path: env_path.clone(),
+                key: "SUPERVISOR_PHP_USER".into(),
+                value: "'root'".into(),
+            },
+            Edit::InsertSeqItem { path: env_path, value: "SUPERVISOR_PHP_USER=root".into() },
+            Edit::InsertMapBlock {
+                path: vec![key("services"), key(service)],
+                key: "environment".into(),
+                lines: vec!["SUPERVISOR_PHP_USER: 'root'".into()],
+            },
+        ];
+        let Some(chosen) =
+            candidates.into_iter().find(|e| mast_yaml_edit::apply(&source, e).is_ok())
+        else {
+            // Non-fatal: the writability doctor and its repair catch this
+            // after the first start.
+            return Ok(());
+        };
+        self.write_compose(
+            &invocation,
+            &file,
+            &[chosen],
+            vec![format!("{service}: environment SUPERVISOR_PHP_USER -> root")],
+        )
+        .await?;
+        self.emit_op(
+            handle,
+            op,
+            OperationEventKind::Output {
+                line: format!(
+                    "{service}: PHP runs as root in-container — Windows bind mounts are \
+                     root-owned and ignore chmod"
+                ),
+                stderr: false,
+            },
+        );
+        Ok(())
+    }
+
     async fn rename_service(
         &self,
         handle: &Arc<OpHandle>,
