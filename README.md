@@ -12,11 +12,11 @@
 
 ### Keep Sail. Lose the juggling.
 
-**A desktop control center for Laravel Sail — Linux, macOS and Windows.**
+**A Linux-first desktop control center for Laravel Sail — now also at home on macOS and Windows.**
 
 Manage all your Laravel Sail projects, containers, logs, workers, and development services from one place — without replacing Sail or Docker.
 
-**Linux · macOS · Windows · Open source**
+**Linux-first · macOS & Windows supported · Open source**
 
 [**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
 
@@ -68,10 +68,10 @@ Close Mast and go straight back to the terminal whenever you want.
 | Platform       | Status                                                                        |
 | -------------- | ----------------------------------------------------------------------------- |
 | 🐧 **Linux**   | **Primary platform — tested and supported**                                   |
-| 🍎 **macOS**   | **Tested and supported** (unsigned build: right-click → Open on first launch) |
+| 🍎 **macOS**   | **Tested and supported** (unsigned build: see the first-launch note below)    |
 | 🪟 **Windows** | **Tested and supported** (unsigned installer: SmartScreen warns on first run) |
 
-Linux remains the primary development platform; macOS and Windows are field-tested against real Sail projects and ship prebuilt binaries with every release.
+Mast is Linux-first: Linux is the primary development and testing platform. macOS and Windows are fully supported — field-tested against real Sail projects, with prebuilt binaries in every release.
 
 ## Requirements
 
@@ -112,7 +112,14 @@ After starting Mast, open **Settings**, add the directories containing your proj
 
 ## macOS
 
-Download the `.dmg` for your chip (Apple Silicon `aarch64` or Intel `x64`) from the latest release. The build is unsigned: right-click the app and choose **Open** on first launch.
+Download the `.dmg` for your chip (Apple Silicon `aarch64` or Intel `x64`) from the latest release, open it, and drag **Mast** into **Applications** as normal.
+
+The build is unsigned, so the first launch is a two-step dance with Gatekeeper:
+
+1. Open Mast — macOS warns that it cannot verify the app and refuses to open it.
+2. Go to **System Settings → Privacy & Security**, scroll down to the note about Mast being blocked, and click **Open Anyway** — then confirm in the dialog.
+
+macOS remembers the choice; every later launch is normal.
 
 Works with Docker Desktop, OrbStack and colima — Mast finds the docker CLI even when the app is launched from Finder.
 

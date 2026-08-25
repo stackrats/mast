@@ -108,12 +108,26 @@ mod tests {
         let first = acquire_ownership(dir.clone());
         assert!(!first.is_read_only());
 
-        let second = acquire_ownership(dir.clone());
-        assert!(second.is_read_only());
-        assert_eq!(second.owner_pid(), Some(std::process::id()));
+        // flock semantics are unix-only; Windows' documented behavior is
+        // fail-open until the LockFileEx port lands (platform-pass TODO) —
+        // pinned below so this test flips the day it does.
+        #[cfg(unix)]
+        {
+            let second = acquire_ownership(dir.clone());
+            assert!(second.is_read_only());
+            assert_eq!(second.owner_pid(), Some(std::process::id()));
+        }
+        #[cfg(not(unix))]
+        {
+            let second = acquire_ownership(dir.clone());
+            assert!(
+                !second.is_read_only(),
+                "fail-open is the documented Windows behavior until LockFileEx"
+            );
+        }
 
         drop(first);
         let third = acquire_ownership(dir);
-        assert!(!third.is_read_only(), "flock must release when the owner drops");
+        assert!(!third.is_read_only(), "the lock must release when the owner drops");
     }
 }

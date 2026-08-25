@@ -418,6 +418,9 @@ async fn run_streaming_inner(
 mod tests {
     use super::*;
 
+    /// unix-only: drives `bash` (on Windows runners `bash` is WSL's
+    /// launcher) and asserts unix process semantics.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn streaming_captures_both_streams_in_order() {
         let (tx, mut rx) = mpsc::channel(64);
@@ -448,6 +451,9 @@ mod tests {
         assert_eq!(stderr_lines, vec!["two"]);
     }
 
+    /// unix-only: drives `bash` (on Windows runners `bash` is WSL's
+    /// launcher) and asserts unix process semantics.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn cancellation_kills_the_whole_process_group() {
         let (tx, mut rx) = mpsc::channel(64);
@@ -499,6 +505,9 @@ mod tests {
         assert!(resolved == "docker" || Path::new(&resolved).is_file(), "{resolved}");
     }
 
+    /// unix-only: drives `bash` (on Windows runners `bash` is WSL's
+    /// launcher) and asserts unix process semantics.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn nonzero_exit_is_reported() {
         let (tx, _rx) = mpsc::channel(8);

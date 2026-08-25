@@ -264,6 +264,25 @@ async fn wait_for_captures(engine: &Engine, what: &str, count: usize) -> Vec<mas
     }
 }
 
+/// Same skip contract as the other docker-gated suites: these tests run
+/// real containers (and resolve models through the compose CLI), so a
+/// runner without a usable LINUX docker daemon skips instead of timing out.
+async fn docker_usable() -> bool {
+    if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
+        return false;
+    }
+    mast_docker::run_command(
+        &["docker".into(), "info".into(), "--format".into(), "{{.OSType}}".into()],
+        None,
+        &[],
+        Duration::from_secs(10),
+        16 * 1024,
+    )
+    .await
+    .map(|o| o.success() && o.stdout.trim() == "linux")
+    .unwrap_or(false)
+}
+
 // ---------- tests ----------
 
 /// The headline case: nobody asked Mast to stop this container and nobody was
@@ -271,6 +290,10 @@ async fn wait_for_captures(engine: &Engine, what: &str, count: usize) -> Vec<mas
 /// the moment compose recreates it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_container_that_dies_on_its_own_is_captured() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -295,6 +318,10 @@ async fn a_container_that_dies_on_its_own_is_captured() {
 /// across many reconciles must not refill the tab with the same lines.
 #[tokio::test(flavor = "multi_thread")]
 async fn unhealthy_captures_once_not_every_reconcile() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -329,6 +356,10 @@ async fn unhealthy_captures_once_not_every_reconcile() {
 /// the stop must not record the same lines a second time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deliberate_stop_captures_exactly_once() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -358,6 +389,10 @@ async fn a_deliberate_stop_captures_exactly_once() {
 /// nothing to read, so there must be no attempt and no empty row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_container_replaced_outside_mast_is_not_captured() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -381,6 +416,10 @@ async fn a_container_replaced_outside_mast_is_not_captured() {
 /// button. A secret that reaches one reaches a clipboard and a file.
 #[tokio::test(flavor = "multi_thread")]
 async fn secrets_never_reach_a_capture() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     adapter.set_tail(vec![CapturedLine {
@@ -427,6 +466,10 @@ async fn secrets_never_reach_a_capture() {
 /// was closed is exactly the one nobody can explain afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn captures_outlive_the_engine_that_took_them() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
 
@@ -448,6 +491,10 @@ async fn captures_outlive_the_engine_that_took_them() {
 /// emptying a view that repopulates on the next read.
 #[tokio::test(flavor = "multi_thread")]
 async fn clearing_removes_them_for_good() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -463,6 +510,10 @@ async fn clearing_removes_them_for_good() {
 /// A subscriber sees captures as they happen — the tab must not need a poll.
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribers_see_captures_live() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -485,6 +536,10 @@ async fn subscribers_see_captures_live() {
 /// "never seen alive" must not read as "nothing happened".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_death_mast_never_saw_happen_is_still_captured() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -511,6 +566,10 @@ async fn a_death_mast_never_saw_happen_is_still_captured() {
 /// alive" from filling the tab on every startup with every stopped container.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_dead_container_leaves_no_empty_row() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     // Nothing within the capture window — what docker returns for a container
@@ -542,6 +601,10 @@ async fn a_long_dead_container_leaves_no_empty_row() {
 /// and the noisy one is the capture worth having.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_attempt_does_not_suppress_the_next_one() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     adapter.set_tail(vec![]); // quiet container
@@ -576,6 +639,10 @@ async fn an_empty_attempt_does_not_suppress_the_next_one() {
 /// same container's last words twice.
 #[tokio::test(flavor = "multi_thread")]
 async fn suppression_survives_a_restart() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let project_dir = tmp.path().join("captureapp");

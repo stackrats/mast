@@ -3,10 +3,12 @@
 //! detached (argv-only, own process group) so launched apps outlive Mast.
 //! Living in the engine means the CLI (M8) gets these actions for free.
 //!
-//! Two desktops are supported. On Linux the freedesktop tools do the work
+//! Three desktops are supported. On Linux the freedesktop tools do the work
 //! (`xdg-open` dispatches URLs and paths on scheme/mimetype); on macOS the
-//! equivalent is `open`, which is also how a `.app` bundle is launched. Every
-//! difference between them lives in this module — callers stay platform-blind.
+//! equivalent is `open`, which is also how a `.app` bundle is launched; on
+//! Windows `explorer` dispatches both and the PATHEXT forms (exe/cmd/bat)
+//! outrank bare names. Every difference between them lives in this module —
+//! callers stay platform-blind. (ADR-0006 holds the platform rules.)
 
 use std::path::{Path, PathBuf};
 

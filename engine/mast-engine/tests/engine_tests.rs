@@ -249,7 +249,11 @@ fn make_project(dir: &Path, name: &str) -> std::path::PathBuf {
         "services:\n  app:\n    image: alpine:latest\n",
     )
     .unwrap();
-    project
+    // Canonical (and verbatim-stripped) so the fake observations built from
+    // this path match what the engine records: Windows hands out the temp
+    // dir in 8.3 short form (RUNNER~1), the engine canonicalizes to the
+    // long form, and association compares path strings.
+    mast_compose::strip_verbatim(project.canonicalize().unwrap())
 }
 
 fn observation(project_name: &str, project_dir: &Path, service: &str, state: &str) -> ContainerObservation {
@@ -271,6 +275,10 @@ fn observation(project_name: &str, project_dir: &Path, service: &str, state: &st
 
 #[tokio::test(flavor = "multi_thread")]
 async fn import_observe_and_reflect_terminal_changes() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "observeapp");
     let adapter = FakeAdapter::new();
@@ -288,7 +296,10 @@ async fn import_observe_and_reflect_terminal_changes() {
     assert_eq!(project_summary.status, ProjectStatus::Stopped);
 
     // Simulate `docker compose up` from a terminal: containers appear + event.
-    let canonical = project.canonicalize().unwrap();
+    // (make_project already returned the canonical, verbatim-stripped path —
+    // canonicalizing again would re-add \\?\ on Windows and break the
+    // path-string association.)
+    let canonical = project.clone();
     let started = Instant::now();
     adapter.set_containers(vec![observation(&compose_name, &canonical, "app", "running")]);
     let snap = wait_until(&engine, "project running", |s| {
@@ -689,7 +700,7 @@ async fn workspace_rig(
     let adapter = FakeAdapter::new();
     let mut dirs = Vec::new();
     for name in ["wsa", "wsb", "wsc"] {
-        let dir = make_project(tmp.path(), name).canonicalize().unwrap();
+        let dir = make_project(tmp.path(), name);
         if let Some((_, env)) = envs.iter().find(|(n, _)| *n == name) {
             std::fs::write(dir.join(".env"), env).unwrap();
         }
@@ -1272,6 +1283,10 @@ async fn integrations_persist_and_launch_context_flows() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn env_report_and_env_edits_flow() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "envapp");
     std::fs::write(
@@ -1314,6 +1329,8 @@ async fn env_report_and_env_edits_flow() {
     assert!(std::fs::read_dir(&backups).unwrap().count() >= 1);
 }
 
+/// unix-only: the ownership lock is fail-open on Windows until LockFileEx (documented).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn read_only_engine_refuses_mutations_but_still_observes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1338,6 +1355,8 @@ async fn read_only_engine_refuses_mutations_but_still_observes() {
     assert!(engine.dispatch(Action::RefreshNow).is_ok());
 }
 
+/// unix-only: the app-key repair is unix-only for now (documented degradation).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1476,6 +1495,10 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn catalog_add_and_three_way_remove() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "catapp");
     std::fs::write(project.join(".env"), "APP_NAME=catapp\n").unwrap();
@@ -1950,6 +1973,10 @@ async fn an_unknown_repo_offers_no_versions() {
 /// applied through the same write transaction as every other compose edit.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_image_retag_previews_and_applies() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "verapp");
     std::fs::write(project.join(".env"), "APP_NAME=verapp\n").unwrap();
@@ -2068,17 +2095,27 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
 
     let env = std::fs::read_to_string(project.join(".env")).unwrap();
     assert!(!env.contains(&format!("APP_PORT={busy}")), "the busy port survived: {env}");
-    assert!(env.contains(&format!("APP_PORT={}", busy + 1)), "{env}");
+    // Not "busy + 1": Windows hands out ephemeral ports sequentially, so a
+    // parallel test's listener routinely holds the neighbor and the remap
+    // rightly skips further. The contract is "moved somewhere free, URL
+    // followed", not any particular number.
+    let new_port = env
+        .lines()
+        .find_map(|l| l.strip_prefix("APP_PORT="))
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("APP_PORT missing after the move: {env}"));
+    assert_ne!(new_port, busy, "{env}");
     // The pinned APP_URL followed the move.
-    assert!(env.contains(&format!("APP_URL=http://localhost:{}", busy + 1)), "{env}");
+    assert!(env.contains(&format!("APP_URL=http://localhost:{new_port}")), "{env}");
     // Untouched keys keep their bytes.
     assert!(env.contains("APP_KEY=base64:x"), "{env}");
     let moved = moved_line.expect("the move is reported in the operation output");
-    assert!(moved.contains("APP_PORT") && moved.contains(&(busy + 1).to_string()), "{moved}");
+    assert!(moved.contains("APP_PORT") && moved.contains(&new_port.to_string()), "{moved}");
 
-    // With the setting off, the same start leaves .env alone.
+    // With the setting off, the same start leaves .env alone. Squat the port
+    // the remap actually chose (only on Linux is that reliably busy + 1).
     drop(squatter);
-    let squatter2 = std::net::TcpListener::bind(("127.0.0.1", busy + 1)).unwrap();
+    let squatter2 = std::net::TcpListener::bind(("127.0.0.1", new_port)).unwrap();
     run_action(
         &engine,
         Action::SetIntegrations {
@@ -2701,7 +2738,7 @@ async fn diagnostics_flag_a_running_container_detached_from_its_network() {
     .await;
     let pid = snap.projects[0].id.clone();
     let compose_name = snap.projects[0].compose_project_name.clone().unwrap();
-    let canonical = project.canonicalize().unwrap();
+    let canonical = project.clone();
 
     let mut adrift = observation(&compose_name, &canonical, "app", "running");
     adrift.networks = Vec::new();

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The M8 verify criterion: the SAME client suite runs against the local
 //! and IPC clients — the transport must be invisible.
 
