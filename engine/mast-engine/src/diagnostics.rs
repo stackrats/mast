@@ -3170,16 +3170,26 @@ impl Engine {
                     return Ok(());
                 }
                 // The domain passed the strict character validation above,
-                // so it is safe as a printf argument word.
-                let mut script = format!(
-                    "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> {hosts_path}"
-                );
-                if cfg!(target_os = "macos") {
-                    // macOS caches negative lookups; without a flush the
-                    // fresh entry can take minutes to be seen.
-                    script.push_str(" && dscacheutil -flushcache");
-                }
-                let argv = crate::proxy::privileged_shell_argv(&script);
+                // so it is safe as a printf/echo argument word.
+                let argv = if cfg!(windows) {
+                    // UAC path: generated .cmd, elevated console (pkexec is
+                    // a Linux binary — "program not found" in the field).
+                    crate::proxy::windows_elevated_cmd(&[
+                        format!("echo 127.0.0.1\t{domain}\t# mast local domain>>{hosts_path}"),
+                        "ipconfig /flushdns".to_string(),
+                    ])
+                    .map_err(crate::internal_err)?
+                } else {
+                    let mut script = format!(
+                        "printf '127.0.0.1\\t%s\\t# mast local domain\\n' {domain} >> {hosts_path}"
+                    );
+                    if cfg!(target_os = "macos") {
+                        // macOS caches negative lookups; without a flush the
+                        // fresh entry can take minutes to be seen.
+                        script.push_str(" && dscacheutil -flushcache");
+                    }
+                    crate::proxy::privileged_shell_argv(&script)
+                };
                 self.run_streamed_command(
                     handle,
                     op,
@@ -3189,6 +3199,16 @@ impl Engine {
                     Duration::from_secs(5 * 60),
                 )
                 .await?;
+                // Exit codes lie across a UAC boundary — verify the state.
+                let hosts = tokio::fs::read_to_string(hosts_path).await.unwrap_or_default();
+                if !crate::proxy::hosts_resolves(&hosts, &domain) {
+                    return Err(ErrorInfo::Internal {
+                        message: format!(
+                            "{hosts_path} still does not resolve {domain} — the elevation \
+                             prompt may have been declined"
+                        ),
+                    });
+                }
                 self.emit_op(
                     handle,
                     op,
@@ -3240,6 +3260,16 @@ impl Engine {
                         },
                     );
                 } else {
+                    // Windows first: certutil.exe ships with the OS and the
+                    // Root store covers Chromium-family and Edge — and the
+                    // unix trust-store detection below would wrongly bail
+                    // ("no known system trust store") on Windows.
+                    let argv = if cfg!(windows) {
+                        crate::proxy::windows_elevated_cmd(&[format!(
+                            "certutil -addstore -f Root \"{crt_str}\""
+                        )])
+                        .map_err(crate::internal_err)?
+                    } else {
                     let script = if cfg!(target_os = "macos") {
                         format!(
                             "security add-trusted-cert -d -r trustRoot \
@@ -3270,7 +3300,8 @@ impl Engine {
                         };
                         format!("install -m 644 '{crt_str}' {dest} && {refresh}")
                     };
-                    let argv = crate::proxy::privileged_shell_argv(&script);
+                    crate::proxy::privileged_shell_argv(&script)
+                    };
                     self.run_streamed_command(
                         handle,
                         op,
@@ -3281,10 +3312,15 @@ impl Engine {
                     )
                     .await?;
                 }
-                self.nss_add_proxy_ca(handle, op, &crt_str).await;
+                if !cfg!(windows) {
+                    self.nss_add_proxy_ca(handle, op, &crt_str).await;
+                }
                 let done = if cfg!(target_os = "macos") {
                     "added to the System keychain — restart the browser; Firefox needs \
                      the certificate imported manually"
+                } else if cfg!(windows) {
+                    "added to the Windows Root store — restart the browser; Firefox needs \
+                     the certificate imported manually or security.enterprise_roots.enabled"
                 } else {
                     "system trust store updated — restart the browser; Firefox needs \
                      the certificate imported manually or security.enterprise_roots.enabled"

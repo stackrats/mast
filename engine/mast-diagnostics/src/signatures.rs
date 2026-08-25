@@ -293,6 +293,16 @@ mod tests {
         assert_eq!(port.repair, Some(crate::REPAIR_REASSIGN_PORTS));
         assert_eq!(extract_repair_arg(port, "bind: address already in use"), None);
 
+        // The fresh-project stalls map to their containerized installs.
+        let vendor = classify_line(
+            "Failed to open stream: No such file or directory in /var/www/html/vendor/autoload.php",
+        )
+        .unwrap();
+        assert_eq!(vendor.repair, Some(crate::REPAIR_COMPOSER_INSTALL));
+        let node = classify_line("sh: 1: multiplex: not found").unwrap();
+        assert_eq!(node.repair, Some(crate::REPAIR_NODE_INSTALL));
+        assert_eq!(classify_line("sh: 1: vite: not found").unwrap().id, node.id);
+
         // The exact daemon wording seen live: the network name follows the
         // LAST "network" token; the container id is packed as a second word
         // so the repair can dispose of a leftover that still exists.
