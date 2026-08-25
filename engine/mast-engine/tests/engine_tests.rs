@@ -296,7 +296,10 @@ async fn import_observe_and_reflect_terminal_changes() {
     assert_eq!(project_summary.status, ProjectStatus::Stopped);
 
     // Simulate `docker compose up` from a terminal: containers appear + event.
-    let canonical = project.canonicalize().unwrap();
+    // (make_project already returned the canonical, verbatim-stripped path —
+    // canonicalizing again would re-add \\?\ on Windows and break the
+    // path-string association.)
+    let canonical = project.clone();
     let started = Instant::now();
     adapter.set_containers(vec![observation(&compose_name, &canonical, "app", "running")]);
     let snap = wait_until(&engine, "project running", |s| {
@@ -697,7 +700,7 @@ async fn workspace_rig(
     let adapter = FakeAdapter::new();
     let mut dirs = Vec::new();
     for name in ["wsa", "wsb", "wsc"] {
-        let dir = make_project(tmp.path(), name).canonicalize().unwrap();
+        let dir = make_project(tmp.path(), name);
         if let Some((_, env)) = envs.iter().find(|(n, _)| *n == name) {
             std::fs::write(dir.join(".env"), env).unwrap();
         }
@@ -2725,7 +2728,7 @@ async fn diagnostics_flag_a_running_container_detached_from_its_network() {
     .await;
     let pid = snap.projects[0].id.clone();
     let compose_name = snap.projects[0].compose_project_name.clone().unwrap();
-    let canonical = project.canonicalize().unwrap();
+    let canonical = project.clone();
 
     let mut adrift = observation(&compose_name, &canonical, "app", "running");
     adrift.networks = Vec::new();
