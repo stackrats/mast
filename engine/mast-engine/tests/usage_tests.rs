@@ -292,8 +292,32 @@ async fn next_measured_sample(
 
 /// The claim that makes this safe to ship on a laptop: measuring the machine
 /// costs CPU, so it must not happen when nobody is looking at the answer.
+
+/// Same skip contract as the other docker-gated suites: these tests run
+/// real containers, so a runner without a usable LINUX docker daemon skips
+/// instead of timing out.
+async fn docker_usable() -> bool {
+    if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
+        return false;
+    }
+    mast_docker::run_command(
+        &["docker".into(), "info".into(), "--format".into(), "{{.OSType}}".into()],
+        None,
+        &[],
+        Duration::from_secs(10),
+        16 * 1024,
+    )
+    .await
+    .map(|o| o.success() && o.stdout.trim() == "linux")
+    .unwrap_or(false)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_is_sampled_while_nobody_is_subscribed() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -324,6 +348,10 @@ async fn nothing_is_sampled_while_nobody_is_subscribed() {
 /// 8-core machine's time per reading, so the answer must be one core.
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_is_measured_as_cores_between_two_readings() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
@@ -346,6 +374,10 @@ async fn cpu_is_measured_as_cores_between_two_readings() {
 /// "about to be OOM-killed".
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_is_the_working_set_and_knows_whether_it_is_limited() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     // 500 MB held, 100 MB of it reclaimable cache, no limit of its own.
@@ -370,6 +402,10 @@ async fn memory_is_the_working_set_and_knows_whether_it_is_limited() {
 /// a bogus spike.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replaced_container_is_not_diffed_against_its_predecessor() {
+    if !docker_usable().await {
+        eprintln!("skipping: docker daemon not usable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let adapter = FakeAdapter::new();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
