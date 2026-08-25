@@ -213,20 +213,41 @@ fn app_url_mismatch(
     host_ports: &[(String, u16)],
 ) -> Option<(u16, u16)> {
     let url_port = env.get("APP_URL").and_then(|v| mast_laravel::explicit_port(v))?;
-    let app_port = env.get("APP_PORT").and_then(|v| v.trim().parse::<u16>().ok())?;
-    if url_port == app_port || host_ports.iter().any(|(_, port)| *port == url_port) {
+    if host_ports.iter().any(|(_, port)| *port == url_port) {
+        return None;
+    }
+    // The port APP_URL should have named: APP_PORT when set — but APP_URL
+    // can lie without APP_PORT ever being written (field case: a fresh
+    // bootstrap with APP_URL=…:8000 while sail publishes the default 80),
+    // so fall back to the app service's actually-published port.
+    let app_service = env.get("APP_SERVICE").map(String::as_str).unwrap_or("laravel.test");
+    let app_port = env
+        .get("APP_PORT")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .or_else(|| {
+            host_ports.iter().find(|(label, _)| label == app_service).map(|(_, port)| *port)
+        })?;
+    if url_port == app_port {
         return None;
     }
     Some((url_port, app_port))
 }
 
 /// The edit `fix-app-url` will make — recomputed fresh from the file, since
-/// the report may be stale by the time the user consents. `None` when
-/// APP_URL and APP_PORT already agree (or either says nothing).
-fn app_url_rewrite(file: &mast_laravel::EnvFile) -> Option<String> {
+/// the report may be stale by the time the user consents. `None` when the
+/// URL already agrees with the app's port (or nothing says what that is).
+/// `published_app_port` is the fallback target when `.env` never wrote
+/// APP_PORT — sail publishes the default 80 and APP_URL can still lie.
+fn app_url_rewrite(
+    file: &mast_laravel::EnvFile,
+    published_app_port: Option<u16>,
+) -> Option<String> {
     let url = file.get("APP_URL")?.value.clone();
     let from = mast_laravel::explicit_port(&url)?;
-    let to = file.get("APP_PORT")?.value.trim().parse::<u16>().ok()?;
+    let to = file
+        .get("APP_PORT")
+        .and_then(|e| e.value.trim().parse::<u16>().ok())
+        .or(published_app_port)?;
     if from == to {
         return None;
     }
@@ -1328,17 +1349,20 @@ impl Engine {
                 Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op: false })
             }
             REPAIR_FIX_APP_URL => {
-                let path = self.project_path(self.require_project(project)?)?;
+                let project = self.require_project(project)?;
+                let path = self.project_path(project)?;
+                let fallback = self.published_app_port(project);
                 tokio::task::spawn_blocking(move || {
                     let env_path = path.join(".env");
                     let before =
                         std::fs::read_to_string(&env_path).map_err(crate::internal_err)?;
                     let mut file = mast_laravel::EnvFile::parse(&before);
-                    let rewrite = app_url_rewrite(&file);
+                    let rewrite = app_url_rewrite(&file, fallback);
                     let (summary, no_op) = match &rewrite {
                         Some(to) => (vec![format!("set APP_URL={to}")], false),
                         None => (
-                            vec!["APP_URL already agrees with APP_PORT — nothing to do".into()],
+                            vec!["APP_URL already agrees with the app's port — nothing to do"
+                                .into()],
                             true,
                         ),
                     };
@@ -1905,6 +1929,20 @@ impl Engine {
         })
     }
 
+    /// The app service's actually-published host port from live state — the
+    /// fix-app-url fallback when `.env` never wrote APP_PORT (sail publishes
+    /// the default 80, and APP_URL can lie without APP_PORT existing).
+    fn published_app_port(&self, project: &ProjectId) -> Option<u16> {
+        let st = self.inner.state.lock().unwrap();
+        let entry = st.projects.get(&project.0)?;
+        let app_service = crate::project_ops::app_service_of(&entry.record.path);
+        entry
+            .host_ports
+            .iter()
+            .find(|(label, _)| *label == "APP_PORT" || *label == app_service)
+            .map(|(_, port)| *port)
+    }
+
     fn current_username(&self) -> Result<String, ErrorInfo> {
         self.inner
             .deps
@@ -2246,13 +2284,15 @@ impl Engine {
                 Ok(())
             }
             REPAIR_FIX_APP_URL => {
-                let path = self.project_path(self.require_project(project)?)?.join(".env");
+                let project = self.require_project(project)?;
+                let path = self.project_path(project)?.join(".env");
+                let fallback = self.published_app_port(project);
                 let backups = self.inner.deps.store.backups_dir();
                 let applied =
                     tokio::task::spawn_blocking(move || -> Result<Option<String>, ErrorInfo> {
                         let mut applied = None;
                         mast_laravel::edit_env_file(&path, Some(&backups), |f| {
-                            if let Some(to) = app_url_rewrite(f) {
+                            if let Some(to) = app_url_rewrite(f, fallback) {
                                 f.set("APP_URL", &to)?;
                                 applied = Some(to);
                             }
@@ -3014,6 +3054,36 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The field case that slipped past the original check: APP_URL pins a
+    /// port while APP_PORT was never written — the app publishes sail's
+    /// default through the app service, and that published port is the
+    /// mismatch target.
+    #[test]
+    fn app_url_mismatch_falls_back_to_the_published_app_port() {
+        let env = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<
+                std::collections::HashMap<_, _>,
+            >()
+        };
+        let ports = vec![("test.test".to_string(), 80u16), ("FORWARD_DB_PORT".to_string(), 3306)];
+        // No APP_PORT anywhere: fall back to the app service's published port.
+        let e = env(&[("APP_URL", "http://localhost:8000"), ("APP_SERVICE", "test.test")]);
+        assert_eq!(app_url_mismatch(&e, &ports), Some((8000, 80)));
+        // APP_URL matching a published port is fine.
+        let e = env(&[("APP_URL", "http://localhost:80"), ("APP_SERVICE", "test.test")]);
+        assert_eq!(app_url_mismatch(&e, &ports), None);
+        // An explicit APP_PORT still wins over the fallback.
+        let e = env(&[
+            ("APP_URL", "http://localhost:8000"),
+            ("APP_PORT", "8082"),
+            ("APP_SERVICE", "test.test"),
+        ]);
+        assert_eq!(app_url_mismatch(&e, &ports), Some((8000, 8082)));
+        // No URL port pinned: nothing to mismatch.
+        let e = env(&[("APP_URL", "http://localhost"), ("APP_SERVICE", "test.test")]);
+        assert_eq!(app_url_mismatch(&e, &ports), None);
+    }
 
     /// A project dir resolvable by `mast_compose`, with the Node shape the
     /// test needs. `sail` present makes the invocation a Sail runner.

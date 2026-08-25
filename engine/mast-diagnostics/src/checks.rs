@@ -1227,7 +1227,8 @@ impl Check for StaleAppUrl {
                     format!("{}: the Browser link points at a dead port", p.name),
                     format!(
                         "APP_URL pins port {url_port}, but the project publishes nothing \
-                         there — the app is forwarded on APP_PORT={app_port}. The Browser \
+                         there — the app is actually published on port {app_port} (from \
+                         APP_PORT, or sail's default when it was never written). The Browser \
                          button (and anything else reading APP_URL) opens a refused \
                          connection. This is what a port move leaves behind when APP_URL \
                          had the old port written in."
@@ -2452,7 +2453,7 @@ mod tests {
         let f = findings.iter().find(|f| f.check == "stale-app-url").unwrap();
         assert_eq!(f.severity, Severity::Warning);
         assert!(f.detail.contains("APP_URL pins port 8000"), "{}", f.detail);
-        assert!(f.detail.contains("APP_PORT=8082"), "{}", f.detail);
+        assert!(f.detail.contains("published on port 8082"), "{}", f.detail);
         let repair = f.repair.as_ref().unwrap();
         assert_eq!(repair.id, REPAIR_FIX_APP_URL);
         assert_eq!(repair.risk, RiskTier::Safe);
