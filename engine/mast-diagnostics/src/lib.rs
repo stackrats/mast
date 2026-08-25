@@ -57,6 +57,7 @@ pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
 pub const REPAIR_DISCONNECT_STALE: &str = "disconnect-stale-endpoints";
+pub const REPAIR_STORAGE_WRITABLE: &str = "storage-writable";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
 pub const REPAIR_INSTALL_CERTUTIL: &str = "install-certutil";
 
@@ -268,6 +269,12 @@ pub struct ProjectFacts {
     /// badge can hide a dead app server — the ready probe falls back to a
     /// grace timeout — and this is the check that refuses to look away.
     pub app_reachability: Option<AppReachability>,
+    /// Laravel's writable directories that are missing or read-only INSIDE
+    /// the running app container (`storage/framework/*`, `storage/logs`,
+    /// `bootstrap/cache`). Blade compilation and cache/session writes land
+    /// there; a broken one 500s every page ("tempnam(): file created in the
+    /// system's temporary directory") while the containers look healthy.
+    pub unwritable_paths: Vec<String>,
     /// Vite's `public/hot` marker, when present: the dev-server URL it pins
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
@@ -392,6 +399,16 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             risk: RiskTier::Safe,
             description: "Runs `docker network create` (idempotent).".into(),
             arg: arg.map(String::from),
+        }),
+        REPAIR_STORAGE_WRITABLE => Some(RepairSpec {
+            id: REPAIR_STORAGE_WRITABLE,
+            title: "Create and open Laravel's writable directories".into(),
+            risk: RiskTier::Safe,
+            description: "Runs mkdir -p and chmod ug+rwX for storage/framework/*, \
+                          storage/logs and bootstrap/cache inside the app container — \
+                          where Blade, cache and sessions actually write."
+                .into(),
+            arg: None,
         }),
         REPAIR_DISCONNECT_STALE => Some(RepairSpec {
             id: REPAIR_DISCONNECT_STALE,
