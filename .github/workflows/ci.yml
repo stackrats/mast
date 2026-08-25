@@ -47,7 +47,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # mast-desktop's test BINARY cannot load on a bare runner
+      # (STATUS_ENTRYPOINT_NOT_FOUND: it links the WebView2 loader), so the
+      # desktop crate is type-checked but its tests run everywhere else.
+      - run: cargo check --workspace
+      - run: cargo test --workspace --exclude mast-desktop
 
   # Primary frontend toolchain: Vite Plus (vp) — check (fmt+lint+types),
   # tests, and production build, exactly as local dev runs them.
