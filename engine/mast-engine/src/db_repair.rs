@@ -707,9 +707,13 @@ mod tests {
         let (argv, env) = scoped_compose_argv(&inv, &["rm", "-s", "-f", "mysql"]);
         assert_eq!(argv[..2], ["docker", "compose"]);
         assert_eq!(&argv[argv.len() - 4..], ["rm", "-s", "-f", "mysql"]);
-        #[cfg(unix)]
+        // Parity applies on every platform now (Windows fills 0/0).
         assert!(env.iter().any(|(k, _)| k == "WWWUSER"), "parity overlay expected: {env:?}");
 
+        // The sail-runner half is unix-only by design: Windows never picks
+        // the bash-script runner (asserted in mast-compose).
+        #[cfg(unix)]
+        {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("docker-compose.yml"), "services: {}\n").unwrap();
         let bin = tmp.path().join("vendor/bin");
@@ -727,6 +731,7 @@ mod tests {
         assert_eq!(&argv[1..], ["up", "-d", "mysql"]);
         // Unlike lifecycle verbs, repairs must not trip sail's auto-down.
         assert!(env.iter().any(|(k, v)| k == "SAIL_SKIP_CHECKS" && v == "1"), "{env:?}");
+        }
     }
 
     #[test]

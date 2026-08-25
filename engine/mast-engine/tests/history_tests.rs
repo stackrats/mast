@@ -78,6 +78,11 @@ async fn wait_for_history(
     }
 }
 
+// The bash-vehicle tests below are unix-only: on Windows runners `bash`
+// resolves to WSL's launcher, which mangles exit codes and output. The
+// recording hook they exercise is platform-neutral Rust, covered by the
+// unix legs; the shell-free env-write test still runs everywhere.
+#[cfg(unix)]
 fn argv_of(entry: &HistoryEntry) -> Vec<String> {
     match &entry.detail {
         HistoryDetail::Command { argv, .. } => argv.clone(),
@@ -96,6 +101,7 @@ fn make_project(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// Nobody threads a recorder through `run_command`; the observer hook means a
 /// shell-out anywhere in the workspace is recorded anyway — as background,
 /// since no user action claimed it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_shell_outs_are_recorded_as_background() {
     let tmp = tempfile::tempdir().unwrap();
@@ -120,6 +126,7 @@ async fn unclaimed_shell_outs_are_recorded_as_background() {
 
 /// A failing command keeps its exit status and its output, which is the whole
 /// point: the user can see why it failed without reproducing it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn failures_keep_their_status_and_output() {
     let tmp = tempfile::tempdir().unwrap();
@@ -171,6 +178,7 @@ async fn env_writes_are_recorded_against_their_action() {
 
 /// A secret set in one project must not surface in a command that belongs to
 /// no project — history is copyable, and the union redactor is what stops it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn secrets_never_reach_the_record() {
     let tmp = tempfile::tempdir().unwrap();
@@ -210,6 +218,7 @@ async fn secrets_never_reach_the_record() {
 
 /// Two engines in one process both keep recording: registering an observer
 /// must never switch an earlier engine's history off.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_engine_does_not_silence_the_first() {
     let tmp = tempfile::tempdir().unwrap();
@@ -233,6 +242,7 @@ async fn a_second_engine_does_not_silence_the_first() {
 /// redacted with what was known *then*, so the finish must re-run it through
 /// what is known *now*; otherwise the argv keeps the secret for the life of
 /// the ring while the output beside it is clean.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_secret_learned_mid_command_scrubs_what_was_recorded_at_start() {
     let tmp = tempfile::tempdir().unwrap();

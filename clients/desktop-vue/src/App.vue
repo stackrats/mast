@@ -109,7 +109,7 @@ function editWorkspace(ws: WorkspaceSummary) {
             :workspace="selectedWorkspace"
             @edit="editWorkspace(selectedWorkspace)"
           />
-          <div v-else-if="selectedProject" class="mx-auto max-w-2xl">
+          <div v-else-if="selectedProject" class="mx-auto max-w-4xl">
             <ProjectCard :project="selectedProject" @diagnose="openDiagnostics(selectedProject)" />
           </div>
           <HomePane v-else @open-settings="settingsOpen = true" />

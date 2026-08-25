@@ -662,6 +662,10 @@ mod tests {
         assert_eq!(normalize_project_name("...."), "default");
     }
 
+    /// unix-only by design: the sail wrapper is a bash script, so Windows
+    /// never picks the Sail runner (see the resolver) — asserted separately
+    /// below.
+    #[cfg(unix)]
     #[test]
     fn sail_runner_detected_when_script_executable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -677,6 +681,21 @@ mod tests {
         }
         let inv = resolve_invocation(tmp.path(), &env(&[])).unwrap();
         assert!(inv.is_sail());
+    }
+
+    /// The Windows counterpart: the sail wrapper is a bash script Windows
+    /// cannot execute (CreateProcess error 193), so the resolver must pick
+    /// bare compose even when vendor/bin/sail exists.
+    #[cfg(windows)]
+    #[test]
+    fn sail_script_is_ignored_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "docker-compose.yml", MINIMAL);
+        let bin = tmp.path().join("vendor/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("sail"), "#!/bin/sh\n").unwrap();
+        let inv = resolve_invocation(tmp.path(), &env(&[])).unwrap();
+        assert!(!inv.is_sail());
     }
 
     #[test]

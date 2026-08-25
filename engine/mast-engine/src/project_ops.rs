@@ -398,36 +398,7 @@ impl Engine {
                     }
                     let mut fixed_url = None;
                     mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
-                        // (2) An APP_URL pinning a port sail will not publish
-                        // (installers write :8000, `artisan serve`'s default;
-                        // sail publishes ${APP_PORT:-80}). Honor the URL:
-                        // publish where it points — :80 is a collision magnet
-                        // on dev machines, and the port preflight remaps
-                        // APP_PORT (dragging APP_URL along) if another
-                        // project claims it. Only when APP_PORT is already
-                        // pinned elsewhere does the URL follow the port.
-                        if let Some(url) = f.get("APP_URL").map(|e| e.value.clone())
-                            && let Some(from) = mast_laravel::explicit_port(&url)
-                        {
-                            match f.get("APP_PORT").and_then(|e| e.value.trim().parse::<u16>().ok())
-                            {
-                                None => {
-                                    f.set("APP_PORT", &from.to_string())?;
-                                    fixed_url =
-                                        Some(format!("APP_PORT={from} (publishing where \
-                                                      APP_URL points)"));
-                                }
-                                Some(app_port) if app_port != from => {
-                                    if let Some(to) =
-                                        mast_laravel::rewrite_explicit_port(&url, from, app_port)
-                                    {
-                                        f.set("APP_URL", &to)?;
-                                        fixed_url = Some(format!("APP_URL={to}"));
-                                    }
-                                }
-                                Some(_) => {}
-                            }
-                        }
+                        fixed_url = reconcile_bootstrap_url(f)?;
                         f.set("APP_SERVICE", &app_service)?;
                         f.set("WWWUSER", &uid.to_string())?;
                         f.set("WWWGROUP", &gid.to_string())
@@ -1432,6 +1403,37 @@ pub(crate) fn app_service_of(dir: &Path) -> String {
         .unwrap_or_else(|| "laravel.test".to_string())
 }
 
+/// The wizard's URL/port reconciliation, pure over the parsed `.env` so the
+/// decision table is testable: an APP_URL pinning a port sail will not
+/// publish (installers write :8000, `artisan serve`'s default; sail
+/// publishes `${APP_PORT:-80}`) is honored by writing APP_PORT to match —
+/// :80 is a collision magnet on dev machines, and the port preflight remaps
+/// APP_PORT (dragging APP_URL along) if another project claims it. Only
+/// when APP_PORT is already pinned elsewhere does the URL follow the port.
+/// Returns a description of the change made, if any.
+fn reconcile_bootstrap_url(
+    f: &mut mast_laravel::EnvFile,
+) -> Result<Option<String>, mast_laravel::EnvError> {
+    let Some(url) = f.get("APP_URL").map(|e| e.value.clone()) else { return Ok(None) };
+    let Some(from) = mast_laravel::explicit_port(&url) else { return Ok(None) };
+    match f.get("APP_PORT").and_then(|e| e.value.trim().parse::<u16>().ok()) {
+        None => {
+            f.set("APP_PORT", &from.to_string())?;
+            Ok(Some(format!("APP_PORT={from} (publishing where APP_URL points)")))
+        }
+        Some(app_port) if app_port != from => {
+            match mast_laravel::rewrite_explicit_port(&url, from, app_port) {
+                Some(to) => {
+                    f.set("APP_URL", &to)?;
+                    Ok(Some(format!("APP_URL={to}")))
+                }
+                None => Ok(None),
+            }
+        }
+        Some(_) => Ok(None),
+    }
+}
+
 /// What `sail <tail…>` means when the wrapper itself cannot run (Windows,
 /// where CreateProcess refuses bash scripts): compose verbs pass straight
 /// through the resolved invocation — the wrapper's own passthrough — and
@@ -1516,6 +1518,28 @@ mod tests {
         assert!(argv.contains(&"--profile".to_string()));
         let exec_at = argv.iter().position(|a| a == "exec").unwrap();
         assert_eq!(&argv[exec_at..], ["exec", "-T", "app", "php", "artisan"]);
+    }
+
+    /// The wizard's URL/port decision table, exactly as field-tested: honor
+    /// the installer's URL, follow a pinned APP_PORT, touch nothing that
+    /// already agrees.
+    #[test]
+    fn bootstrap_reconciles_url_and_port_in_the_right_direction() {
+        let case = |env: &str| {
+            let mut f = mast_laravel::EnvFile::parse(env);
+            let change = reconcile_bootstrap_url(&mut f).unwrap();
+            (change, f.to_string())
+        };
+        // Installer wrote :8000, APP_PORT absent → publish where it points.
+        let (change, out) = case("APP_URL=http://localhost:8000\n");
+        assert!(change.unwrap().contains("APP_PORT=8000"), "{out}");
+        assert!(out.contains("APP_PORT=8000"), "{out}");
+        // APP_PORT pinned elsewhere → the URL follows the port.
+        let (change, out) = case("APP_URL=http://localhost:8000\nAPP_PORT=8082\n");
+        assert!(change.unwrap().contains("APP_URL=http://localhost:8082"), "{out}");
+        // Agreement or no pinned URL port → untouched.
+        assert!(case("APP_URL=http://localhost:8000\nAPP_PORT=8000\n").0.is_none());
+        assert!(case("APP_URL=http://localhost\n").0.is_none());
     }
 
     /// The Windows stand-in for the sail wrapper: compose verbs pass
