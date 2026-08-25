@@ -473,6 +473,47 @@ impl Engine {
             out("reload failed — recreating the proxy container".into());
         }
 
+        // The proxy needs host 80/443 for itself. When a RUNNING Mast
+        // project already publishes one of them (a pre-:8000 bootstrap
+        // publishing 80, say), the docker run below is doomed with "port is
+        // already allocated" — and the Fix must target the HOLDER project's
+        // ports, not the project whose domain is being enabled.
+        let holder: Option<(mast_contract::ProjectId, String, u16)> = {
+            let st = self.inner.state.lock().unwrap();
+            st.projects
+                .values()
+                .filter(|e| e.summary.status != mast_contract::ProjectStatus::Stopped)
+                .find_map(|e| {
+                    e.host_ports
+                        .iter()
+                        .find(|(_, p)| *p == 80 || *p == 443)
+                        .map(|(_, p)| (e.summary.id.clone(), e.summary.name.clone(), *p))
+                })
+        };
+        if let Some((holder_id, holder_name, port)) = holder {
+            out(format!(
+                "{holder_name} publishes host port {port}, which the proxy itself needs \
+                 — the Fix below moves {holder_name}'s ports (APP_PORT and friends in \
+                 its .env), then enable the domain again"
+            ));
+            if let Some(spec) =
+                mast_diagnostics::repair_spec(mast_diagnostics::REPAIR_REASSIGN_PORTS, None)
+            {
+                self.emit_op(
+                    handle,
+                    id,
+                    OperationEventKind::FixAvailable {
+                        repair: crate::diagnostics::offer_to_contract(spec),
+                        project: holder_id,
+                    },
+                );
+            }
+            return Err(ErrorInfo::Conflict {
+                message: format!(
+                    "the proxy needs host port {port}, but {holder_name} publishes it"
+                ),
+            });
+        }
         let rm: Vec<String> = ["docker", "rm", "-f", PROXY_CONTAINER].map(String::from).into();
         let _ = run_command(&rm, None, &[], DOCKER_TIMEOUT, OUTPUT_CAP).await;
         out(format!(
