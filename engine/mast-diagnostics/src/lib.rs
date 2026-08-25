@@ -58,6 +58,7 @@ pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
 pub const REPAIR_DISCONNECT_STALE: &str = "disconnect-stale-endpoints";
 pub const REPAIR_STORAGE_WRITABLE: &str = "storage-writable";
+pub const REPAIR_PHP_AS_ROOT: &str = "php-as-root";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
 pub const REPAIR_INSTALL_CERTUTIL: &str = "install-certutil";
 
@@ -271,10 +272,20 @@ pub struct ProjectFacts {
     pub app_reachability: Option<AppReachability>,
     /// Laravel's writable directories that are missing or read-only INSIDE
     /// the running app container (`storage/framework/*`, `storage/logs`,
-    /// `bootstrap/cache`). Blade compilation and cache/session writes land
-    /// there; a broken one 500s every page ("tempnam(): file created in the
-    /// system's temporary directory") while the containers look healthy.
+    /// `bootstrap/cache`) — probed by an actual write as the user PHP runs
+    /// as. Blade compilation and cache/session writes land there; a broken
+    /// one 500s every page ("tempnam(): file created in the system's
+    /// temporary directory") while the containers look healthy.
     pub unwritable_paths: Vec<String>,
+    /// `.env` SUPERVISOR_PHP_USER — who supervisord runs PHP as in the sail
+    /// runtime ("sail" when unset). NOT WWWUSER: a failed
+    /// `usermod -u $WWWUSER` leaves the sail user at its image default while
+    /// WWWUSER claims something else.
+    pub php_user: Option<String>,
+    /// The writability probe failed as PHP's user but succeeded as root —
+    /// the bind-mount ownership trap (chmod there is a silent no-op), where
+    /// sail's own SUPERVISOR_PHP_USER=root knob is the supported answer.
+    pub writable_as_root: bool,
     /// Vite's `public/hot` marker, when present: the dev-server URL it pins
     /// and whether anything actually listens there (`None` = unknowable,
     /// e.g. a non-loopback host).
@@ -399,6 +410,19 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             risk: RiskTier::Safe,
             description: "Runs `docker network create` (idempotent).".into(),
             arg: arg.map(String::from),
+        }),
+        REPAIR_PHP_AS_ROOT => Some(RepairSpec {
+            id: REPAIR_PHP_AS_ROOT,
+            title: "Run PHP as root inside the app container".into(),
+            risk: RiskTier::Caution,
+            description: "Sets SUPERVISOR_PHP_USER=root in `.env` — sail's own knob — \
+                          and recreates the app service. On Windows bind mounts the \
+                          project files belong to root and chmod is silently ignored, \
+                          so the sail user can never write storage/; running PHP as \
+                          root INSIDE the container is the supported answer there. \
+                          Container-only: nothing on the host changes."
+                .into(),
+            arg: None,
         }),
         REPAIR_STORAGE_WRITABLE => Some(RepairSpec {
             id: REPAIR_STORAGE_WRITABLE,
