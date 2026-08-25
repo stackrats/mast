@@ -2110,11 +2110,12 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
     // Untouched keys keep their bytes.
     assert!(env.contains("APP_KEY=base64:x"), "{env}");
     let moved = moved_line.expect("the move is reported in the operation output");
-    assert!(moved.contains("APP_PORT") && moved.contains(&(busy + 1).to_string()), "{moved}");
+    assert!(moved.contains("APP_PORT") && moved.contains(&new_port.to_string()), "{moved}");
 
-    // With the setting off, the same start leaves .env alone.
+    // With the setting off, the same start leaves .env alone. Squat the port
+    // the remap actually chose (only on Linux is that reliably busy + 1).
     drop(squatter);
-    let squatter2 = std::net::TcpListener::bind(("127.0.0.1", busy + 1)).unwrap();
+    let squatter2 = std::net::TcpListener::bind(("127.0.0.1", new_port)).unwrap();
     run_action(
         &engine,
         Action::SetIntegrations {
