@@ -415,12 +415,14 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
             id: REPAIR_PHP_AS_ROOT,
             title: "Run PHP as root inside the app container".into(),
             risk: RiskTier::Caution,
-            description: "Sets SUPERVISOR_PHP_USER=root in `.env` — sail's own knob — \
-                          and recreates the app service. On Windows bind mounts the \
-                          project files belong to root and chmod is silently ignored, \
-                          so the sail user can never write storage/; running PHP as \
-                          root INSIDE the container is the supported answer there. \
-                          Container-only: nothing on the host changes."
+            description: "Adds SUPERVISOR_PHP_USER: 'root' to the app service's \
+                          environment in the compose file (sail's own knob; a \
+                          transactional, validated edit) and recreates the service. On \
+                          Windows bind mounts the project files belong to root and \
+                          chmod is silently ignored, so the sail user can never write \
+                          storage/; running PHP as root INSIDE the container is the \
+                          supported answer there. Container-only: nothing on the host \
+                          changes."
                 .into(),
             arg: None,
         }),

@@ -1427,16 +1427,33 @@ impl Engine {
             }
             REPAIR_PHP_AS_ROOT => {
                 let project = self.require_project(project)?;
+                let (_, file) = self.catalog_context(project)?;
                 let path = self.project_path(project)?;
-                let already = mast_compose::parse_env_file(&path.join(".env"))
-                    .get("SUPERVISOR_PHP_USER")
-                    .is_some_and(|v| v.trim() == "root");
+                let service = crate::project_ops::app_service_of(&path);
+                let already = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|source| {
+                        mast_yaml_edit::get_scalar(
+                            &source,
+                            &[
+                                mast_yaml_edit::key("services"),
+                                mast_yaml_edit::key(&service),
+                                mast_yaml_edit::key("environment"),
+                                mast_yaml_edit::key("SUPERVISOR_PHP_USER"),
+                            ],
+                        )
+                    })
+                    .is_some_and(|v| v.trim_matches(['\'', '"']) == "root");
                 Ok(RepairPlan {
                     summary: if already {
-                        vec!["SUPERVISOR_PHP_USER is already root — nothing to do".into()]
+                        vec!["the app service already runs PHP as root — nothing to do".into()]
                     } else {
                         vec![
-                            "set SUPERVISOR_PHP_USER=root in .env (sail's own knob)".into(),
+                            format!(
+                                "compose file: add SUPERVISOR_PHP_USER: 'root' to \
+                                 {service}'s environment (sail's own knob — a transactional, \
+                                 validated edit)"
+                            ),
                             "recreate the app service so supervisord picks it up".into(),
                             "container-only: nothing on the host changes".into(),
                         ]
@@ -2195,38 +2212,79 @@ impl Engine {
             }
             REPAIR_PHP_AS_ROOT => {
                 let project = self.require_project(project)?;
-                let (invocation, path, redactor) = {
+                // The knob must reach supervisord THROUGH the compose file:
+                // sail's stub forwards WWWUSER but not SUPERVISOR_PHP_USER,
+                // so an `.env`-only write changes nothing inside the
+                // container (the first version of this repair, disproven in
+                // the field within the hour).
+                let (invocation, file) = self.catalog_context(project)?;
+                let (path, redactor) = {
                     let st = self.inner.state.lock().unwrap();
                     let entry = st.projects.get(&project.0).ok_or(ErrorInfo::NotFound {
                         what: format!("project {}", project.0),
                     })?;
-                    let invocation =
-                        entry.invocation.clone().ok_or_else(|| ErrorInfo::InvalidInput {
-                            message: "the project's compose invocation is not resolved".into(),
-                        })?;
-                    (invocation, entry.record.path.clone(), entry.redactor.clone())
+                    (entry.record.path.clone(), entry.redactor.clone())
                 };
-                let backups = self.inner.deps.store.backups_dir();
-                {
-                    let env_path = path.join(".env");
-                    tokio::task::spawn_blocking(move || {
-                        mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
-                            f.set("SUPERVISOR_PHP_USER", "root")
-                        })
-                    })
-                    .await
-                    .map_err(crate::internal_err)?
-                    .map_err(crate::env_write_error)?;
-                }
+                let service = crate::project_ops::app_service_of(&path);
+                let source = std::fs::read_to_string(&file).map_err(crate::internal_err)?;
+                use mast_yaml_edit::{Edit, key};
+                let scalar_path = vec![
+                    key("services"),
+                    key(&service),
+                    key("environment"),
+                    key("SUPERVISOR_PHP_USER"),
+                ];
+                let env_path = vec![key("services"), key(&service), key("environment")];
+                // The service's `environment` may be a block mapping, a
+                // sequence of KEY=val strings, or absent — dry-apply picks
+                // the shape that splices cleanly; the transaction gates
+                // still validate the final file.
+                let candidates: Vec<Edit> =
+                    if mast_yaml_edit::get_scalar(&source, &scalar_path).is_some() {
+                        vec![Edit::SetScalar { path: scalar_path, value: "'root'".into() }]
+                    } else {
+                        vec![
+                            Edit::InsertMapKey {
+                                path: env_path.clone(),
+                                key: "SUPERVISOR_PHP_USER".into(),
+                                value: "'root'".into(),
+                            },
+                            Edit::InsertSeqItem {
+                                path: env_path,
+                                value: "SUPERVISOR_PHP_USER=root".into(),
+                            },
+                            Edit::InsertMapBlock {
+                                path: vec![key("services"), key(&service)],
+                                key: "environment".into(),
+                                lines: vec!["SUPERVISOR_PHP_USER: 'root'".into()],
+                            },
+                        ]
+                    };
+                let chosen = candidates
+                    .into_iter()
+                    .find(|e| mast_yaml_edit::apply(&source, e).is_ok())
+                    .ok_or_else(|| ErrorInfo::Internal {
+                        message: format!(
+                            "could not add SUPERVISOR_PHP_USER to {service} in the compose file"
+                        ),
+                    })?;
+                self.write_compose(
+                    &invocation,
+                    &file,
+                    &[chosen],
+                    vec![format!("{service}: environment SUPERVISOR_PHP_USER -> root")],
+                )
+                .await?;
                 self.emit_op(
                     handle,
                     op,
                     OperationEventKind::Output {
-                        line: "set SUPERVISOR_PHP_USER=root — recreating the app service".into(),
+                        line: format!(
+                            "{service} now runs PHP as root in-container — recreating"
+                        ),
                         stderr: false,
                     },
                 );
-                let service = crate::project_ops::app_service_of(&path);
                 let tail: Vec<&str> =
                     vec!["up", "-d", "--force-recreate", "--no-deps", &service];
                 let (argv, _env) = crate::db_repair::scoped_compose_argv(&invocation, &tail);
