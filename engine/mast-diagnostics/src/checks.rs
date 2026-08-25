@@ -10,7 +10,7 @@ use crate::{
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
     REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS,
     REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME,
-    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
+    REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK, REPAIR_STORAGE_WRITABLE,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
 
@@ -1241,6 +1241,46 @@ impl Check for StaleAppUrl {
     }
 }
 
+/// Every chip green, every page a 500: Blade compilation and cache/session
+/// writes land in storage/* and bootstrap/cache, and one missing or
+/// read-only directory inside the container fails them all — the visible
+/// symptom is "tempnam(): file created in the system's temporary directory"
+/// on a Symfony error page.
+struct StorageUnwritable;
+impl Check for StorageUnwritable {
+    fn id(&self) -> &'static str {
+        "storage-unwritable"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| !p.unwritable_paths.is_empty())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| !p.unwritable_paths.is_empty())
+            .map(|p| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Error,
+                    format!("{}: Laravel's writable directories are broken", p.name),
+                    format!(
+                        "Inside the app container, {} {} missing or not writable. Blade \
+                         compilation, cache and session writes fail there — the classic \
+                         symptom is a 500 on every page with \"tempnam(): file created \
+                         in the system's temporary directory\", while every container \
+                         looks healthy. The repair recreates them and opens permissions, \
+                         inside the container.",
+                        p.unwritable_paths.join(", "),
+                        if p.unwritable_paths.len() == 1 { "is" } else { "are" },
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_STORAGE_WRITABLE, None);
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
 /// Status says Running, the browser says refused: the ready probe's grace
 /// fallback can mark a project Running while nothing answers on its app
 /// port. The layered probe (host connect, then in-container HTTP) splits
@@ -1833,6 +1873,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(DetachedContainers),
         Box::new(StaleAppUrl),
         Box::new(AppUnreachable),
+        Box::new(StorageUnwritable),
         Box::new(DbNotMigrated),
         Box::new(ViteHotStale),
         Box::new(EnvLineEndings),
@@ -1928,6 +1969,7 @@ mod tests {
             drifted_services: Vec::new(),
             detached_services: Vec::new(),
             app_reachability: None,
+            unwritable_paths: Vec::new(),
             vite_hot: None,
             env_crlf: false,
             xdebug: None,
@@ -2457,6 +2499,19 @@ mod tests {
         let repair = f.repair.as_ref().unwrap();
         assert_eq!(repair.id, REPAIR_FIX_APP_URL);
         assert_eq!(repair.risk, RiskTier::Safe);
+    }
+
+    #[test]
+    fn broken_writable_dirs_error_with_the_in_container_repair() {
+        let mut p = sail_project("shop");
+        p.running = true;
+        p.unwritable_paths = vec!["storage/framework/views".into()];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "storage-unwritable").unwrap();
+        assert_eq!(f.severity, Severity::Error);
+        assert!(f.detail.contains("tempnam()"), "{}", f.detail);
+        assert!(f.detail.contains("storage/framework/views is missing"), "{}", f.detail);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_STORAGE_WRITABLE);
     }
 
     #[test]
