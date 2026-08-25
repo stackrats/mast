@@ -542,6 +542,40 @@ impl Engine {
         }
         let rm: Vec<String> = ["docker", "rm", "-f", PROXY_CONTAINER].map(String::from).into();
         let _ = run_command(&rm, None, &[], DOCKER_TIMEOUT, OUTPUT_CAP).await;
+        // The old proxy is gone; anything still listening on 80/443 is an
+        // outside squatter the docker run below cannot beat. Name each
+        // platform's usual suspect instead of letting docker's "port is
+        // already allocated" do the explaining. Both address families — a
+        // v6-only listener blocks the bind just as hard.
+        for port in [80u16, 443] {
+            let connect = |addr: &'static str| async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(600),
+                    tokio::net::TcpStream::connect((addr, port)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            };
+            if connect("127.0.0.1").await || connect("::1").await {
+                let hint = if cfg!(windows) {
+                    "on Windows this is often IIS (World Wide Web Publishing Service) or \
+                     another web stack — an elevated `netstat -abno` names the holder"
+                } else if cfg!(target_os = "macos") {
+                    "often a local Apache/nginx — `sudo lsof -iTCP:80 -sTCP:LISTEN` names \
+                     the holder"
+                } else {
+                    "often a local Apache/nginx — `sudo ss -tlnp` names the holder"
+                };
+                out(format!(
+                    "something outside Mast is listening on port {port}, which the proxy \
+                     needs — {hint}; stop or reconfigure it, then enable the domain again"
+                ));
+                return Err(ErrorInfo::Conflict {
+                    message: format!("port {port} is held by a program outside Mast"),
+                });
+            }
+        }
         out(format!(
             "starting {PROXY_CONTAINER} ({PROXY_IMAGE}) on ports 80/443 — first run \
              pulls the image"
