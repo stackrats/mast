@@ -541,10 +541,15 @@ async function clearAppLog() {
                 : 'Current git branch — working tree is clean.'
             "
           >
-            <Badge variant="outline" class="shrink-0 normal-case">
-              <GitBranch class="h-3 w-3" />
-              {{ project.gitBranch }}
-              <span v-if="project.gitDirty" class="h-1.5 w-1.5 rounded-full bg-amber-500" />
+            <!-- The one chip allowed to shrink: long branch names ellipsize
+                 instead of being clipped by the row's overflow-hidden. -->
+            <Badge variant="outline" class="min-w-0 normal-case">
+              <GitBranch class="h-3 w-3 shrink-0" />
+              <span class="truncate">{{ project.gitBranch }}</span>
+              <span
+                v-if="project.gitDirty"
+                class="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
+              />
             </Badge>
           </Tooltip>
         </div>
