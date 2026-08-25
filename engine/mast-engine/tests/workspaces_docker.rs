@@ -21,14 +21,14 @@ async fn docker_usable() -> bool {
         return false;
     }
     mast_docker::run_command(
-        &["docker".into(), "info".into()],
+        &["docker".into(), "info".into(), "--format".into(), "{{.OSType}}".into()],
         None,
         &[],
         Duration::from_secs(10),
         16 * 1024,
     )
     .await
-    .map(|o| o.success())
+    .map(|o| o.success() && o.stdout.trim() == "linux")
     .unwrap_or(false)
 }
 

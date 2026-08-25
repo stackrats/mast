@@ -503,11 +503,14 @@ pub fn run() {
             }
             // Belt and braces for the taskbar button: set the window icon
             // explicitly so the tiled mark shows even where Windows' icon
-            // cache still serves the exe's old art for the shortcut.
+            // cache still serves the exe's old art for the shortcut. The
+            // tile lives in its own asset — the bundle PNGs are the bare
+            // transparent glyph (user preference: transparent everywhere it
+            // has contrast; only Windows' light taskbar needs the tile).
             #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main")
                 && let Ok(icon) =
-                    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/tile-128.png"))
             {
                 let _ = window.set_icon(icon);
             }
