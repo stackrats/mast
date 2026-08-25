@@ -271,6 +271,10 @@ fn observation(project_name: &str, project_dir: &Path, service: &str, state: &st
 
 #[tokio::test(flavor = "multi_thread")]
 async fn import_observe_and_reflect_terminal_changes() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "observeapp");
     let adapter = FakeAdapter::new();
@@ -1272,6 +1276,10 @@ async fn integrations_persist_and_launch_context_flows() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn env_report_and_env_edits_flow() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "envapp");
     std::fs::write(
@@ -1476,6 +1484,10 @@ async fn diagnostics_find_bootstrap_issues_and_safe_repairs_fix_them() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn catalog_add_and_three_way_remove() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "catapp");
     std::fs::write(project.join(".env"), "APP_NAME=catapp\n").unwrap();
@@ -1950,6 +1962,10 @@ async fn an_unknown_repo_offers_no_versions() {
 /// applied through the same write transaction as every other compose edit.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_image_retag_previews_and_applies() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "verapp");
     std::fs::write(project.join(".env"), "APP_NAME=verapp\n").unwrap();
