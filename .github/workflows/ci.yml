@@ -26,8 +26,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Early cross-platform honesty (plan §9): Linux ships first, but macOS and
-  # Windows must at least type-check every commit.
+  # Cross-platform honesty (plan §9), upgraded after the v0.3.0 field-fix
+  # wave: compiling was never enough — every cfg-gated branch must also RUN
+  # on its real platform. Docker-gated e2e suites skip cleanly where the
+  # runner has no usable docker; everything else executes.
+  # (Job names are pinned: they are required checks on main.)
   check-macos:
     name: cargo check (macOS)
     runs-on: macos-latest
@@ -35,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - run: cargo test --workspace
 
   check-windows:
     name: cargo check (Windows)
@@ -44,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - run: cargo test --workspace
 
   # Primary frontend toolchain: Vite Plus (vp) — check (fmt+lint+types),
   # tests, and production build, exactly as local dev runs them.
