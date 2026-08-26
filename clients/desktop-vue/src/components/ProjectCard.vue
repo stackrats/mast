@@ -11,6 +11,7 @@ import {
   FileCog,
   Globe,
   Hammer,
+  Loader2,
   Lock,
   Plus,
   FolderOpen,
@@ -51,6 +52,8 @@ import type {
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { statusBadgeVariant } from "../lib/status";
+import { stripAnsi } from "../lib/ansi";
+import { formatElapsed, useElapsed } from "../lib/elapsed";
 import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
@@ -65,6 +68,7 @@ import Sparkline from "./ui/Sparkline.vue";
 import Tooltip from "./ui/Tooltip.vue";
 import Input from "./ui/Input.vue";
 import Modal from "./ui/Modal.vue";
+import Select from "./ui/Select.vue";
 
 const { project } = defineProps<{ project: ProjectSummary }>();
 const emit = defineEmits<{ diagnose: [] }>();
@@ -73,6 +77,32 @@ const store = useEngineStore();
 const op = computed(() => store.operations[project.id]);
 const processes = computed(() => project.processes ?? []);
 const opRunning = computed(() => op.value != null && op.value.terminal === null);
+
+/** Nothing that changes this project may be touched while an operation is in
+ * flight. Two reasons, and the second is the sharp one: the store keys one
+ * operation per project, so a second dispatch silently supersedes the first
+ * in the UI while its docker command keeps running unwatched — and compose
+ * itself will not thank you for a `stop` landing mid-`up`. Folded into the
+ * same guard as read-only so every control asks the question once. */
+const locked = computed(() => store.readOnly || opRunning.value);
+
+const elapsed = useElapsed(
+  computed(() => (opRunning.value ? (op.value?.startedAt ?? null) : null)),
+);
+
+/** The operation's most recent word, for the card's one-line progress. A
+ * build spends minutes inside a single step; without this the card says
+ * "running…" for twenty minutes and the only way to tell a working build
+ * from a wedged one is to open the panel. */
+const lastLine = computed(() => {
+  const lines = op.value?.lines;
+  if (!lines) return null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = stripAnsi(lines[i].line).trim();
+    if (line) return line;
+  }
+  return null;
+});
 
 /** This project's share of the machine, or null when nothing of it is running
  * — which the template shows as a dash rather than a confident zero. */
@@ -433,12 +463,56 @@ function switchNode() {
 
 // --- user-defined commands, shown as chips like services/processes ---
 const commands = computed(() => project.commands ?? []);
-const addCommandOpen = ref(false);
+const commandDialogOpen = ref(false);
+/** The name of the command being edited, or null when adding a new one. Held
+ * as the ORIGINAL name, since the form may be renaming it. */
+const editingCommand = ref<string | null>(null);
 const catalogOpen = ref(false);
 const newName = ref("");
 const newCommand = ref("");
 const newAuto = ref(false);
 const newCwd = ref("");
+const newAfter = ref("");
+const newReadyWhen = ref("");
+
+function openCommandDialog(cmd?: ProjectCommand) {
+  editingCommand.value = cmd?.name ?? null;
+  newName.value = cmd?.name ?? "";
+  newCommand.value = cmd?.command ?? "";
+  newAuto.value = cmd?.autoStart ?? false;
+  newCwd.value = cmd?.cwd ?? "";
+  newAfter.value = cmd?.after ?? "";
+  newReadyWhen.value = cmd?.readyWhen ?? "";
+  commandDialogOpen.value = true;
+}
+
+/** Waiting on a command that never starts is the one way to configure this
+ * that fails silently: the chip just stays grey. Say so in the dialog, where
+ * the mistake is still cheap to undo. */
+const afterNotAuto = computed(() => {
+  const after = newAfter.value.trim();
+  if (!after || !newAuto.value) return false;
+  return commands.value.some((c) => c.name === after && !c.autoStart);
+});
+
+/** The other commands this one could wait for — itself excluded, since a
+ * command that waits for itself never starts. */
+const afterOptions = computed(() => [
+  { value: "", label: "start with the project" },
+  ...commands.value
+    .filter((c) => c.name !== editingCommand.value)
+    .map((c) => ({ value: c.name, label: `after ${c.name}` })),
+]);
+
+/** Why the form cannot be submitted yet, or null when it can. Names are the
+ * identity Mast runs and streams output under, so a collision would silently
+ * merge two commands into one. */
+const commandFormError = computed<string | null>(() => {
+  const name = newName.value.trim();
+  if (!name || !newCommand.value.trim()) return null; // nothing typed yet
+  const clash = commands.value.some((c) => c.name === name && c.name !== editingCommand.value);
+  return clash ? `A command named "${name}" already exists.` : null;
+});
 
 function commandOp(name: string) {
   return store.operations[commandKey(project.id, name)];
@@ -460,21 +534,27 @@ function stopCommand(cmd: ProjectCommand) {
 async function saveCommands(list: ProjectCommand[]) {
   await store.run({ type: "setProjectCommands", id: project.id, commands: list });
 }
-async function addCommand() {
+async function saveCommandForm() {
   const name = newName.value.trim();
   const command = newCommand.value.trim();
-  if (!name || !command) return;
-  await saveCommands([
-    ...commands.value,
-    { name, command, autoStart: newAuto.value, cwd: newCwd.value.trim() || null },
-  ]);
-  if (!store.error) {
-    addCommandOpen.value = false;
-    newName.value = "";
-    newCommand.value = "";
-    newAuto.value = false;
-    newCwd.value = "";
-  }
+  if (!name || !command || commandFormError.value) return;
+  const edited: ProjectCommand = {
+    name,
+    command,
+    autoStart: newAuto.value,
+    cwd: newCwd.value.trim() || null,
+    after: (newAuto.value && newAfter.value.trim()) || null,
+    readyWhen: newReadyWhen.value.trim() || null,
+  };
+  const original = editingCommand.value;
+  // Edited in place rather than removed and appended: the chip row is in list
+  // order, and a command should not jump to the end because its cwd changed.
+  await saveCommands(
+    original === null
+      ? [...commands.value, edited]
+      : commands.value.map((c) => (c.name === original ? edited : c)),
+  );
+  if (!store.error) commandDialogOpen.value = false;
 }
 
 // --- PHP runtime viewer: php -m and the classic ini limits from the LIVE
@@ -524,7 +604,14 @@ async function clearAppLog() {
           <h2 class="truncate font-semibold text-slate-900 dark:text-slate-100">
             {{ project.name }}
           </h2>
-          <Badge :variant="statusBadgeVariant[project.status]" class="shrink-0">
+          <!-- Mid-operation the stored status describes where the project is
+               coming from ("stopped" all through a rebuild), which is the one
+               reading guaranteed to be wrong. Say what is happening instead. -->
+          <Badge v-if="opRunning" variant="warning" class="shrink-0">
+            <Loader2 class="h-3 w-3 animate-spin" />
+            {{ op.label }}
+          </Badge>
+          <Badge v-else :variant="statusBadgeVariant[project.status]" class="shrink-0">
             {{ project.status }}
           </Badge>
           <Tooltip
@@ -579,7 +666,7 @@ async function clearAppLog() {
             </Button>
           </template>
           <Tooltip
-            text="Rebuild images, pull newer ones and recreate every container — for when the compose config changed underneath the project (e.g. after a git pull)."
+            text="Rebuild images, pull newer ones and recreate every container — for when the compose config changed underneath the project (e.g. after a git pull). A cold image build can run for half an hour; the card shows what it is doing."
           >
             <Button
               variant="outline"
@@ -835,7 +922,7 @@ async function clearAppLog() {
               <DropdownMenuItem
                 v-if="service.state !== 'running'"
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked"
                 @select="serviceVerb(service.name, 'start', 'startService')"
               >
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Start
@@ -843,14 +930,14 @@ async function clearAppLog() {
               <template v-else>
                 <DropdownMenuItem
                   :class="menuItemClass"
-                  :disabled="store.readOnly"
+                  :disabled="locked"
                   @select="serviceVerb(service.name, 'restart', 'restartService')"
                 >
                   <RotateCw class="h-3.5 w-3.5 text-slate-400" /> Restart
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   :class="menuItemClass"
-                  :disabled="store.readOnly"
+                  :disabled="locked"
                   @select="serviceVerb(service.name, 'stop', 'stopService')"
                 >
                   <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
@@ -859,7 +946,7 @@ async function clearAppLog() {
               <DropdownMenuItem
                 v-if="service.orphaned"
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked"
                 @select="
                   store.runLifecycle(project.id, `remove ${service.name}`, {
                     type: 'removeOrphanContainer',
@@ -876,7 +963,7 @@ async function clearAppLog() {
         <Chip
           dashed
           tip="Add or remove a service (Redis, Mailpit, a database, …), or change an installed one's version — each as a previewed compose edit."
-          :disabled="store.readOnly"
+          :disabled="locked"
           @click="catalogOpen = true"
         >
           <Plus class="h-3 w-3" /> Add
@@ -983,7 +1070,7 @@ async function clearAppLog() {
               <DropdownMenuItem
                 v-if="!proc.running"
                 :class="menuItemClass"
-                :disabled="store.readOnly || project.status !== 'running'"
+                :disabled="locked || project.status !== 'running'"
                 @select="processVerb(proc.id, proc.title, 'startProcess')"
               >
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Start{{
@@ -993,7 +1080,7 @@ async function clearAppLog() {
               <DropdownMenuItem
                 v-else
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked"
                 @select="processVerb(proc.id, proc.title, 'stopProcess')"
               >
                 <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
@@ -1030,10 +1117,26 @@ async function clearAppLog() {
           </DropdownMenuTrigger>
           <DropdownMenuPortal>
             <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
+              <!-- The line that will actually be run. A chip shows a name the
+                   user chose; when a command misbehaves, the question is
+                   always what it expands to, and a tooltip you have to hunt
+                   for is the wrong place to answer it. -->
+              <div class="max-w-72 px-2 py-1.5">
+                <p class="font-mono text-[11px] break-all text-slate-600 dark:text-slate-300">
+                  {{ cmd.command }}
+                </p>
+                <p class="mt-0.5 text-[10px] text-slate-400">
+                  in {{ cmd.cwd || "the project directory" }}
+                  <template v-if="cmd.autoStart">
+                    · auto<template v-if="cmd.after">, after {{ cmd.after }}</template>
+                  </template>
+                </p>
+              </div>
+              <DropdownMenuSeparator :class="menuSeparatorClass" />
               <DropdownMenuItem
                 v-if="!commandRunning(cmd.name)"
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked"
                 @select="runCommand(cmd)"
               >
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Run
@@ -1042,9 +1145,19 @@ async function clearAppLog() {
                 <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
               </DropdownMenuItem>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
+              <!-- Not while it runs: the live process would keep the old line
+                   either way, and a rename would strand its output under a
+                   key nothing is listening to any more. -->
               <DropdownMenuItem
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked || commandRunning(cmd.name)"
+                @select="openCommandDialog(cmd)"
+              >
+                <Pencil class="h-3.5 w-3.5 text-slate-400" /> Edit
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                :class="menuItemClass"
+                :disabled="locked"
                 @select="
                   saveCommands(
                     commands.map((c) =>
@@ -1057,7 +1170,7 @@ async function clearAppLog() {
               </DropdownMenuItem>
               <DropdownMenuItem
                 :class="menuItemClass"
-                :disabled="store.readOnly"
+                :disabled="locked"
                 @select="saveCommands(commands.filter((c) => c.name !== cmd.name))"
               >
                 <Trash2 class="h-3.5 w-3.5 text-slate-400" /> Delete
@@ -1065,7 +1178,7 @@ async function clearAppLog() {
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>
-        <Chip dashed :disabled="store.readOnly" @click="addCommandOpen = true">
+        <Chip dashed :disabled="locked" @click="openCommandDialog()">
           <Plus class="h-3 w-3" /> Add
         </Chip>
       </div>
@@ -1127,9 +1240,7 @@ async function clearAppLog() {
           </p>
           <div class="flex justify-end">
             <Button
-              :disabled="
-                store.readOnly || project.status === 'stopped' || project.status === 'failed'
-              "
+              :disabled="locked || project.status === 'stopped' || project.status === 'failed'"
               @click="startShare"
             >
               <Share2 class="h-3.5 w-3.5" /> Start sharing
@@ -1377,7 +1488,7 @@ async function clearAppLog() {
           <Button
             variant="outline"
             size="sm"
-            :disabled="store.readOnly || opRunning || !project.php"
+            :disabled="locked || !project.php"
             @click="
               extOpen = false;
               serviceVerb(project.php!.service, 'rebuild', 'rebuildService');
@@ -1418,7 +1529,7 @@ async function clearAppLog() {
         </p>
         <div class="flex flex-wrap gap-2">
           <Button
-            :disabled="store.readOnly || !domainValid || domainBusy"
+            :disabled="locked || !domainValid || domainBusy"
             @click="setDomain(domainDraft.trim().toLowerCase())"
           >
             <Lock class="h-3.5 w-3.5" />
@@ -1434,7 +1545,7 @@ async function clearAppLog() {
           <Button
             v-if="project.localDomain"
             variant="outline"
-            :disabled="store.readOnly || domainBusy"
+            :disabled="locked || domainBusy"
             @click="setDomain(null)"
           >
             Disable
@@ -1619,7 +1730,10 @@ async function clearAppLog() {
       </div>
     </Modal>
 
-    <Modal v-model:open="addCommandOpen" title="Add command">
+    <Modal
+      v-model:open="commandDialogOpen"
+      :title="editingCommand === null ? 'Add command' : `Edit ${editingCommand}`"
+    >
       <div class="space-y-3">
         <p class="text-xs text-slate-500 dark:text-slate-400">
           Runs on your machine with the project directory as working directory. A leading
@@ -1644,10 +1758,42 @@ async function clearAppLog() {
           <span class="font-mono">sail</span> commands only work from the project root.
         </p>
         <Checkbox v-model="newAuto" label="Run automatically when the project starts" />
+        <template v-if="newAuto">
+          <label class="block text-xs text-slate-600 dark:text-slate-300">
+            Start it
+            <Select v-model="newAfter" :options="afterOptions" class="mt-1" />
+          </label>
+          <p v-if="afterNotAuto" class="text-xs text-amber-700 dark:text-amber-300">
+            <span class="font-mono">{{ newAfter }}</span> does not start with the project, so
+            nothing will be waiting on — turn its auto-start on, or this command will never run by
+            itself.
+          </p>
+          <p v-if="newAfter" class="text-xs text-slate-400">
+            Waits for <span class="font-mono">{{ newAfter }}</span> to finish starting — not to
+            exit, which a dev server never does. Mast takes it as up when its
+            <span class="font-mono">ready when</span> text appears, or, if it has none, when its
+            output goes quiet.
+          </p>
+          <label class="block text-xs text-slate-600 dark:text-slate-300">
+            Ready when it prints <span class="text-slate-400">(optional)</span>
+            <Input v-model="newReadyWhen" placeholder="Server running on" mono class="mt-1" />
+          </label>
+          <p class="text-xs text-slate-400">
+            How anything waiting on <span class="font-mono">{{ newName.trim() || "this" }}</span>
+            knows it is up. Leave it blank and Mast waits for the output to settle instead, which is
+            a guess — a good one for a server that prints a banner and quietens down.
+          </p>
+        </template>
+        <p v-if="commandFormError" class="text-xs text-amber-700 dark:text-amber-300">
+          {{ commandFormError }}
+        </p>
         <div class="flex justify-end gap-2">
-          <Button variant="outline" @click="addCommandOpen = false">Cancel</Button>
-          <Button :disabled="!newName.trim() || !newCommand.trim()" @click="addCommand">
-            Add command
+          <Button variant="outline" @click="commandDialogOpen = false">Cancel</Button>
+          <Button
+            :disabled="!newName.trim() || !newCommand.trim() || commandFormError !== null"
+            @click="saveCommandForm"
+          >
+            {{ editingCommand === null ? "Add command" : "Save changes" }}
           </Button>
         </div>
       </div>
@@ -1659,9 +1805,19 @@ async function clearAppLog() {
     >
       <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
         {{ op.label }}
-        <span v-if="opRunning" class="text-amber-600">running…</span>
+        <span v-if="opRunning" class="text-amber-600"> running… {{ formatElapsed(elapsed) }} </span>
         <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700">cancelled</span>
         <span v-else class="text-red-700">failed: {{ op.error }}</span>
+      </p>
+      <!-- One line, truncated: enough to tell a build that is working from
+           one that has stopped, without the panel and without ever growing
+           the card. -->
+      <p
+        v-if="opRunning && lastLine"
+        class="mt-1 truncate font-mono text-[11px] text-slate-400"
+        :title="lastLine"
+      >
+        {{ lastLine }}
       </p>
       <!-- A failure is only actionable if you can see what was run. Matched
            fixes live in Diagnostics (one home for every repair) — the

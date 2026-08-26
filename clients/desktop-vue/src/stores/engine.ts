@@ -11,6 +11,7 @@ import type {
   LogCapture,
   LogLine,
   OperationId,
+  ProjectCommand,
   ProjectId,
   ProjectSummary,
   RepairOffer,
@@ -18,6 +19,8 @@ import type {
   WorkspaceSummary,
 } from "../bindings";
 import { EngineSync, type SyncPhase } from "../lib/engineSync";
+import { stripAnsi } from "../lib/ansi";
+import { formatElapsed } from "../lib/elapsed";
 import { notify } from "../lib/notify";
 import {
   loadCapturesSeen,
@@ -70,7 +73,16 @@ export interface OperationView {
   token: number;
   id: OperationId;
   label: string;
+  /** Wall-clock start, for the elapsed readout. A cold image build runs for
+   * tens of minutes, and "how long has this been going" is the question the
+   * user actually has while watching it. */
+  startedAt: number;
   lines: { line: string; stderr: boolean }[];
+  /** Output lines ever received, not the number still held. `lines` is a
+   * bounded ring, so its length plateaus once a chatty command fills it —
+   * which would read to the readiness watcher as the command falling
+   * silent, exactly when it is at its busiest. */
+  received: number;
   terminal: "completed" | "failed" | "cancelled" | null;
   error: string | null;
   /** A one-click repair the engine matched to this operation's failure —
@@ -97,6 +109,19 @@ export type Selection =
 let sync: EngineSync | null = null;
 let nextToken = 0;
 let nextActivity = 0;
+
+/** Past this, an operation is assumed to have outlasted the user's attention,
+ * and finishing is news. Under it, they are still looking at the card. */
+const WALKED_AWAY_MS = 60_000;
+
+/** How long a command must stay silent before its silence counts as "booted"
+ * rather than "still working". Long enough to outlast the gap between a
+ * server's own startup lines, short enough not to feel like a hang. */
+const READY_SETTLE_MS = 3_000;
+/** Give up waiting for a dependency here. Covers a first `pnpm install` on a
+ * cold store, and bounds a wait on a command nobody ever starts. */
+const READY_TIMEOUT_MS = 5 * 60_000;
+const READY_POLL_MS = 250;
 
 /** Operations-map key for a user-defined project command (M7.5). */
 export function commandKey(project: string, name: string): string {
@@ -201,6 +226,18 @@ export const useEngineStore = defineStore("engine", {
     latestUsage(state): UsageSample | null {
       return state.usage.at(-1) ?? null;
     },
+
+    /** Whether an operation is still in flight under a given key — a project
+     * id, or one of the `*Key()` slots. One definition because two places act
+     * on it: the controls that must not be touched mid-operation, and the
+     * spinner that says why they are dim. Unrelated to [`busy`], which counts
+     * short non-lifecycle dispatches across the whole app. */
+    hasRunningOp(state) {
+      return (key: string): boolean => {
+        const op = state.operations[key];
+        return op != null && op.terminal === null;
+      };
+    },
   },
 
   actions: {
@@ -257,14 +294,9 @@ export const useEngineStore = defineStore("engine", {
             }
             if (p.status !== "running" || wasRunning.get(p.id) !== false) continue;
             for (const cmd of (p.commands ?? []).filter((c) => c.autoStart)) {
-              const key = commandKey(p.id, cmd.name);
-              const existing = this.operations[key];
-              if (existing && existing.terminal === null) continue;
-              void this.runLifecycle(key, cmd.name, {
-                type: "runProjectCommand",
-                id: p.id,
-                name: cmd.name,
-              });
+              // Each chain runs on its own: a command that waits parks in its
+              // own promise rather than holding up the commands beside it.
+              void this.autoStartCommand(p.id, cmd);
             }
           }
         }
@@ -472,7 +504,9 @@ export const useEngineStore = defineStore("engine", {
         token,
         id: -1,
         label,
+        startedAt: Date.now(),
         lines: [],
+        received: 0,
         terminal: null,
         error: null,
         fixes: [],
@@ -496,6 +530,7 @@ export const useEngineStore = defineStore("engine", {
                 { line: event.kind.line, stderr: event.kind.stderr },
                 OP_LINE_CAP,
               );
+              op.received += 1;
               this.pushActivity(event.kind.line, event.kind.stderr);
               break;
             case "completed":
@@ -505,6 +540,17 @@ export const useEngineStore = defineStore("engine", {
                 event.kind.type === "completed" ? `✓ ${label} completed` : `⏹ ${label} cancelled`,
                 false,
               );
+              // Failures already notify. Success is worth it too once an
+              // operation has run long enough that you went and did something
+              // else — a cold rebuild is half an hour of not watching. Short
+              // ones stay silent; a notification per `stop` is just noise.
+              if (event.kind.type === "completed" && Date.now() - op.startedAt >= WALKED_AWAY_MS) {
+                void notify(
+                  "operations",
+                  `${label} finished`,
+                  `Took ${formatElapsed(Date.now() - op.startedAt)}.`,
+                );
+              }
               break;
             case "fixAvailable": {
               const repair = event.kind.repair;
@@ -530,6 +576,68 @@ export const useEngineStore = defineStore("engine", {
         if (current()) delete this.operations[project];
         this.error = e instanceof Error ? e.message : String(e);
       }
+    },
+
+    /** Auto-start one command, after whatever it waits for has come up.
+     * Manual Run deliberately ignores `after` — asking for a command by hand
+     * means now, not eventually. */
+    async autoStartCommand(project: ProjectId, cmd: ProjectCommand): Promise<void> {
+      const key = commandKey(project, cmd.name);
+      if (this.operations[key]?.terminal === null) return; // already running
+      const after = cmd.after?.trim();
+      if (after) {
+        const up = await this.waitForCommandReady(project, after);
+        if (!up) {
+          this.pushActivity(`✗ ${cmd.name} not started — ${after} never came up`, true);
+          return;
+        }
+      }
+      await this.runLifecycle(key, cmd.name, {
+        type: "runProjectCommand",
+        id: project,
+        name: cmd.name,
+      });
+    },
+
+    /** Resolve once `name` has finished starting, or false if it never does.
+     *
+     * A dev server never exits, so "finished" is the wrong question — what a
+     * dependent needs is "up". Three ways to know, in order of how much they
+     * can be trusted: the command exited cleanly (a one-shot really is done),
+     * its declared `readyWhen` text appeared, or it printed something and
+     * then went quiet, which is what a server does once it has finished
+     * booting. The last is a guess, which is why the first two exist. */
+    async waitForCommandReady(project: ProjectId, name: string): Promise<boolean> {
+      const key = commandKey(project, name);
+      const readyWhen = this.projects
+        .find((p) => p.id === project)
+        ?.commands?.find((c) => c.name === name)
+        ?.readyWhen?.trim();
+      const until = Date.now() + READY_TIMEOUT_MS;
+      let seen = -1;
+      let quietSince = Date.now();
+      while (Date.now() < until) {
+        const op = this.operations[key];
+        // Absent is "not yet", not "never": the command it waits for is very
+        // likely being dispatched in the same tick. The timeout is what stops
+        // this waiting forever on a command nobody is going to start.
+        if (op?.terminal === "completed") return true;
+        if (op?.terminal) return false;
+        if (op) {
+          if (readyWhen) {
+            // Matched against the visible text — the banner worth waiting for
+            // is exactly the sort of line a tool prints in colour.
+            if (op.lines.some((l) => stripAnsi(l.line).includes(readyWhen))) return true;
+          } else if (op.received !== seen) {
+            seen = op.received;
+            quietSince = Date.now();
+          } else if (seen > 0 && Date.now() - quietSince >= READY_SETTLE_MS) {
+            return true;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
+      }
+      return false;
     },
 
     /** Drop a finished operation so its card stops being shown. */
