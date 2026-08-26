@@ -9,7 +9,8 @@ use crate::{
     REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_MIGRATE_MAILPIT, REPAIR_NODE_INSTALL,
     REPAIR_ARTISAN_MIGRATE, REPAIR_FIX_APP_URL, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REASSIGN_PORTS,
-    REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME,
+    REPAIR_PNPM_VERIFY_OFF, REPAIR_RECREATE_SERVICE, REPAIR_REMOVE_HOT, REPAIR_SAIL_INSTALL,
+    REPAIR_SET_PROJECT_NAME,
     REPAIR_PHP_AS_ROOT, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK, REPAIR_STORAGE_WRITABLE,
 };
 use mast_laravel::db::{ProbeFailure, VersionVerdict};
@@ -328,6 +329,59 @@ impl Check for VendorMissing {
                         .into(),
                     arg: None,
                 });
+                for_project(f, p)
+            })
+            .collect()
+    }
+}
+
+/// pnpm's `node_modules` installed against a store the app container cannot
+/// reach — or the mirror image, installed in the container against a store
+/// path the host does not have.
+///
+/// pnpm is the only manager this can happen to: npm, yarn and bun copy real
+/// files and record nothing, while pnpm records the store's absolute path at
+/// install time and (since pnpm 10) verifies it before every `pnpm run`. A
+/// Sail project shares one `node_modules` across the bind mount, so whichever
+/// side did not run the install fails that check every time — pnpm tries to
+/// rebuild the directory, stops to ask permission, and a log has no keyboard.
+/// The visible symptom is `artisan dev`'s vite lane dying in a loop while the
+/// site keeps serving: what is actually lost is hot reload. The installed
+/// files work on BOTH sides (hard links carry real content); only the check
+/// fails, so the repair switches the check off rather than moving the tree.
+struct PnpmSplitStore;
+impl Check for PnpmSplitStore {
+    fn id(&self) -> &'static str {
+        "node-modules-foreign-store"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        ctx.projects.iter().any(|p| p.node_modules_foreign_store.is_some())
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        ctx.projects
+            .iter()
+            .filter(|p| p.has_compose && !p.pnpm_verify_disabled)
+            .filter(|p| p.package_manager.as_deref() == Some("pnpm"))
+            .filter_map(|p| p.node_modules_foreign_store.as_ref().map(|store| (p, store)))
+            .map(|(p, store)| {
+                let mut f = finding(
+                    self.id(),
+                    Severity::Warning,
+                    format!(
+                        "{}'s node_modules only verifies on the machine that installed it",
+                        p.name
+                    ),
+                    format!(
+                        "It records {store} as its package store, a path only the installing \
+                         side has. pnpm checks that path before every `pnpm run`, so runs on \
+                         the other side of the bind mount — the vite lane of `artisan dev` in \
+                         the app container, most visibly — try to reinstall, find no terminal \
+                         to confirm on, and die in a retry loop. The site keeps serving; hot \
+                         reload is what breaks. The installed files themselves work on both \
+                         sides — only pnpm's bookkeeping check fails."
+                    ),
+                );
+                f.repair = repair_spec(REPAIR_PNPM_VERIFY_OFF, None);
                 for_project(f, p)
             })
             .collect()
@@ -1882,6 +1936,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(EnvMissing),
         Box::new(VendorMissing),
         Box::new(NodeModulesMissing),
+        Box::new(PnpmSplitStore),
         Box::new(AmbiguousLockfiles),
         Box::new(SailMissing),
         Box::new(AppKeyMissing),
@@ -1969,6 +2024,8 @@ mod tests {
             package_manager: Some("npm".into()),
             node_lockfile: true,
             has_node_modules: true,
+            node_modules_foreign_store: None,
+            pnpm_verify_disabled: false,
             conflicting_lockfiles: Vec::new(),
             env_present: true,
             env_example_present: true,
@@ -2718,6 +2775,59 @@ mod tests {
         let (_, findings) = run_all(&c);
         let f = findings.iter().find(|f| f.check == "compose-quirks").unwrap();
         assert!(f.detail.contains("host-gateway"), "{}", f.detail);
+    }
+
+    /// The split-store check exists because nothing else reports this: the
+    /// site keeps serving and the only trace is a pnpm stack trace in the
+    /// vite lane's log.
+    #[test]
+    fn a_split_pnpm_store_offers_the_verify_off_repair() {
+        let mut p = sail_project("a");
+        p.package_manager = Some("pnpm".into());
+        p.has_node_modules = true;
+        p.node_modules_foreign_store = Some("/home/me/.local/share/pnpm/store/v11".into());
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let f = findings.iter().find(|f| f.check == "node-modules-foreign-store").unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.repair.as_ref().unwrap().id, REPAIR_PNPM_VERIFY_OFF);
+        assert_eq!(f.repair.as_ref().unwrap().risk, RiskTier::Safe);
+        // The path is quoted — "which store" is the whole diagnosis.
+        assert!(f.detail.contains("/home/me/.local/share/pnpm/store/v11"), "{}", f.detail);
+    }
+
+    /// Silent in every state where there is nothing to do: already repaired,
+    /// a manager that records no store, a store the engine judged reachable,
+    /// and a project that never runs in a container at all.
+    #[test]
+    fn the_split_store_check_stays_quiet_when_nothing_is_wrong() {
+        let fired = |p| {
+            let (_, findings) = run_all(&ctx(vec![p]));
+            findings.iter().any(|f| f.check == "node-modules-foreign-store")
+        };
+
+        let mut repaired = sail_project("a");
+        repaired.package_manager = Some("pnpm".into());
+        repaired.node_modules_foreign_store = Some("/home/me/store".into());
+        repaired.pnpm_verify_disabled = true;
+        assert!(!fired(repaired));
+
+        // npm never records a store, so the engine never sets the fact; a
+        // stale fact with a non-pnpm manager must still not fire.
+        let mut npm = sail_project("b");
+        npm.package_manager = Some("npm".into());
+        npm.node_modules_foreign_store = Some("/home/me/store".into());
+        assert!(!fired(npm));
+
+        let mut reachable = sail_project("c");
+        reachable.package_manager = Some("pnpm".into());
+        reachable.node_modules_foreign_store = None;
+        assert!(!fired(reachable));
+
+        let mut hostless = sail_project("d");
+        hostless.package_manager = Some("pnpm".into());
+        hostless.node_modules_foreign_store = Some("/home/me/store".into());
+        hostless.has_compose = false;
+        assert!(!fired(hostless));
     }
 
     #[test]

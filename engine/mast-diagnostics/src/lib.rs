@@ -40,6 +40,7 @@ pub const REPAIR_CREATE_NETWORK: &str = "create-network";
 pub const REPAIR_DOCKER_GROUP: &str = "docker-group";
 pub const REPAIR_SAIL_INSTALL: &str = "sail-install";
 pub const REPAIR_NODE_INSTALL: &str = "node-install";
+pub const REPAIR_PNPM_VERIFY_OFF: &str = "pnpm-verify-off";
 pub const REPAIR_REASSIGN_PORTS: &str = "reassign-ports";
 pub const REPAIR_RECREATE_SERVICE: &str = "recreate-service";
 pub const REPAIR_FIX_APP_URL: &str = "fix-app-url";
@@ -202,6 +203,13 @@ pub struct ProjectFacts {
     /// frozen rather than re-resolved.
     pub node_lockfile: bool,
     pub has_node_modules: bool,
+    /// Set when `node_modules` records a pnpm store the app container cannot
+    /// see — an absolute path outside the project, so outside the bind
+    /// mount. Holds the path, for the finding to quote.
+    pub node_modules_foreign_store: Option<String>,
+    /// pnpm-workspace.yaml already sets `verifyDepsBeforeRun: false`, so the
+    /// split-store failure cannot fire.
+    pub pnpm_verify_disabled: bool,
     /// Lockfiles for competing managers, when the repo holds more than one.
     pub conflicting_lockfiles: Vec<String>,
     pub env_present: bool,
@@ -467,6 +475,23 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           built against the runtime that will load them."
                 .into(),
             arg: arg.map(String::from),
+        }),
+        REPAIR_PNPM_VERIFY_OFF => Some(RepairSpec {
+            id: REPAIR_PNPM_VERIFY_OFF,
+            title: "Skip pnpm's pre-run check, so the host owns node_modules".into(),
+            risk: RiskTier::Safe,
+            description: "Appends `verifyDepsBeforeRun: false` to pnpm-workspace.yaml \
+                          (creating the file if the project has none), shown as a diff \
+                          first. pnpm then stops comparing node_modules against its \
+                          install-time store path before `pnpm run` — the one comparison \
+                          that can never pass across the container boundary, even though \
+                          the installed files themselves work on both sides. Nothing is \
+                          reinstalled and nothing else changes. The trade: pnpm no longer \
+                          auto-installs when dependencies drift, so run `pnpm install` \
+                          yourself after changing package.json or pulling a lockfile \
+                          change."
+                .into(),
+            arg: None,
         }),
         REPAIR_SAIL_INSTALL => Some(RepairSpec {
             id: REPAIR_SAIL_INSTALL,

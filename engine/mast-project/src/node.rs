@@ -10,7 +10,7 @@
 //! corepack) and bun, and `vendor/bin/sail` proxies all four, so acting on the
 //! detected manager needs nothing extra installed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
@@ -52,10 +52,15 @@ impl PackageManager {
             (PackageManager::Npm, true) => &["npm", "ci"],
             (PackageManager::Npm, false) => &["npm", "install"],
             (PackageManager::Pnpm, true) => &["pnpm", "install", "--frozen-lockfile"],
-            (PackageManager::Pnpm, false) => &["pnpm", "install"],
+            // Spelled out rather than left to the default: an unattended
+            // install runs with CI=true (the only thing that stops pnpm
+            // prompting before it replaces a modules directory), and CI is
+            // exactly what flips this default the other way. Mast has already
+            // decided — say so, so the environment cannot overrule it.
+            (PackageManager::Pnpm, false) => &["pnpm", "install", "--no-frozen-lockfile"],
             (PackageManager::Yarn, _) => &["yarn", "install"],
             (PackageManager::Bun, true) => &["bun", "install", "--frozen-lockfile"],
-            (PackageManager::Bun, false) => &["bun", "install"],
+            (PackageManager::Bun, false) => &["bun", "install", "--no-frozen-lockfile"],
         };
         args.iter().map(|s| s.to_string()).collect()
     }
@@ -83,6 +88,15 @@ pub struct NodeProject {
     /// and worth reporting rather than silently resolving.
     pub conflicting_lockfiles: Vec<String>,
     pub has_node_modules: bool,
+    /// The package store `node_modules` was installed against, as pnpm's own
+    /// install recorded it. Absolute, and meaningful only on the machine that
+    /// wrote it — which is the whole problem this exists to expose. `None`
+    /// for npm/yarn/bun, which copy files and record nothing.
+    pub modules_store: Option<PathBuf>,
+    /// `verifyDepsBeforeRun: false` is already set in pnpm-workspace.yaml,
+    /// so pnpm no longer checks the store before `pnpm run` — the split-store
+    /// failure cannot fire and there is nothing left to repair.
+    pub verify_deps_disabled: bool,
 }
 
 /// Inspect a directory's Node setup. `None` when there is no package.json —
@@ -97,6 +111,8 @@ pub fn inspect_node_project(dir: &Path) -> Option<NodeProject> {
     let present: Vec<(&str, PackageManager)> =
         LOCKFILES.iter().copied().filter(|(name, _)| dir.join(name).is_file()).collect();
     let has_node_modules = dir.join("node_modules").is_dir();
+    let modules_store = recorded_store_dir(dir);
+    let verify_deps_disabled = verify_deps_disabled(dir);
 
     if let Some(pinned) = package_manager_field(&package_json) {
         return Some(NodeProject {
@@ -105,6 +121,8 @@ pub fn inspect_node_project(dir: &Path) -> Option<NodeProject> {
             pinned: true,
             conflicting_lockfiles: Vec::new(),
             has_node_modules,
+            modules_store: modules_store.clone(),
+            verify_deps_disabled,
         });
     }
 
@@ -128,6 +146,39 @@ pub fn inspect_node_project(dir: &Path) -> Option<NodeProject> {
         pinned: false,
         conflicting_lockfiles,
         has_node_modules,
+        modules_store,
+        verify_deps_disabled,
+    })
+}
+
+/// The store path `node_modules/.modules.yaml` records — pnpm's note to
+/// itself about which store the tree's links point into.
+///
+/// Scanned for the one key rather than parsed: the file has been JSON inside
+/// a `.yaml` name since pnpm 10, is YAML in older versions, and carries a
+/// megabyte of hoisting detail either way. One key is all this needs, and a
+/// scanner cannot be broken by the next format change.
+fn recorded_store_dir(dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(dir.join("node_modules/.modules.yaml")).ok()?;
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let rest =
+            line.strip_prefix("storeDir:").or_else(|| line.strip_prefix("\"storeDir\":"))?;
+        let value = rest.trim().trim_end_matches(',').trim().trim_matches(['"', '\'']);
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    })
+}
+
+/// Whether pnpm-workspace.yaml already switches pnpm's pre-run store check
+/// off. Same scanner discipline as [`recorded_store_dir`]: one top-level key,
+/// read as a line, immune to the rest of the file.
+fn verify_deps_disabled(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join("pnpm-workspace.yaml")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.strip_prefix("verifyDepsBeforeRun:")
+            .is_some_and(|value| value.trim() == "false")
     })
 }
 
@@ -255,6 +306,65 @@ mod tests {
         assert_eq!(n.manager, PackageManager::Yarn);
     }
 
+    /// Both shapes pnpm has written this file in, and the case that matters:
+    /// nothing recorded at all (npm/yarn/bun).
+    #[test]
+    fn the_recorded_store_is_read_in_either_format() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), "{}").unwrap();
+        let modules = d.path().join("node_modules");
+        std::fs::create_dir(&modules).unwrap();
+
+        // pnpm 10+ writes JSON into the .yaml name.
+        std::fs::write(
+            modules.join(".modules.yaml"),
+            "{\n  \"nodeLinker\": \"isolated\",\n  \"storeDir\": \"/home/me/.local/share/pnpm/store/v11\",\n  \"virtualStoreDir\": \".pnpm\"\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_node_project(d.path()).unwrap().modules_store,
+            Some(PathBuf::from("/home/me/.local/share/pnpm/store/v11"))
+        );
+
+        // Older pnpm wrote actual YAML.
+        std::fs::write(
+            modules.join(".modules.yaml"),
+            "hoistPattern:\n  - '*'\nstoreDir: /var/www/html/.pnpm-store/v11\nvirtualStoreDir: .pnpm\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_node_project(d.path()).unwrap().modules_store,
+            Some(PathBuf::from("/var/www/html/.pnpm-store/v11"))
+        );
+
+        std::fs::remove_file(modules.join(".modules.yaml")).unwrap();
+        assert_eq!(inspect_node_project(d.path()).unwrap().modules_store, None);
+    }
+
+    /// The already-repaired state must read as repaired, or the finding never
+    /// goes away. Only a top-level `false` counts — a commented line or a
+    /// different value does not.
+    #[test]
+    fn the_verify_switch_is_only_seen_when_actually_off() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), "{}").unwrap();
+        assert!(!inspect_node_project(d.path()).unwrap().verify_deps_disabled);
+
+        std::fs::write(
+            d.path().join("pnpm-workspace.yaml"),
+            "allowBuilds:\n  vue-demi: true\n# a comment\nverifyDepsBeforeRun: false\n",
+        )
+        .unwrap();
+        assert!(inspect_node_project(d.path()).unwrap().verify_deps_disabled);
+
+        std::fs::write(
+            d.path().join("pnpm-workspace.yaml"),
+            "# verifyDepsBeforeRun: false\nverifyDepsBeforeRun: install\n",
+        )
+        .unwrap();
+        assert!(!inspect_node_project(d.path()).unwrap().verify_deps_disabled);
+    }
+
     #[test]
     fn node_modules_is_detected() {
         let d = dir();
@@ -273,5 +383,15 @@ mod tests {
         );
         assert_eq!(PackageManager::Yarn.install_argv(true), ["yarn", "install"]);
         assert_eq!(PackageManager::Bun.install_argv(true), ["bun", "install", "--frozen-lockfile"]);
+        // Without a committed lockfile the resolve must be allowed, whatever
+        // CI=true would otherwise default these two to.
+        assert_eq!(
+            PackageManager::Pnpm.install_argv(false),
+            ["pnpm", "install", "--no-frozen-lockfile"]
+        );
+        assert_eq!(
+            PackageManager::Bun.install_argv(false),
+            ["bun", "install", "--no-frozen-lockfile"]
+        );
     }
 }

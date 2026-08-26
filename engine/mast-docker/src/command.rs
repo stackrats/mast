@@ -27,6 +27,11 @@ pub enum CommandError {
     },
     #[error("{argv0} timed out after {seconds}s")]
     Timeout { argv0: String, seconds: u64 },
+    /// Distinct from [`Self::Timeout`] on purpose: "still running after an
+    /// hour" and "has said nothing for ten minutes" are different diagnoses,
+    /// and only the second one means the command is actually stuck.
+    #[error("{argv0} produced no output for {seconds}s")]
+    Stalled { argv0: String, seconds: u64 },
     #[error("i/o error running {argv0}: {source}")]
     Io {
         argv0: String,
@@ -282,6 +287,45 @@ fn kill_group(pid: i32, signal: i32) {
     }
 }
 
+/// How long a streamed command is allowed to take. A wall clock alone cannot
+/// answer the question that matters — a cold image build legitimately runs for
+/// half an hour, and any number large enough to let it finish is far too large
+/// to notice a command that wedged in the first minute. Streamed output is the
+/// progress signal both readings need: `idle` kills silence, `overall` is the
+/// backstop for something that chatters forever without converging.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamBudget {
+    /// Killed once it has produced no output for this long. `None` for
+    /// processes that are *supposed* to sit quiet — a dev server between
+    /// requests is healthy, not stuck.
+    pub idle: Option<Duration>,
+    /// Killed at this age however well it is progressing.
+    pub overall: Duration,
+}
+
+impl StreamBudget {
+    /// A command expected to finish, which narrates while it works: output
+    /// keeps it alive, silence for `idle` ends it, `overall` bounds the lot.
+    pub fn progressing(idle: Duration, overall: Duration) -> Self {
+        Self { idle: Some(idle), overall }
+    }
+
+    /// A process expected to run until something stops it, and to be silent
+    /// for long stretches meanwhile.
+    pub fn long_running(overall: Duration) -> Self {
+        Self { idle: None, overall }
+    }
+}
+
+/// A bare duration is the old behavior — a wall clock and no interest in
+/// whether the command is making progress. Kept so call sites that have no
+/// opinion yet read as plainly as they did before.
+impl From<Duration> for StreamBudget {
+    fn from(overall: Duration) -> Self {
+        Self::long_running(overall)
+    }
+}
+
 /// Run `argv` in its own process group, streaming stdout/stderr lines into
 /// `lines`. Cancellation SIGTERMs the group, escalating to SIGKILL after
 /// `grace`. Lines longer than 8 KiB are truncated.
@@ -291,9 +335,10 @@ pub async fn run_streaming(
     env_overlay: &[(String, String)],
     lines: mpsc::Sender<OutputLine>,
     cancel: CancellationToken,
-    timeout: Duration,
+    budget: impl Into<StreamBudget>,
     grace: Duration,
 ) -> Result<CommandOutcome, CommandError> {
+    let budget = budget.into();
     let watchers =
         start_all(&CommandStart { argv, cwd, env_overlay, streaming: true, detached: false });
     // Only collected when someone is listening; a long-running dev server
@@ -301,7 +346,7 @@ pub async fn run_streaming(
     let tail: Option<Tail> =
         (!watchers.is_empty()).then(|| Arc::new(Mutex::new(VecDeque::new())));
     let result =
-        run_streaming_inner(argv, cwd, env_overlay, lines, cancel, timeout, grace, tail.clone())
+        run_streaming_inner(argv, cwd, env_overlay, lines, cancel, budget, grace, tail.clone())
             .await;
     if !watchers.is_empty() {
         let tail: Vec<String> =
@@ -326,7 +371,7 @@ async fn run_streaming_inner(
     env_overlay: &[(String, String)],
     lines: mpsc::Sender<OutputLine>,
     cancel: CancellationToken,
-    timeout: Duration,
+    budget: StreamBudget,
     grace: Duration,
     tail: Option<Tail>,
 ) -> Result<CommandOutcome, CommandError> {
@@ -358,15 +403,21 @@ async fn run_streaming_inner(
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    // Last time either stream said anything. Both readers stamp it and the
+    // waiter below reads it, so the idle budget measures the process's own
+    // progress rather than the wall clock.
+    let spoke = Arc::new(Mutex::new(tokio::time::Instant::now()));
     for (reader, is_stderr) in [(Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Send + Unpin>, false)]
         .into_iter()
         .chain([(Box::new(stderr) as Box<dyn tokio::io::AsyncRead + Send + Unpin>, true)])
     {
         let lines = lines.clone();
         let tail = tail.clone();
+        let spoke = spoke.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(reader).lines();
             while let Ok(Some(mut line)) = reader.next_line().await {
+                *spoke.lock().unwrap() = tokio::time::Instant::now();
                 line.truncate(MAX_LINE);
                 if let Some(tail) = &tail {
                     let mut tail = tail.lock().unwrap();
@@ -391,25 +442,50 @@ async fn run_streaming_inner(
         let _ = first;
     };
 
-    tokio::select! {
-        status = &mut wait => {
-            let status = status
-                .map_err(|e| CommandError::Io { argv0: argv0.clone(), source: std::io::Error::other(e) })?
-                .map_err(|source| CommandError::Io { argv0: argv0.clone(), source })?;
-            Ok(CommandOutcome::Exited(status.code().unwrap_or(-1)))
-        }
-        _ = cancel.cancelled() => {
-            escalate(SIG_TERM).await;
-            if tokio::time::timeout(grace, &mut wait).await.is_err() {
+    let expires = tokio::time::Instant::now() + budget.overall;
+    loop {
+        // Recomputed every pass: output that arrived while we were parked
+        // pushes the idle deadline out, so a command that keeps talking is
+        // only ever stopped by `overall`.
+        let deadline = match budget.idle {
+            Some(idle) => expires.min(*spoke.lock().unwrap() + idle),
+            None => expires,
+        };
+        tokio::select! {
+            status = &mut wait => {
+                let status = status
+                    .map_err(|e| CommandError::Io { argv0: argv0.clone(), source: std::io::Error::other(e) })?
+                    .map_err(|source| CommandError::Io { argv0: argv0.clone(), source })?;
+                return Ok(CommandOutcome::Exited(status.code().unwrap_or(-1)));
+            }
+            _ = cancel.cancelled() => {
+                escalate(SIG_TERM).await;
+                if tokio::time::timeout(grace, &mut wait).await.is_err() {
+                    escalate(SIG_KILL).await;
+                    let _ = wait.await;
+                }
+                return Ok(CommandOutcome::Cancelled);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let now = tokio::time::Instant::now();
+                if now < expires
+                    && let Some(idle) = budget.idle
+                    && now < *spoke.lock().unwrap() + idle
+                {
+                    // It spoke while we were waiting — this deadline is stale.
+                    continue;
+                }
                 escalate(SIG_KILL).await;
                 let _ = wait.await;
+                return Err(if now < expires {
+                    CommandError::Stalled {
+                        argv0,
+                        seconds: budget.idle.unwrap_or_default().as_secs(),
+                    }
+                } else {
+                    CommandError::Timeout { argv0, seconds: budget.overall.as_secs() }
+                });
             }
-            Ok(CommandOutcome::Cancelled)
-        }
-        _ = tokio::time::sleep(timeout) => {
-            escalate(SIG_KILL).await;
-            let _ = wait.await;
-            Err(CommandError::Timeout { argv0, seconds: timeout.as_secs() })
         }
     }
 }
@@ -417,6 +493,80 @@ async fn run_streaming_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the idle budget: a command that keeps talking runs
+    /// past a wall clock that would have killed it. This one lives four times
+    /// its own idle allowance by saying something every so often.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steady_output_outlives_the_idle_allowance() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let argv: Vec<String> =
+            ["bash", "-c", "for i in 1 2 3 4 5 6 7 8; do echo tick; sleep 0.1; done"]
+                .map(String::from)
+                .to_vec();
+        let outcome = run_streaming(
+            &argv,
+            None,
+            &[],
+            tx,
+            CancellationToken::new(),
+            StreamBudget::progressing(Duration::from_millis(250), Duration::from_secs(30)),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a command that keeps printing must not be killed");
+        assert!(matches!(outcome, CommandOutcome::Exited(0)), "{outcome:?}");
+        let mut ticks = 0;
+        while rx.recv().await.is_some() {
+            ticks += 1;
+        }
+        assert_eq!(ticks, 8);
+    }
+
+    /// And the converse — silence past the allowance is what "stuck" means.
+    /// Reported as `Stalled`, not `Timeout`: the command still had most of
+    /// its overall budget left, so the clock is not the story.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn silence_past_the_allowance_is_a_stall() {
+        let (tx, _rx) = mpsc::channel(64);
+        let argv: Vec<String> =
+            ["bash", "-c", "echo starting; sleep 30"].map(String::from).to_vec();
+        let err = run_streaming(
+            &argv,
+            None,
+            &[],
+            tx,
+            CancellationToken::new(),
+            StreamBudget::progressing(Duration::from_millis(300), Duration::from_secs(30)),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("silence past the idle allowance must end the command");
+        assert!(matches!(err, CommandError::Stalled { .. }), "{err:?}");
+    }
+
+    /// A process with no idle budget is never judged on silence — a dev
+    /// server between requests is healthy, and only `overall` may end it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quiet_long_running_process_is_only_bound_by_the_backstop() {
+        let (tx, _rx) = mpsc::channel(64);
+        let argv: Vec<String> = ["bash", "-c", "sleep 30"].map(String::from).to_vec();
+        let err = run_streaming(
+            &argv,
+            None,
+            &[],
+            tx,
+            CancellationToken::new(),
+            StreamBudget::long_running(Duration::from_millis(300)),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the backstop still applies");
+        assert!(matches!(err, CommandError::Timeout { .. }), "{err:?}");
+    }
 
     /// unix-only: drives `bash` (on Windows runners `bash` is WSL's
     /// launcher) and asserts unix process semantics.
