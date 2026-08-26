@@ -9,15 +9,22 @@
 //! - Stream traffic: `{"stream":k,"item":…}` — the CLIENT chooses `k` and
 //!   registers its receiver before sending the request, so no item can race
 //!   the response. A `{"stream":k,"end":true}` marks stream end.
-//! - The first request MUST be `hello {"protocolVersion":N}`: exact-match
-//!   negotiation against the frozen contract v1.
+//! - The first request MUST be `hello {"protocolVersion":N,"version":"x.y.z"}`:
+//!   exact-match negotiation against the frozen contract v1, then a build
+//!   check against `BUILD_VERSION`. Protocol version guards the framing;
+//!   build version guards the DTO shapes riding on it, which is what
+//!   actually drifts when the app and the CLI install through different
+//!   channels. The reply carries both back.
 
 #![cfg_attr(not(unix), allow(unused))]
 
 use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
-use mast_contract::{Action, ErrorInfo, OperationId, ProjectId, PROTOCOL_VERSION, WorkspaceId};
+use mast_contract::{
+    Action, BUILD_VERSION, ErrorInfo, OperationId, PROTOCOL_VERSION, ProjectId, WorkspaceId,
+    describe_peer_version, wire_compatible,
+};
 use mast_engine::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -150,8 +157,28 @@ async fn handle_connection(engine: Engine, stream: UnixStream) -> std::io::Resul
                 .await;
                 break;
             }
+            // Protocol version says the framing matches. It is frozen at 1
+            // and stays there while DTOs grow additively, so it cannot say
+            // whether the payloads match — for that, compare builds. Refusing
+            // here costs one clear error; letting it through costs a missing
+            // field panic three calls later that names nothing useful.
+            let peer = request.params.get("version").and_then(Value::as_str).unwrap_or("");
+            if !wire_compatible(peer, BUILD_VERSION) {
+                send(&tx, error_response(id, ErrorInfo::VersionMismatch {
+                    // Not necessarily broken — just a build from before the
+                    // handshake carried a version. Name it as such.
+                    client: describe_peer_version(peer).to_string(),
+                    server: BUILD_VERSION.to_string(),
+                }))
+                .await;
+                break;
+            }
             greeted = true;
-            send(&tx, json!({"id": id, "result": {"protocolVersion": PROTOCOL_VERSION}})).await;
+            send(&tx, json!({
+                "id": id,
+                "result": {"protocolVersion": PROTOCOL_VERSION, "version": BUILD_VERSION},
+            }))
+            .await;
             continue;
         }
         let reply = handle_request(&engine, &tx, &request.method, request.params).await;

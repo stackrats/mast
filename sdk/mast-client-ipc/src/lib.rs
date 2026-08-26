@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 // Only the unix `connect` speaks the wire protocol; the non-unix stub refuses
 // before any of this is reachable.
 #[cfg(unix)]
-use mast_contract::PROTOCOL_VERSION;
+use mast_contract::{BUILD_VERSION, PROTOCOL_VERSION, describe_peer_version, wire_compatible};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -105,7 +105,10 @@ impl IpcClient {
 
         let client = Self { writer, router, next_id: AtomicU64::new(1) };
         let negotiated = client
-            .request("hello", json!({"protocolVersion": PROTOCOL_VERSION}))
+            .request(
+                "hello",
+                json!({"protocolVersion": PROTOCOL_VERSION, "version": BUILD_VERSION}),
+            )
             .await?;
         let daemon_version =
             negotiated.get("protocolVersion").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -113,6 +116,19 @@ impl IpcClient {
             return Err(ClientError::Engine(ErrorInfo::ProtocolMismatch {
                 expected: PROTOCOL_VERSION,
                 actual: daemon_version,
+            }));
+        }
+        // The mirror of the daemon's own check, and the direction that bites
+        // in practice: a CLI installed from the latest release meeting a
+        // desktop app somebody installed months ago. A daemon that predates
+        // the versioned handshake accepts our `hello` (unknown params are
+        // ignored) and answers without a `version` — silence means "older
+        // build", never "compatible".
+        let daemon_build = negotiated.get("version").and_then(Value::as_str).unwrap_or("");
+        if !wire_compatible(daemon_build, BUILD_VERSION) {
+            return Err(ClientError::Engine(ErrorInfo::VersionMismatch {
+                client: BUILD_VERSION.to_string(),
+                server: describe_peer_version(daemon_build).to_string(),
             }));
         }
         Ok(client)
