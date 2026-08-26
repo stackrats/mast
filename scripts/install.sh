@@ -93,11 +93,26 @@ choose_downloader() {
 
 # Fetch $1 to the file $2. Returns non-zero on any HTTP error, which callers
 # rely on to tell "no such asset" from "the network is on fire".
+#
+# The downloader's own complaint goes to a file rather than the terminal. A
+# missing asset is an EXPECTED failure here — it is how the desktop-match
+# fallback discovers there is no archive for a tag — and printing `curl: (22)
+# ... 404` before the explanation reads like something broke. `last_fetch_error`
+# hands the text back for the cases that really are fatal.
 fetch_to() {
+    _err_file="${WORK:-${TMPDIR:-/tmp}}/fetch.err"
     case "$DOWNLOADER" in
-        curl) curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" -- "$1" ;;
-        wget) wget --https-only --tries=3 -q -O "$2" -- "$1" ;;
+        curl) curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" -- "$1" 2>"$_err_file" ;;
+        wget) wget --https-only --tries=3 -q -O "$2" -- "$1" 2>"$_err_file" ;;
     esac
+}
+
+# The last downloader error, indented for inclusion in an err() message, or
+# empty when it had nothing to say.
+last_fetch_error() {
+    _err_file="${WORK:-${TMPDIR:-/tmp}}/fetch.err"
+    [ -s "$_err_file" ] || return 0
+    printf '\n      %s' "$(head -n 2 "$_err_file")"
 }
 
 cleanup() {
@@ -168,15 +183,12 @@ detect_platform() {
 
     PLATFORM="${os}-${arch}"
     case "$PLATFORM" in
-        linux-x86_64|macos-x86_64|macos-aarch64) ;;
-        linux-aarch64)
-            err "no prebuilt CLI for 64-bit ARM Linux yet — releases cover
-      linux-x86_64, macos-aarch64 and macos-x86_64. Build it from source with
-      \`cargo build --release -p mast-cli -p mast-daemon\` (see the Development
-      section of the README)." ;;
+        linux-x86_64|linux-aarch64|macos-x86_64|macos-aarch64) ;;
         *)
-            err "no prebuilt CLI for \`$PLATFORM\`. Build from source, or open an
-      issue at https://github.com/${REPO}/issues if this platform should ship." ;;
+            err "no prebuilt CLI for \`$PLATFORM\`. Releases cover linux-x86_64,
+      linux-aarch64, macos-aarch64 and macos-x86_64. Build from source with
+      \`cargo build --release -p mast-cli -p mast-daemon\`, or open an issue at
+      https://github.com/${REPO}/issues if this platform should ship." ;;
     esac
 }
 
@@ -334,11 +346,16 @@ download_and_verify() {
             fi
             ARCHIVE="mast-${VERSION}-${PLATFORM}.tar.gz"
             url="$RELEASES/download/$TAG/$ARCHIVE"
-            fetch_to "$url" "$WORK/$ARCHIVE" || err "download failed: $url"
+            fetch_to "$url" "$WORK/$ARCHIVE" || err "download failed: $url$(last_fetch_error)"
         else
-            err "download failed: $url
+            hint=""
+        if [ "$PLATFORM" = linux-aarch64 ]; then
+            hint="
+      ARM Linux builds start at v0.5.0; older releases have no $PLATFORM archive."
+        fi
+        err "download failed: $url$(last_fetch_error)
       If $TAG is real, it may not carry a $PLATFORM CLI archive — check
-      $RELEASES/tag/$TAG."
+      $RELEASES/tag/$TAG.$hint"
         fi
     fi
 

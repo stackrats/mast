@@ -99,7 +99,19 @@ curl -fsSL https://mast.sh/install | sh -s -- --dir /usr/local/bin
 curl -fsSL https://mast.sh/install | MAST_INSTALL_DIR=/usr/local/bin sh
 ```
 
-On Windows, take `mast-<version>-windows-x86_64.zip` from the latest release. There is no prebuilt CLI for ARM Linux yet — [build from source](#development).
+On Windows, PowerShell gets its own installer — there is no POSIX shell to pipe into:
+
+```powershell
+irm https://mast.sh/install.ps1 | iex
+```
+
+It installs under `%LOCALAPPDATA%\Programs\Mast\bin` and adds that to your user PATH; nothing needs administrator rights. Arguments cannot pass through `iex`, so to pin a release, run the downloaded text as a script block instead:
+
+```powershell
+& ([scriptblock]::Create((irm https://mast.sh/install.ps1))) -Version v0.5.0
+```
+
+Prebuilt CLI binaries cover `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` and `windows-x86_64`. ARM Linux builds start at v0.5.0. Windows on ARM installs the x64 binaries, which it runs under emulation.
 
 ## Linux
 
