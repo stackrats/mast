@@ -5,6 +5,7 @@
 //! and cancellable-operation machinery carry over from M1 unchanged.
 
 pub mod captures;
+mod commands;
 mod db_repair;
 mod diagnostics;
 mod effects;
@@ -213,6 +214,8 @@ fn commands_to_contract(record: &ProjectRecord) -> Vec<mast_contract::ProjectCom
             command: c.command.clone(),
             auto_start: c.auto_start,
             cwd: c.cwd.clone(),
+            after: c.after.clone(),
+            ready_when: c.ready_when.clone(),
         })
         .collect()
 }
@@ -946,6 +949,13 @@ impl Engine {
                             });
                         }
                     }
+                    // A dependency that cannot be satisfied is worse than no
+                    // dependency: the command simply never starts, and the
+                    // only symptom is a chip that stays grey. Refuse it here,
+                    // where there is a dialog to show the reason in.
+                    if let Err(message) = crate::commands::check_order(&commands) {
+                        return Err(ErrorInfo::InvalidInput { message });
+                    }
                     let records: Vec<mast_project::ProjectCommandRecord> = commands
                         .iter()
                         .map(|c| mast_project::ProjectCommandRecord {
@@ -953,6 +963,8 @@ impl Engine {
                             command: c.command.clone(),
                             auto_start: c.auto_start,
                             cwd: c.cwd.clone().filter(|w| !w.trim().is_empty()),
+                            after: c.after.clone().filter(|a| !a.trim().is_empty()),
+                            ready_when: c.ready_when.clone().filter(|r| !r.trim().is_empty()),
                         })
                         .collect();
                     let all = engine.with_state(|st, events| {
