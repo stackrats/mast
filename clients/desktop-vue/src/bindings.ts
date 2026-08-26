@@ -895,7 +895,24 @@ autoStart: boolean;
  * sibling repo's dev server; `sail …` commands refuse it, since the
  * wrapper only works from the project root.
  */
-cwd?: string | null }
+cwd?: string | null; 
+/**
+ * Auto-start only once the command of this name has finished starting.
+ * A dev server never exits, so waiting for it to *finish* would wait
+ * forever — what a dependent actually needs is for it to be up.
+ */
+after?: string | null; 
+/**
+ * How to tell THIS command has finished starting — its own readiness,
+ * declared where a compose healthcheck would be, on the thing being
+ * waited for rather than on each waiter. The first of its output lines
+ * containing this text marks it up. `None` falls back to watching for
+ * the output to settle, which needs no configuration but can only ever
+ * be a guess: a server that prints its banner and goes quiet really is
+ * up, and one that keeps chattering is indistinguishable from one that
+ * is still working.
+ */
+readyWhen?: string | null }
 export type ProjectId = string
 export type ProjectStatus = "stopped" | "starting" | "running" | "degraded" | "failed"
 export type ProjectSummary = { id: ProjectId; name: string; 

@@ -175,6 +175,21 @@ pub struct ProjectCommand {
     /// wrapper only works from the project root.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Auto-start only once the command of this name has finished starting.
+    /// A dev server never exits, so waiting for it to *finish* would wait
+    /// forever — what a dependent actually needs is for it to be up.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// How to tell THIS command has finished starting — its own readiness,
+    /// declared where a compose healthcheck would be, on the thing being
+    /// waited for rather than on each waiter. The first of its output lines
+    /// containing this text marks it up. `None` falls back to watching for
+    /// the output to settle, which needs no configuration but can only ever
+    /// be a guess: a server that prints its banner and goes quiet really is
+    /// up, and one that keeps chattering is indistinguishable from one that
+    /// is still working.
+    #[serde(default)]
+    pub ready_when: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1197,6 +1212,8 @@ mod tests {
                 command: "sail npm run dev".into(),
                 auto_start: true,
                 cwd: None,
+                after: None,
+                ready_when: None,
             }],
             processes: vec![ProcessState {
                 id: "horizon".into(),
@@ -1414,7 +1431,9 @@ mod tests {
                     name: "dev".into(),
                     command: "sail npm run dev".into(),
                     auto_start: true,
-                cwd: None,
+                    cwd: None,
+                    after: Some("api".into()),
+                    ready_when: Some("Server running on".into()),
                 }],
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },
