@@ -39,6 +39,12 @@ const SERVICES = [
 ];
 const PHP_VERSIONS = ["85", "84", "83", "82", "81", "80"];
 
+// The three Sail installs that rewrite the DB_* block. Without one of them the
+// project keeps the skeleton's SQLite, which is a fine default but easy to
+// pick by accident — so say so rather than leaving it to be discovered.
+const RELATIONAL = ["mysql", "pgsql", "mariadb"];
+const usesSqlite = computed(() => !RELATIONAL.some((db) => selected.value.has(db)));
+
 const parentChoices = computed(() => store.watchedDirectories);
 const nameValid = computed(() => /^[a-z0-9][a-z0-9-_]*$/.test(name.value));
 const canCreate = computed(() => nameValid.value && parent.value.trim() !== "");
@@ -135,6 +141,10 @@ function create() {
             {{ service }}
           </Chip>
         </div>
+        <p v-if="usesSqlite" class="mt-1.5 text-slate-500 dark:text-slate-400">
+          No database service — the project keeps Laravel's SQLite file at
+          <code>database/database.sqlite</code>, migrated and ready.
+        </p>
       </div>
 
       <p class="text-xs text-slate-400">
