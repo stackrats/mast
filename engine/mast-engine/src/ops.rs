@@ -238,9 +238,9 @@ impl Engine {
         argv: &[String],
         cwd: Option<&Path>,
         redactor: &Redactor,
-        timeout: Duration,
+        budget: impl Into<mast_docker::StreamBudget>,
     ) -> Result<(), ErrorInfo> {
-        self.run_streamed_command_env(handle, op, argv, cwd, &[], redactor, timeout).await
+        self.run_streamed_command_env(handle, op, argv, cwd, &[], redactor, budget).await
     }
 
     /// [`Self::run_streamed_command`] with an env overlay on the child —
@@ -255,7 +255,7 @@ impl Engine {
         cwd: Option<&Path>,
         env_overlay: &[(String, String)],
         redactor: &Redactor,
-        timeout: Duration,
+        budget: impl Into<mast_docker::StreamBudget>,
     ) -> Result<(), ErrorInfo> {
         let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
         let forwarder = {
@@ -281,7 +281,7 @@ impl Engine {
             env_overlay,
             line_tx,
             handle.cancel.clone(),
-            timeout,
+            budget,
             Duration::from_secs(8),
         )
         .await;
