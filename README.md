@@ -18,7 +18,7 @@ Manage all your Laravel Sail projects, containers, logs, workers, and developmen
 
 **Linux-first · macOS & Windows supported · Open source**
 
-[**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
+[**mast.sh**](https://mast.sh) · [**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
 
 <img src="docs/media/workspace-start.gif" alt="Starting the Acme workspace: billing-api starts first, Mast waits for it to become healthy, then storefront follows" width="900">
 
@@ -77,6 +77,41 @@ Mast is Linux-first: Linux is the primary development and testing platform. macO
 
 - Docker Engine, reachable by your user
 - Docker Compose v2 (`docker compose`)
+
+## Command line
+
+Every release ships the CLI (`mast` and `mast-daemon`) alongside the desktop app. To install just the CLI on Linux or macOS:
+
+```bash
+curl -fsSL https://mast.sh/install | sh
+```
+
+The binaries land in `~/.local/bin`; no `sudo` is involved anywhere.
+
+**If the desktop app is already installed, the installer matches its version** rather than taking the latest release. That is deliberate. The CLI and the app share a per-user daemon socket so that both drive one engine — one mutation owner, one observation loop — and they compare builds when that socket is opened. A mismatched pair refuses to run and says which two things to line up, instead of failing later inside a deserialization error that names nothing useful. Builds agreeing on major and minor are compatible; patch releases never move the wire format.
+
+```bash
+# Pin a release instead (note sh's -s -- , since the script is on stdin)
+curl -fsSL https://mast.sh/install | sh -s -- --version v0.5.0
+
+# Install somewhere else
+curl -fsSL https://mast.sh/install | sh -s -- --dir /usr/local/bin
+curl -fsSL https://mast.sh/install | MAST_INSTALL_DIR=/usr/local/bin sh
+```
+
+On Windows, PowerShell gets its own installer — there is no POSIX shell to pipe into:
+
+```powershell
+irm https://mast.sh/install.ps1 | iex
+```
+
+It installs under `%LOCALAPPDATA%\Programs\Mast\bin` and adds that to your user PATH; nothing needs administrator rights. Arguments cannot pass through `iex`, so to pin a release, run the downloaded text as a script block instead:
+
+```powershell
+& ([scriptblock]::Create((irm https://mast.sh/install.ps1))) -Version v0.5.0
+```
+
+Prebuilt CLI binaries cover `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` and `windows-x86_64`. ARM Linux builds start at v0.5.0. Windows on ARM installs the x64 binaries, which it runs under emulation.
 
 ## Linux
 
