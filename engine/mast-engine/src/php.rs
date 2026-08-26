@@ -316,8 +316,10 @@ impl Engine {
         let (argv, env) =
             crate::db_repair::scoped_compose_argv(invocation, &["build", "--no-cache", service]);
         out(format!("$ {}", argv.join(" ")));
-        // A cold runtime build fetches the base image and every PPA
-        // package — the slowest legitimate operation Mast runs.
+        // A cold runtime build fetches the base image and every PPA package —
+        // the slowest legitimate operation Mast runs, and one that narrates
+        // the whole way. Judge it on whether it is still talking, not on how
+        // long it has been at it; the outer hours are pure backstop.
         self.run_streamed_command_env(
             handle,
             op,
@@ -325,7 +327,10 @@ impl Engine {
             Some(project_dir),
             &env,
             redactor,
-            Duration::from_secs(45 * 60),
+            mast_docker::StreamBudget::progressing(
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(2 * 60 * 60),
+            ),
         )
         .await?;
 
