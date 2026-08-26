@@ -156,6 +156,40 @@ pub const SIGNATURES: &[ErrorSignature] = &[
         repair: Some(crate::REPAIR_DISCONNECT_STALE),
     },
     ErrorSignature {
+        id: "stale-container-network",
+        needles: &["failed to set up container networking: network"],
+        explanation: "the mirror image of a stale endpoint: this container was created \
+                      against a project network that has since been removed and recreated, \
+                      so it still points at a network id the daemon no longer has — every \
+                      start of it fails on the lookup",
+        // The daemon names the dead network by id, never the service, so
+        // there is nothing to hand `recreate-service` — offering a Fix here
+        // would only fail asking for a service name.
+        advice: "recreate the container rather than restarting it — a restart reuses the \
+                 same stale record; a whole-project rebuild, or removing that container \
+                 and starting again, re-attaches it to the live network",
+        repair: None,
+    },
+    ErrorSignature {
+        id: "node-modules-foreign-store",
+        needles: &[
+            "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY",
+            "Aborted removal of modules directory due to no TTY",
+        ],
+        explanation: "node_modules was installed from the other side of the bind mount — \
+                      the store it links into belongs to the host, and the container \
+                      cannot see it (or the reverse). The package manager will not reuse \
+                      a tree whose links it cannot follow: it wants to replace the whole \
+                      directory, stops to ask, and finds no terminal to ask at. What \
+                      breaks in practice is Vite, so the site keeps serving and only hot \
+                      reload goes",
+        advice: "the installed files work on both sides — only pnpm's pre-run store \
+                 check fails, so switching that check off is a one-click repair; the \
+                 side that installs stays responsible for `pnpm install` after \
+                 dependency changes",
+        repair: Some(crate::REPAIR_PNPM_VERIFY_OFF),
+    },
+    ErrorSignature {
         id: "dependency-unhealthy",
         needles: &["dependency failed to start", "is unhealthy"],
         explanation: "a service this one depends on started but never became healthy",
@@ -243,6 +277,8 @@ mod tests {
             ("Bind for 0.0.0.0:3306 failed: port is already allocated", "port-taken"),
             ("write /var/lib/docker/tmp: no space left on device", "disk-full"),
             ("network mast-shared declared as external, but could not be found", "external-network-missing"),
+            ("Error response from daemon: failed to set up container networking: network 8b642960cbae7f54c2fb658dfb37a600da5364f2f2fa45038538c38c7cd0fed3 not found", "stale-container-network"),
+            ("[ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY] Aborted removal of modules directory due to no TTY", "node-modules-foreign-store"),
             ("dependency failed to start: container app-mysql-1 is unhealthy", "dependency-unhealthy"),
             ("invalid name; only [a-zA-Z0-9_-]+ are allowed", "compose-dotted-name"),
             ("[InnoDB] Unsupported redo log format (v6)", "db-version-mismatch"),
