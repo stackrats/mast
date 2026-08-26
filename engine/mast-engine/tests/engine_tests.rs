@@ -1573,12 +1573,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         mast_contract::ProjectCommand {
             name: "touch".into(),
             command: "touch marker.txt".into(),
-            auto_start: true, cwd: None,
+            auto_start: true, cwd: None, after: None, ready_when: None,
         },
         mast_contract::ProjectCommand {
             name: "dev".into(),
             command: "sail npm run dev".into(),
-            auto_start: false, cwd: None,
+            auto_start: false, cwd: None, after: None, ready_when: None,
         },
     ];
     run_action(
@@ -1638,12 +1638,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "true".into(),
-                    auto_start: false, cwd: None,
+                    auto_start: false, cwd: None, after: None, ready_when: None,
                 },
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "false".into(),
-                    auto_start: false, cwd: None,
+                    auto_start: false, cwd: None, after: None, ready_when: None,
                 },
             ],
         })
@@ -1684,18 +1684,24 @@ async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
                     command: "touch here.txt".into(),
                     auto_start: false,
                     cwd: Some("../frontend".into()),
+                    after: None,
+                    ready_when: None,
                 },
                 mast_contract::ProjectCommand {
                     name: "gone".into(),
                     command: "touch nowhere.txt".into(),
                     auto_start: false,
                     cwd: Some("../does-not-exist".into()),
+                    after: None,
+                    ready_when: None,
                 },
                 mast_contract::ProjectCommand {
                     name: "dev".into(),
                     command: "sail npm run dev".into(),
                     auto_start: false,
                     cwd: Some("../frontend".into()),
+                    after: None,
+                    ready_when: None,
                 },
             ],
         },
@@ -2169,7 +2175,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "build".into(),
                 command: "./fail-like-a-gpg-outage.sh".into(),
-                auto_start: false, cwd: None,
+                auto_start: false, cwd: None, after: None, ready_when: None,
             }],
         },
     )
@@ -2224,7 +2230,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "clash".into(),
                 command: "./fail-like-a-port-clash.sh".into(),
-                auto_start: false, cwd: None,
+                auto_start: false, cwd: None, after: None, ready_when: None,
             }],
         },
     )

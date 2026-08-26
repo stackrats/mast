@@ -13,8 +13,8 @@ pub use adapter::{
     StatsSample,
 };
 pub use command::{
-    CommandError, CommandOutcome, CommandOutput, OutputLine, run_command, run_streaming,
-    spawn_detached,
+    CommandError, CommandOutcome, CommandOutput, OutputLine, StreamBudget, run_command,
+    run_streaming, spawn_detached,
 };
 pub use observer::{
     CommandFinish, CommandObserver, CommandStart, register_command_observer,

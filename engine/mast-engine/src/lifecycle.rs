@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use mast_compose::{ComposeInvocation, Runner};
-use mast_docker::{CommandOutcome, OutputLine, run_streaming};
+use mast_docker::{CommandOutcome, OutputLine, StreamBudget, run_streaming};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +38,27 @@ impl LifecycleVerb {
             LifecycleVerb::Stop => "stop",
             LifecycleVerb::Restart => "restart",
             LifecycleVerb::Rebuild => "rebuild",
+        }
+    }
+
+    /// How long the shell-out gets. Two of these verbs can build the app image
+    /// from its Dockerfile — `rebuild` always does (`--build`), and `up` does
+    /// whenever the image is missing — and a cold Sail runtime build fetches
+    /// the base image and every PPA package, which legitimately outruns any
+    /// wall clock short enough to catch a wedge. Compose narrates a build
+    /// continuously, so silence is the honest stuck signal and the outer hour
+    /// is only there so nothing can hang forever. `stop`/`restart` just move
+    /// containers that already exist; they are quick or they are broken.
+    fn budget(&self) -> StreamBudget {
+        match self {
+            LifecycleVerb::Up | LifecycleVerb::Rebuild => StreamBudget::progressing(
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(2 * 60 * 60),
+            ),
+            LifecycleVerb::Stop | LifecycleVerb::Restart => StreamBudget::progressing(
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(15 * 60),
+            ),
         }
     }
 }
@@ -174,8 +195,7 @@ impl LifecycleRunner for RealLifecycleRunner {
             &env,
             lines,
             cancel,
-            // Generous: first `up` may pull images.
-            Duration::from_secs(15 * 60),
+            verb.budget(),
             Duration::from_secs(8),
         )
         .await
@@ -273,6 +293,25 @@ mod tests {
         let (_, env) = lifecycle_argv(&inv, LifecycleVerb::Up, None);
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["WWWGROUP"], "pinned WWWUSER must not be overridden: {env:?}");
+    }
+
+    /// Every lifecycle verb is judged on progress, never on the clock alone:
+    /// a build that is still printing must survive, and one that has gone
+    /// quiet must not. The building verbs additionally get the looser pair,
+    /// since a cold Sail runtime build outlives any stop-sized budget.
+    #[test]
+    fn building_verbs_get_the_looser_progress_budget() {
+        use LifecycleVerb::{Rebuild, Restart, Stop, Up};
+        for verb in [Up, Stop, Restart, Rebuild] {
+            let budget = verb.budget();
+            let idle = budget.idle.expect("a lifecycle verb narrates; silence is the stuck signal");
+            assert!(idle < budget.overall, "{verb:?}: idle must trip before the backstop");
+        }
+        let build = LifecycleVerb::Rebuild.budget();
+        assert_eq!(build.overall, LifecycleVerb::Up.budget().overall);
+        // A cold image build needs more room than moving existing containers.
+        assert!(build.overall > LifecycleVerb::Restart.budget().overall);
+        assert!(build.idle.unwrap() > LifecycleVerb::Restart.budget().idle.unwrap());
     }
 
     #[test]

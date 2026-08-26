@@ -40,6 +40,7 @@ vi.mock("../lib/transport", () => ({
 }));
 
 import { dispatchAction, streamServiceLogs, stopLogStream } from "../lib/transport";
+import { notify } from "../lib/notify";
 
 const dispatchMock = vi.mocked(dispatchAction);
 const streamLogsMock = vi.mocked(streamServiceLogs);
@@ -116,6 +117,231 @@ describe("runLifecycle", () => {
     expect(store.operations["p1"].terminal).toBeNull();
     emits[1]({ operation: 2, kind: { type: "completed" } });
     expect(store.operations["p1"].terminal).toBe("completed");
+  });
+});
+
+describe("hasRunningOp", () => {
+  it("is true only between dispatch and the terminal event", async () => {
+    let emit: ((event: OperationEvent) => void) | null = null;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 7;
+    });
+
+    const store = useEngineStore();
+    expect(store.hasRunningOp("p1")).toBe(false);
+
+    await store.runLifecycle("p1", "rebuild", { type: "rebuildProject", id: "p1" });
+    expect(store.hasRunningOp("p1")).toBe(true);
+    // A sibling project is untouched — the lock is per key, not global.
+    expect(store.hasRunningOp("p2")).toBe(false);
+
+    emit!({ operation: 7, kind: { type: "completed" } });
+    expect(store.hasRunningOp("p1")).toBe(false);
+  });
+
+  it("stays true through a failure that has not landed yet, then clears", async () => {
+    let emit: ((event: OperationEvent) => void) | null = null;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 8;
+    });
+
+    const store = useEngineStore();
+    await store.runLifecycle("p1", "rebuild", { type: "rebuildProject", id: "p1" });
+    emit!({ operation: 8, kind: { type: "output", line: "#10 ...", stderr: false } });
+    expect(store.hasRunningOp("p1")).toBe(true);
+
+    emit!({ operation: 8, kind: { type: "failed", error: "boom" } });
+    expect(store.hasRunningOp("p1")).toBe(false);
+  });
+});
+
+describe("completion notifications", () => {
+  // The point is to catch the rebuild you walked away from, not to ping on
+  // every `stop` the user is sitting and watching.
+  it("stays quiet for an operation that finished promptly", async () => {
+    let emit: ((event: OperationEvent) => void) | null = null;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 9;
+    });
+
+    const store = useEngineStore();
+    await store.runLifecycle("p1", "stop", { type: "stopProject", id: "p1" });
+    emit!({ operation: 9, kind: { type: "completed" } });
+    expect(vi.mocked(notify)).not.toHaveBeenCalled();
+  });
+
+  it("announces one that outlasted the user's attention", async () => {
+    let emit: ((event: OperationEvent) => void) | null = null;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 10;
+    });
+
+    const store = useEngineStore();
+    await store.runLifecycle("p1", "rebuild", { type: "rebuildProject", id: "p1" });
+    // Backdate the start rather than waiting out a real minute.
+    store.operations["p1"].startedAt -= 20 * 60_000;
+    emit!({ operation: 10, kind: { type: "completed" } });
+
+    expect(vi.mocked(notify)).toHaveBeenCalledWith(
+      "operations",
+      "rebuild finished",
+      "Took 20m 00s.",
+    );
+  });
+});
+
+describe("command ordering", () => {
+  function project(commands: unknown[]) {
+    return {
+      id: "p1",
+      name: "p1",
+      path: "/p1",
+      status: "running",
+      services: [],
+      commands,
+      processes: [],
+      warnings: [],
+    };
+  }
+
+  it("waits for the dependency's ready line before starting a dependent", async () => {
+    const emitters = new Map<string, (event: OperationEvent) => void>();
+    let next = 1;
+    dispatchMock.mockImplementation(async (action, onEvent) => {
+      emitters.set((action as { name: string }).name, onEvent);
+      return next++;
+    });
+
+    const store = useEngineStore();
+    store.projects = [
+      project([
+        { name: "api", command: "sail artisan dev", autoStart: true, readyWhen: "Server running" },
+        { name: "web", command: "vp dev", autoStart: true, after: "api" },
+      ]),
+    ] as never;
+    const [api, web] = store.projects[0].commands!;
+
+    void store.autoStartCommand("p1", api);
+    void store.autoStartCommand("p1", web);
+    await vi.waitFor(() => expect(emitters.has("api")).toBe(true));
+
+    // The banner has not arrived, so nothing may have started `web` yet.
+    emitters.get("api")!({
+      operation: 1,
+      kind: { type: "output", line: "booting", stderr: false },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(emitters.has("web")).toBe(false);
+
+    emitters.get("api")!({
+      operation: 1,
+      // Colour is exactly how a tool prints its banner; the match must see
+      // through it.
+      kind: { type: "output", line: "\x1b[32mServer running\x1b[39m on :80", stderr: false },
+    });
+    await vi.waitFor(() => expect(emitters.has("web")).toBe(true));
+  });
+
+  it("does not start a dependent whose dependency failed", async () => {
+    const emitters = new Map<string, (event: OperationEvent) => void>();
+    dispatchMock.mockImplementation(async (action, onEvent) => {
+      emitters.set((action as { name: string }).name, onEvent);
+      return 1;
+    });
+
+    const store = useEngineStore();
+    store.projects = [
+      project([
+        { name: "api", command: "sail artisan dev", autoStart: true, readyWhen: "up" },
+        { name: "web", command: "vp dev", autoStart: true, after: "api" },
+      ]),
+    ] as never;
+    const [api, web] = store.projects[0].commands!;
+
+    void store.autoStartCommand("p1", api);
+    const dependent = store.autoStartCommand("p1", web);
+    await vi.waitFor(() => expect(emitters.has("api")).toBe(true));
+
+    emitters.get("api")!({ operation: 1, kind: { type: "failed", error: "boom" } });
+    await dependent;
+    expect(emitters.has("web")).toBe(false);
+    // And it says so, rather than leaving a chip mysteriously grey.
+    expect(store.activity.some((a) => a.line.includes("never came up"))).toBe(true);
+  });
+
+  it("treats a one-shot that exited cleanly as up", async () => {
+    const emitters = new Map<string, (event: OperationEvent) => void>();
+    dispatchMock.mockImplementation(async (action, onEvent) => {
+      emitters.set((action as { name: string }).name, onEvent);
+      return 1;
+    });
+
+    const store = useEngineStore();
+    store.projects = [
+      project([
+        { name: "build", command: "vp build", autoStart: true },
+        { name: "serve", command: "vp preview", autoStart: true, after: "build" },
+      ]),
+    ] as never;
+    const [build, serve] = store.projects[0].commands!;
+
+    void store.autoStartCommand("p1", build);
+    void store.autoStartCommand("p1", serve);
+    await vi.waitFor(() => expect(emitters.has("build")).toBe(true));
+
+    emitters.get("build")!({ operation: 1, kind: { type: "completed" } });
+    await vi.waitFor(() => expect(emitters.has("serve")).toBe(true));
+  });
+
+  // The ring caps at OP_LINE_CAP; a command noisier than that must not read
+  // as having gone quiet just because the buffer stopped growing.
+  it("keeps waiting on a command that is chattering past the line cap", async () => {
+    const emitters = new Map<string, (event: OperationEvent) => void>();
+    dispatchMock.mockImplementation(async (action, onEvent) => {
+      emitters.set((action as { name: string }).name, onEvent);
+      return 1;
+    });
+
+    const store = useEngineStore();
+    store.projects = [
+      project([
+        { name: "api", command: "vp build", autoStart: true },
+        { name: "web", command: "vp dev", autoStart: true, after: "api" },
+      ]),
+    ] as never;
+    const [api, web] = store.projects[0].commands!;
+
+    void store.autoStartCommand("p1", api);
+    void store.autoStartCommand("p1", web);
+    await vi.waitFor(() => expect(emitters.has("api")).toBe(true));
+
+    const emit = emitters.get("api")!;
+    for (let i = 0; i < 260; i++) {
+      emit({ operation: 1, kind: { type: "output", line: `step ${i}`, stderr: false } });
+    }
+    const op = store.operations["p1:cmd:api"];
+    expect(op.lines.length).toBe(200); // the ring is full and stuck there
+    expect(op.received).toBe(260); // but the count still moves
+
+    // Keep it talking for longer than a whole settle window — the buffer
+    // stays pinned at the cap throughout, which is the trap.
+    for (let n = 0; n < 9; n++) {
+      await new Promise((r) => setTimeout(r, 500));
+      emit({ operation: 1, kind: { type: "output", line: `still working ${n}`, stderr: false } });
+    }
+    expect(emitters.has("web")).toBe(false);
+  });
+
+  it("starts a command with no dependency immediately", async () => {
+    dispatchMock.mockImplementation(async () => 1);
+    const store = useEngineStore();
+    store.projects = [project([{ name: "dev", command: "vp dev", autoStart: true }])] as never;
+    await store.autoStartCommand("p1", store.projects[0].commands![0]);
+    expect(dispatchMock).toHaveBeenCalled();
   });
 });
 

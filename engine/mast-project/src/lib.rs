@@ -175,6 +175,12 @@ pub struct ProjectCommandRecord {
     /// Working directory override (relative to the project, or absolute).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Name of the command this one waits for before auto-starting.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Text in this command's own output that marks it as finished starting.
+    #[serde(default)]
+    pub ready_when: Option<String>,
 }
 
 /// `Default` is what a machine with no `settings.json` starts from, so it has

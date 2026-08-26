@@ -56,6 +56,7 @@ import { iconButtonClass } from "../lib/menu";
 import { useEngineStore } from "../stores/engine";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
+import AnsiText from "./ui/AnsiText.vue";
 import Checkbox from "./ui/Checkbox.vue";
 import Meter from "./ui/Meter.vue";
 import Sparkline from "./ui/Sparkline.vue";
@@ -363,7 +364,7 @@ watch(
                 : 'text-slate-600 dark:text-slate-300',
             ]"
           >
-            {{ entry.line }}
+            <AnsiText :text="entry.line" />
           </div>
         </TabsContent>
 
@@ -469,7 +470,7 @@ watch(
                 {{ outcomeDetail(entry) }}
               </p>
               <p v-for="(line, i) in entry.output" :key="`out-${i}`" :class="lineClass">
-                {{ line }}
+                <AnsiText :text="line" />
               </p>
               <p
                 v-if="
@@ -582,7 +583,7 @@ watch(
                       : 'text-slate-600 dark:text-slate-300',
                   ]"
                 >
-                  {{ line.message }}
+                  <AnsiText :text="line.message" />
                 </span>
               </div>
             </div>

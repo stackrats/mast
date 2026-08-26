@@ -16,6 +16,7 @@ use mast_diagnostics::{
     SystemFacts, REPAIR_COMPOSER_INSTALL, REPAIR_COPY_ENV_EXAMPLE, REPAIR_CREATE_NETWORK,
     REPAIR_CHOWN_STORAGE, REPAIR_CONFIG_CLEAR, REPAIR_DB_RECONCILE, REPAIR_DB_RECREATE,
     REPAIR_DOCKER_GROUP, REPAIR_GENERATE_APP_KEY, REPAIR_HOSTS_ENTRY, REPAIR_NODE_INSTALL,
+    REPAIR_PNPM_VERIFY_OFF,
     REPAIR_ARTISAN_MIGRATE, REPAIR_DISCONNECT_STALE, REPAIR_FIX_APP_URL,
     REPAIR_INSTALL_CERTUTIL, REPAIR_REASSIGN_PORTS, REPAIR_RECREATE_SERVICE,
     REPAIR_TRUST_PROXY_CA,
@@ -117,6 +118,46 @@ pub(crate) fn sail_install_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
 /// native modules have to be compiled against the Node that will load them.
 /// The cost is that the stack must be up — unlike `composer install`, which is
 /// what makes a vendor-less clone runnable in the first place.
+/// An install Mast runs has no terminal behind it, and a package manager that
+/// stops to ask a question just fails — pnpm refuses to replace a modules
+/// directory installed against a store it cannot see (the usual shape: the
+/// last `install` was run on the host, and the container cannot reach the host
+/// store) and aborts with ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY rather
+/// than deciding for itself. `CI` is the only lever pnpm accepts here; its
+/// `confirmModulesPurge` setting is read from rc files, not the environment.
+/// Every manager reads `CI` the same way — as "nobody is watching" — which is
+/// the truth. The one thing it must not decide is the lockfile, which
+/// [`mast_project::PackageManager::install_argv`] now always states outright.
+pub(crate) fn node_install_env() -> Vec<(String, String)> {
+    vec![("CI".to_string(), "true".to_string())]
+}
+
+/// The pnpm-workspace.yaml edit behind [`REPAIR_PNPM_VERIFY_OFF`]: the file's
+/// current text and the text the repair would leave. One function feeds both
+/// the preview and the apply, so what the dialog shows is what gets written.
+/// `None` when the switch is already off — nothing to do.
+pub(crate) fn pnpm_verify_off_edit(dir: &Path) -> Option<(String, String)> {
+    let path = dir.join("pnpm-workspace.yaml");
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    if before.lines().any(|line| {
+        line.strip_prefix("verifyDepsBeforeRun:").is_some_and(|v| v.trim() == "false")
+    }) {
+        return None;
+    }
+    let mut after = before.clone();
+    if !after.is_empty() && !after.ends_with('\n') {
+        after.push('\n');
+    }
+    after.push_str(
+        "# Added by Mast: node_modules is installed on one side of the container\n\
+         # boundary, and pnpm's pre-run store check can only pass on that side. The\n\
+         # installed files work on both sides — only the check fails. With it off,\n\
+         # run `pnpm install` yourself after dependency changes.\n\
+         verifyDepsBeforeRun: false\n",
+    );
+    Some((before, after))
+}
+
 pub(crate) fn node_install_argv(
     invocation: &mast_compose::ComposeInvocation,
     dir: &Path,
@@ -297,6 +338,15 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
         package_manager: node.as_ref().map(|n| n.manager.as_str().to_string()),
         node_lockfile: node.as_ref().is_some_and(|n| n.frozen),
         has_node_modules: node.as_ref().is_some_and(|n| n.has_node_modules),
+        // Only a store *outside* the project is out of reach: compose mounts
+        // the project into the container, so a store the install put inside
+        // it (`<project>/.pnpm-store`) travels with the tree and is fine.
+        node_modules_foreign_store: node
+            .as_ref()
+            .and_then(|n| n.modules_store.as_ref())
+            .filter(|store| store.is_absolute() && !store.starts_with(&seed.path))
+            .map(|store| store.display().to_string()),
+        pnpm_verify_disabled: node.as_ref().is_some_and(|n| n.verify_deps_disabled),
         conflicting_lockfiles: node
             .as_ref()
             .map(|n| n.conflicting_lockfiles.clone())
@@ -1799,6 +1849,54 @@ impl Engine {
                 .await
                 .map_err(crate::internal_err)?
             }
+            REPAIR_PNPM_VERIFY_OFF => {
+                let dir = self.project_path(self.require_project(project)?)?;
+                tokio::task::spawn_blocking(move || {
+                    let file = dir.join("pnpm-workspace.yaml");
+                    match pnpm_verify_off_edit(&dir) {
+                        Some((before, after)) => {
+                            let mut summary = vec![
+                                "append `verifyDepsBeforeRun: false` to pnpm-workspace.yaml"
+                                    .to_string(),
+                                "pnpm stops checking node_modules against its install-time \
+                                 store path before `pnpm run` — the check that cannot pass \
+                                 across the container boundary"
+                                    .into(),
+                                "nothing is reinstalled; run `pnpm install` yourself after \
+                                 dependency changes"
+                                    .into(),
+                            ];
+                            if before.is_empty() {
+                                summary.push("pnpm-workspace.yaml will be created".into());
+                            }
+                            Ok(RepairPlan {
+                                repair: offer,
+                                file_preview: Some(FileEditPreview {
+                                    file: file.to_string_lossy().into_owned(),
+                                    before,
+                                    after,
+                                    summary: summary.clone(),
+                                    no_op: false,
+                                }),
+                                summary,
+                                no_op: false,
+                            })
+                        }
+                        None => Ok(RepairPlan {
+                            summary: vec![
+                                "pnpm-workspace.yaml already sets verifyDepsBeforeRun: false \
+                                 — nothing to do"
+                                    .into(),
+                            ],
+                            repair: offer,
+                            file_preview: None,
+                            no_op: true,
+                        }),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)?
+            }
             REPAIR_ADD_HOST_GATEWAY => {
                 let project = self.require_project(project)?;
                 let service = arg
@@ -2751,11 +2849,12 @@ impl Engine {
                 );
                 // A cold pnpm/npm store on a large frontend is slow, and the
                 // first run may pull the app image too.
-                self.run_streamed_command(
+                self.run_streamed_command_env(
                     handle,
                     op,
                     &argv,
                     Some(&dir),
+                    &node_install_env(),
                     &redactor,
                     Duration::from_secs(30 * 60),
                 )
@@ -2900,6 +2999,39 @@ impl Engine {
                         line: "MailHog replaced with Mailpit — Start recreates the stack with \
                                the new mailbox (dashboard on port 8025)"
                             .into(),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
+            }
+            REPAIR_PNPM_VERIFY_OFF => {
+                let dir = self.project_path(self.require_project(project)?)?;
+                let wrote = tokio::task::spawn_blocking(move || -> Result<bool, ErrorInfo> {
+                    match pnpm_verify_off_edit(&dir) {
+                        Some((_, after)) => {
+                            std::fs::write(dir.join("pnpm-workspace.yaml"), after)
+                                .map_err(crate::internal_err)?;
+                            Ok(true)
+                        }
+                        None => Ok(false),
+                    }
+                })
+                .await
+                .map_err(crate::internal_err)??;
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: if wrote {
+                            "verifyDepsBeforeRun: false written — pnpm runs in the app \
+                             container now skip the store check; run `pnpm install` \
+                             yourself after dependency changes"
+                                .into()
+                        } else {
+                            "pnpm-workspace.yaml already had the switch off — nothing to do"
+                                .into()
+                        },
                         stderr: false,
                     },
                 );
@@ -3553,6 +3685,31 @@ mod tests {
             ]
             .map(String::from)
         );
+    }
+
+    /// One function feeds the preview and the apply, so these shapes are the
+    /// repair's whole behavior: append to an existing file, create a missing
+    /// one, and refuse to double-append.
+    #[test]
+    fn pnpm_verify_off_edit_covers_append_create_and_done() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // No file yet: created from nothing, ending in exactly one setting.
+        let (before, after) = pnpm_verify_off_edit(tmp.path()).unwrap();
+        assert_eq!(before, "");
+        assert!(after.ends_with("verifyDepsBeforeRun: false\n"), "{after}");
+
+        // Existing settings survive untouched, even without a trailing newline.
+        std::fs::write(tmp.path().join("pnpm-workspace.yaml"), "allowBuilds:\n  vue-demi: true")
+            .unwrap();
+        let (before, after) = pnpm_verify_off_edit(tmp.path()).unwrap();
+        assert!(before.ends_with("vue-demi: true"));
+        assert!(after.contains("allowBuilds:"), "{after}");
+        assert!(after.contains("\nverifyDepsBeforeRun: false\n"), "{after}");
+
+        // Applying the edit makes the next ask a no-op — the finding's exit.
+        std::fs::write(tmp.path().join("pnpm-workspace.yaml"), &after).unwrap();
+        assert!(pnpm_verify_off_edit(tmp.path()).is_none());
     }
 
     #[test]
