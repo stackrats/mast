@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 
 import { useEngineStore } from "../stores/engine";
+import AnsiText from "./ui/AnsiText.vue";
 import Modal from "./ui/Modal.vue";
 import Select from "./ui/Select.vue";
 
@@ -58,7 +59,7 @@ watch(
           class="break-all whitespace-pre-wrap"
           :class="{ 'text-amber-700 dark:text-amber-400': line.stderr }"
         >
-          {{ line.message }}
+          <AnsiText :text="line.message" />
         </div>
         <p v-if="!store.logs?.lines.length" class="text-slate-400">waiting for output…</p>
       </div>

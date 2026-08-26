@@ -5,7 +5,7 @@
 // drag-to-resize this panel has — and its offcanvas mobile drawer is dead
 // weight in a desktop window.
 import { onBeforeUnmount, ref } from "vue";
-import { Boxes, Folder, Home, Pencil, Plus } from "lucide-vue-next";
+import { Boxes, Folder, Home, Loader2, Pencil, Plus } from "lucide-vue-next";
 
 import type { ProjectStatus, WorkspaceSummary } from "../bindings";
 import { loadSidebarWidth, saveSidebarWidth } from "../lib/prefs";
@@ -103,7 +103,16 @@ function projectStatus(id: string): ProjectStatus {
             >
               <Boxes class="h-3.5 w-3.5 shrink-0 text-slate-400" />
               <span class="truncate">{{ ws.name }}</span>
+              <!-- While something is running, the dot would be reporting the
+                   state the project is leaving, not the one it is heading
+                   for. The spinner replaces it rather than joining it: one
+                   glyph per row, and it is the one that is still true. -->
+              <Loader2
+                v-if="store.hasRunningOp(ws.id)"
+                class="ml-auto mr-5 h-3 w-3 shrink-0 animate-spin text-amber-500"
+              />
               <span
+                v-else
                 class="ml-auto mr-5 h-2 w-2 shrink-0 rounded-full"
                 :class="statusDot[ws.status]"
               />
@@ -120,7 +129,12 @@ function projectStatus(id: string): ProjectStatus {
                   :is-active="isSelected('project', member.project)"
                   @click="store.selection = { kind: 'project', id: member.project }"
                 >
+                  <Loader2
+                    v-if="store.hasRunningOp(member.project)"
+                    class="h-3 w-3 shrink-0 animate-spin text-amber-500"
+                  />
                   <span
+                    v-else
                     class="h-1.5 w-1.5 shrink-0 rounded-full"
                     :class="statusDot[projectStatus(member.project)]"
                   />
@@ -143,7 +157,12 @@ function projectStatus(id: string): ProjectStatus {
             >
               <Folder class="h-3.5 w-3.5 shrink-0 text-slate-400" />
               <span class="truncate">{{ project.name }}</span>
+              <Loader2
+                v-if="store.hasRunningOp(project.id)"
+                class="ml-auto h-3 w-3 shrink-0 animate-spin text-amber-500"
+              />
               <span
+                v-else
                 class="ml-auto h-2 w-2 shrink-0 rounded-full"
                 :class="statusDot[project.status]"
               />
