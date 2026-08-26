@@ -4,7 +4,7 @@
   "version": "0.4.0",
   "identifier": "dev.mast.desktop",
   "build": {
-    "beforeDevCommand": "vp dev",
+    "beforeDevCommand": "vp run --filter mast-desktop-ui dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "vp run --filter mast-desktop-ui build",
     "frontendDist": "../dist"
