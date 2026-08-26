@@ -76,6 +76,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bundles: deb,rpm,appimage
             suffix: linux-x86_64
+          # Built on a native arm64 runner rather than cross-compiled: the
+          # desktop bundle links webkit2gtk and friends, and those have to be
+          # the arm64 builds of the libraries, which only an arm64 host has.
+          # GitHub's hosted arm runners are free for public repositories.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            suffix: linux-aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             bundles: dmg

@@ -16,6 +16,47 @@ use specta::Type;
 /// an exact match and refuse otherwise (`ErrorInfo::ProtocolMismatch`).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The build this binary was compiled from — the workspace version, which
+/// every crate in the tree shares, so it names the contract itself and not
+/// just whichever binary happens to be asking.
+///
+/// [`PROTOCOL_VERSION`] answers "is the framing the same" and is frozen at 1;
+/// under the additive rules above it deliberately does NOT move when a field
+/// is added to a DTO. That leaves a gap wide enough to fall through: a 0.4
+/// CLI and a 0.6 desktop both announce protocol 1, agree to talk, and then
+/// die inside `serde_json::from_value` complaining about a missing field —
+/// which tells the user nothing about the actual problem, that the app and
+/// the CLI came from different install channels and drifted. Comparing this
+/// on the socket closes it.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The compatibility unit for the daemon socket: everything up to, but not
+/// including, the patch component. `"0.4.1"` → `"0.4"`.
+///
+/// Patch releases are bug fixes that never move a wire shape, while a minor
+/// bump is where DTOs are allowed to grow — which, while this is still 0.x,
+/// is exactly where semver puts the breaking boundary.
+pub fn wire_compat_key(version: &str) -> &str {
+    match version.match_indices('.').nth(1) {
+        Some((dot, _)) => &version[..dot],
+        None => version,
+    }
+}
+
+/// Whether two builds may share one socket. An empty version means the peer
+/// predates the versioned handshake and therefore cannot be vouched for —
+/// unknown is not the same as compatible.
+pub fn wire_compatible(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && wire_compat_key(a) == wire_compat_key(b)
+}
+
+/// How a peer that announced no version at all gets named in an error. Both
+/// ends of the socket report it, so it lives here rather than being spelled
+/// out twice and drifting.
+pub fn describe_peer_version(version: &str) -> &str {
+    if version.is_empty() { "unknown (older than 0.5.0)" } else { version }
+}
+
 // ---------- identifiers ----------
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type)]
@@ -1055,6 +1096,12 @@ pub enum ErrorInfo {
     ReadOnly { owner_pid: Option<u32> },
     ProtocolMismatch { expected: u32, actual: u32 },
     Internal { message: String },
+    /// The two ends of the daemon socket came from different builds of Mast
+    /// (see [`wire_compatible`]). Appended, per the additive rule above;
+    /// clients too old to know this variant degrade to `Internal` carrying
+    /// the raw JSON, which is the best available for a binary that shipped
+    /// before the check existed.
+    VersionMismatch { client: String, server: String },
 }
 
 impl core::fmt::Display for ErrorInfo {
@@ -1073,6 +1120,11 @@ impl core::fmt::Display for ErrorInfo {
                 write!(f, "protocol mismatch: client {expected}, engine {actual}")
             }
             ErrorInfo::Internal { message } => write!(f, "internal error: {message}"),
+            ErrorInfo::VersionMismatch { client, server } => write!(
+                f,
+                "version mismatch: this build is Mast {client}, \
+                 the Mast already running is {server}"
+            ),
         }
     }
 }
@@ -1090,6 +1142,31 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(&back, value, "JSON round-trip changed value ({json})");
+    }
+
+    #[test]
+    fn wire_compat_is_major_minor() {
+        assert_eq!(wire_compat_key("0.4.1"), "0.4");
+        assert_eq!(wire_compat_key("1.10.3"), "1.10");
+        // Pre-release suffixes hang off the patch component, so they fall
+        // away with it rather than splitting the key in the wrong place.
+        assert_eq!(wire_compat_key("0.5.0-rc.2"), "0.5");
+        // Nothing to trim.
+        assert_eq!(wire_compat_key("0.5"), "0.5");
+        assert_eq!(wire_compat_key(""), "");
+
+        assert!(wire_compatible("0.4.0", "0.4.7"));
+        assert!(!wire_compatible("0.4.0", "0.5.0"));
+        assert!(!wire_compatible("0.4.0", "1.4.0"));
+        // A peer that announces nothing is unknown, and unknown is refused —
+        // that is the whole point of the check.
+        assert!(!wire_compatible("", "0.4.0"));
+        assert!(!wire_compatible("0.4.0", ""));
+
+        // The constant every binary in the tree compares against must itself
+        // be a version this rule can read.
+        assert!(!wire_compat_key(BUILD_VERSION).is_empty());
+        assert!(wire_compatible(BUILD_VERSION, BUILD_VERSION));
     }
 
     fn sample_service() -> ServiceState {
@@ -1409,6 +1486,7 @@ mod tests {
             ErrorInfo::ReadOnly { owner_pid: Some(1234) },
             ErrorInfo::ProtocolMismatch { expected: 0, actual: 1 },
             ErrorInfo::Internal { message: "x".into() },
+            ErrorInfo::VersionMismatch { client: "0.4.0".into(), server: "0.5.0".into() },
         ] {
             roundtrip(&err);
         }

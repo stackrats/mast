@@ -10,7 +10,10 @@ use futures::StreamExt;
 use mast_client::MastClient;
 use mast_client_ipc::IpcClient;
 use mast_client_local::LocalClient;
-use mast_contract::{Action, DockerStatus, OperationEventKind, PROTOCOL_VERSION, ProjectId, SubscriptionItem};
+use mast_contract::{
+    Action, BUILD_VERSION, DockerStatus, OperationEventKind, PROTOCOL_VERSION, ProjectId,
+    SubscriptionItem,
+};
 use mast_docker::{DockerError, RuntimeAdapter};
 use mast_engine::{Engine, EngineConfig, EngineDeps, RealLifecycleRunner, RuntimeConnector};
 use mast_project::MetadataStore;
@@ -159,7 +162,7 @@ async fn same_suite_local_and_ipc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn version_mismatch_is_refused() {
+async fn protocol_mismatch_is_refused() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -183,4 +186,101 @@ async fn version_mismatch_is_refused() {
     let mut line = String::new();
     BufReader::new(&mut stream).read_line(&mut line).await.unwrap();
     assert!(line.contains("protocolMismatch") || line.contains("ProtocolMismatch"), "{line}");
+}
+
+/// The gap the protocol version cannot see: same framing, different DTOs.
+/// Both a build from another minor and a build too old to announce one at all
+/// must be turned away at `hello` — with `versionMismatch`, not with a
+/// missing-field error several calls later.
+#[tokio::test(flavor = "multi_thread")]
+async fn build_version_mismatch_is_refused() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = test_engine(tmp.path());
+    engine.start();
+    let socket = tmp.path().join("daemon.sock");
+    {
+        let engine = engine.clone();
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let _ = mast_daemon::serve(engine, &socket).await;
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    async fn handshake(socket: &Path, params: &str) -> String {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        stream
+            .write_all(format!("{{\"id\":1,\"method\":\"hello\",\"params\":{params}}}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut stream).read_line(&mut line).await.unwrap();
+        line
+    }
+
+    // A build from a different minor: framing agrees, payloads do not.
+    let line = handshake(
+        &socket,
+        &format!("{{\"protocolVersion\":{PROTOCOL_VERSION},\"version\":\"99.99.0\"}}"),
+    )
+    .await;
+    assert!(line.contains("versionMismatch"), "{line}");
+    assert!(line.contains("99.99.0"), "the peer's version belongs in the error: {line}");
+
+    // A build predating the versioned handshake announces no version at all.
+    // Unknown is not compatible — it is refused, and named as old rather than
+    // reported as an empty string.
+    let line =
+        handshake(&socket, &format!("{{\"protocolVersion\":{PROTOCOL_VERSION}}}")).await;
+    assert!(line.contains("versionMismatch"), "{line}");
+    assert!(line.contains("older than"), "{line}");
+
+    // Our own build is, necessarily, compatible with itself: the check must
+    // not be so strict that the shipped pair cannot talk.
+    let line = handshake(
+        &socket,
+        &format!("{{\"protocolVersion\":{PROTOCOL_VERSION},\"version\":\"{BUILD_VERSION}\"}}"),
+    )
+    .await;
+    assert!(!line.contains("error"), "{line}");
+    assert!(line.contains(BUILD_VERSION), "the reply must carry the daemon's build: {line}");
+}
+
+/// A patch-level difference is deliberately NOT a mismatch: bug-fix releases
+/// never move a wire shape, and refusing them would make every point release
+/// a forced lockstep upgrade of both installs.
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_level_difference_is_accepted() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = test_engine(tmp.path());
+    engine.start();
+    let socket = tmp.path().join("daemon.sock");
+    {
+        let engine = engine.clone();
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let _ = mast_daemon::serve(engine, &socket).await;
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Same major.minor as this build, an implausible patch component.
+    let peer = format!("{}.99", mast_contract::wire_compat_key(BUILD_VERSION));
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "{{\"id\":1,\"method\":\"hello\",\"params\":{{\"protocolVersion\":{PROTOCOL_VERSION},\"version\":\"{peer}\"}}}}\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(&mut stream).read_line(&mut line).await.unwrap();
+    assert!(!line.contains("error"), "patch drift must be allowed: {line}");
 }

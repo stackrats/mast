@@ -258,6 +258,15 @@ impl Engine {
                 });
             }
         }
+        // Sail writes the service blocks in `--with` order, so the click
+        // order in the wizard would otherwise leak into the compose file:
+        // two projects with the same picks, two different files. Sort into
+        // ALLOWED_SERVICES order — Sail's own catalog order, and the order the
+        // chips are listed in — and drop repeats. The app service is written
+        // first by Sail regardless, which is where it belongs.
+        build_services.sort_by_key(|s| ALLOWED_SERVICES.iter().position(|a| a == &s.as_str()));
+        build_services.dedup();
+
         let parent_dir = PathBuf::from(parent);
         if !parent_dir.is_dir() {
             return Err(ErrorInfo::InvalidInput {
@@ -336,23 +345,51 @@ impl Engine {
                 .extend(["require", "laravel/sail", "--dev", "--no-interaction"].map(String::from));
             self.run_streamed_command(handle, op, &require, None, &redactor, long).await?;
 
+            // `--with` is always passed. Sail's non-interactive fallback when
+            // the flag is absent is its own default set — mysql, redis,
+            // selenium, mailpit — so omitting it on an empty selection quietly
+            // installs four services nobody picked. `none` is Sail's spelling
+            // for "the app container and nothing else".
+            let with = if build_services.is_empty() {
+                "none".to_string()
+            } else {
+                build_services.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+            };
+            // Sail rewrites the DB_* block only when one of its three
+            // relational services is installed; otherwise the skeleton's
+            // SQLite survives, already migrated by composer's
+            // post-create-project-cmd. Mirror that condition so the wizard can
+            // say which database the project was born with — and pin it below.
+            let sqlite = !build_services
+                .iter()
+                .any(|s| matches!(s.as_str(), "mysql" | "mariadb" | "pgsql"));
             self.emit_op(
                 handle,
                 op,
                 OperationEventKind::Output {
-                    line: format!("sail:install --php={php_dotted}"),
+                    line: format!("sail:install --with={with} --php={php_dotted}"),
                     stderr: false,
                 },
             );
             let mut install = composer_run(&target, Some("php"));
             install.extend(["artisan", "sail:install"].map(String::from));
-            if !build_services.is_empty() {
-                let with = build_services.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
-                install.push(format!("--with={with}"));
-            }
+            install.push(format!("--with={with}"));
             install.push(format!("--php={php_dotted}"));
             install.push("--no-interaction".into());
             self.run_streamed_command(handle, op, &install, None, &redactor, long).await?;
+
+            if sqlite {
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: "no database service selected — keeping SQLite at \
+                               database/database.sqlite (already migrated)"
+                            .into(),
+                        stderr: false,
+                    },
+                );
+            }
 
             // Sail names the app service `laravel.test` in every project it
             // scaffolds, which is ambiguous the moment you run more than one.
@@ -396,9 +433,23 @@ impl Engine {
                     ] {
                         let _ = std::fs::create_dir_all(target.join(dir));
                     }
+                    // (2) SQLite, when no relational service was picked.
+                    // Sail leaves DB_CONNECTION alone in that case, so the
+                    // skeleton's sqlite is already correct — this just makes
+                    // it explicit, and recreates the file if the create-project
+                    // scripts ever fail to.
+                    if sqlite {
+                        let db = target.join("database").join("database.sqlite");
+                        if !db.exists() {
+                            let _ = std::fs::File::create(&db);
+                        }
+                    }
                     let mut fixed_url = None;
                     mast_laravel::edit_env_file(&env_path, Some(&backups), |f| {
                         fixed_url = reconcile_bootstrap_url(f)?;
+                        if sqlite {
+                            f.set("DB_CONNECTION", "sqlite")?;
+                        }
                         f.set("APP_SERVICE", &app_service)?;
                         f.set("WWWUSER", &uid.to_string())?;
                         f.set("WWWGROUP", &gid.to_string())

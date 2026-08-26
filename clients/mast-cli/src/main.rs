@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use futures::StreamExt;
-use mast_client::MastClient;
+use mast_client::{ClientError, MastClient};
 use mast_client_local::LocalClient;
 use mast_contract::{
-    Action, DiagSeverity, EngineSnapshot, HistoryDetail, HistoryEntry, HistoryOrigin,
+    Action, DiagSeverity, EngineSnapshot, ErrorInfo, HistoryDetail, HistoryEntry, HistoryOrigin,
     HistoryOutcome, OperationEventKind, ProjectId, ProjectStatus,
 };
 use mast_engine::{Engine, EngineConfig, EngineDeps, RealConnector, RealLifecycleRunner};
@@ -102,6 +102,18 @@ async fn main() {
     let client: Arc<dyn MastClient> =
         match mast_client_ipc::IpcClient::connect(&mast_daemon::default_socket_path()).await {
             Ok(ipc) => Arc::new(ipc),
+            // A version disagreement is the one connect failure that must NOT
+            // fall back. The socket is there and answering; what is on the
+            // other end is a Mast from a different install channel. Quietly
+            // starting an embedded engine instead would come up read-only
+            // behind the running app's ownership lock, and every command after
+            // that would fail for a reason bearing no resemblance to the real
+            // one. Say the real one, once, and stop.
+            Err(ClientError::Engine(
+                error @ (ErrorInfo::VersionMismatch { .. } | ErrorInfo::ProtocolMismatch { .. }),
+            )) => {
+                version_mismatch_exit(&error)
+            }
             Err(_) => embedded_engine(),
         };
 
@@ -125,6 +137,24 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// The CLI and the desktop app install through different channels — one from
+/// `mast.sh/install`, the other from a .deb/.dmg — so they drift apart the
+/// moment one is updated without the other. That is the only thing this can
+/// be, so name it and say which two things to line back up.
+fn version_mismatch_exit(error: &ErrorInfo) -> ! {
+    eprintln!("mast: {error}");
+    eprintln!();
+    eprintln!("The Mast engine already running on this machine came from a different");
+    eprintln!("build than this CLI, and the two cannot share the daemon socket.");
+    eprintln!("Update whichever is older so both sit on the same release:");
+    eprintln!();
+    eprintln!("  CLI      curl -fsSL https://mast.sh/install | sh");
+    eprintln!("  desktop  https://github.com/stackrats/mast/releases/latest");
+    eprintln!();
+    eprintln!("Quit the Mast app first if you want this CLI to run on its own engine.");
+    std::process::exit(2)
 }
 
 fn embedded_engine() -> Arc<dyn MastClient> {
