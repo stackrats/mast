@@ -511,7 +511,8 @@ async fn reconcile(engine: &Engine) {
                             && observation_belongs_to(o, &project_dir)
                     })
                     .collect();
-                let services = build_services(entry.model.as_ref(), &matched);
+                let app_service = process_infos.get(&id).map(|(_, name)| name.as_str());
+                let services = build_services(entry.model.as_ref(), &matched, app_service);
                 if !busy.contains(&id) {
                     collect_deaths(
                         &id,
@@ -723,9 +724,16 @@ fn service_host_endpoints(
     (ui_url, db_port)
 }
 
+/// One order for every project: the app service on top — it is the one you
+/// look at first and the one every verb defaults to — then the companions
+/// alphabetically, so a given service set always reads the same way and the
+/// app does not drift down the list just because the project was named
+/// "zeta". `app_service` is `APP_SERVICE` from `.env`; when it is absent or
+/// names nothing declared, the list is plain alphabetical.
 fn build_services(
     model: Option<&mast_compose::ResolvedModel>,
     observed: &[&ContainerObservation],
+    app_service: Option<&str>,
 ) -> Vec<ServiceState> {
     let mut services: Vec<ServiceState> = Vec::new();
     if let Some(model) = model {
@@ -765,7 +773,10 @@ fn build_services(
             });
         }
     }
-    services.sort_by(|a, b| a.name.cmp(&b.name));
+    services.sort_by(|a, b| {
+        let rank = |s: &ServiceState| usize::from(Some(s.name.as_str()) != app_service);
+        rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+    });
     services
 }
 
@@ -876,13 +887,30 @@ mod tests {
         };
         let app = container("app");
         let old = container("old-db");
-        let services = build_services(Some(&m), &[&app, &old]);
+        let services = build_services(Some(&m), &[&app, &old], None);
         let by_name = |n: &str| services.iter().find(|s| s.name == n).unwrap();
         assert!(!by_name("app").orphaned);
         assert!(by_name("old-db").orphaned);
         // Without a resolved model nothing can be said about membership.
-        let services = build_services(None, &[&old]);
+        let services = build_services(None, &[&old], None);
         assert!(!services[0].orphaned, "{services:?}");
+    }
+
+    /// The app first, the rest alphabetically — and the app does not sink
+    /// just because its name sorts late.
+    #[test]
+    fn the_app_service_leads_and_the_rest_stay_alphabetical() {
+        let m = model(&[("redis", &[]), ("zeta.test", &[]), ("mailpit", &[]), ("mysql", &[])]);
+        let names = |app| {
+            build_services(Some(&m), &[], app)
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(Some("zeta.test")), ["zeta.test", "mailpit", "mysql", "redis"]);
+        // No APP_SERVICE, or one naming nothing declared: plain alphabetical.
+        assert_eq!(names(None), ["mailpit", "mysql", "redis", "zeta.test"]);
+        assert_eq!(names(Some("laravel.test")), ["mailpit", "mysql", "redis", "zeta.test"]);
     }
 
     #[test]
