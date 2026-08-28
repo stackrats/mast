@@ -300,17 +300,24 @@ async fn workspace_warns_on_ports_that_collide_only_via_compose_defaults() {
     }
 
     let snap = wait_until(&engine, "collision warning", Duration::from_secs(30), |s| {
-        s.workspaces.first().is_some_and(|w| w.warnings.iter().any(|x| x.contains("5173")))
+        s.workspaces.first().is_some_and(|w| {
+            w.warnings.iter().any(|x| x.contains("host port 5173"))
+        })
     })
     .await;
     let warnings = &snap.workspaces[0].warnings;
     assert!(
-        warnings.iter().any(|w| w.contains("5173")),
+        warnings.iter().any(|w| w.contains("host port 5173")),
         "the compose-default collision must be warned about: {warnings:#?}"
     );
     // The per-project APP_PORTs differ, so they must not be reported.
+    //
+    // Every port here is matched with its "host port " prefix, never as a bare
+    // number: these warnings name containers whose suffix is a nanosecond
+    // timestamp, and a bare `contains("8181")` matched those digits instead
+    // and failed a run.
     assert!(
-        !warnings.iter().any(|w| w.contains("8181") || w.contains("8182")),
+        !warnings.iter().any(|w| w.contains("host port 8181") || w.contains("host port 8182")),
         "distinct APP_PORTs are not a collision: {warnings:#?}"
     );
 }

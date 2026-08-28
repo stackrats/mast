@@ -495,14 +495,21 @@ mod tests {
     use super::*;
 
     /// The whole point of the idle budget: a command that keeps talking runs
-    /// past a wall clock that would have killed it. This one lives four times
-    /// its own idle allowance by saying something every so often.
+    /// past a wall clock that would have killed it. This one talks for twice
+    /// its own idle allowance, a tick at a time.
+    ///
+    /// Both intervals matter, and they pull opposite ways. The run must
+    /// outlast `idle` or it proves nothing — but a single gap that overruns
+    /// `idle` reads as silence and kills it, and a loaded runner can park the
+    /// reader task mid-gap through no fault of the process. So keep the run
+    /// well over the allowance and every gap well under it: 100ms a tick
+    /// against 1s is 10x of slack. It flaked on macOS at 100ms against 250ms.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn steady_output_outlives_the_idle_allowance() {
         let (tx, mut rx) = mpsc::channel(64);
         let argv: Vec<String> =
-            ["bash", "-c", "for i in 1 2 3 4 5 6 7 8; do echo tick; sleep 0.1; done"]
+            ["bash", "-c", "for i in {1..20}; do echo tick; sleep 0.1; done"]
                 .map(String::from)
                 .to_vec();
         let outcome = run_streaming(
@@ -511,7 +518,7 @@ mod tests {
             &[],
             tx,
             CancellationToken::new(),
-            StreamBudget::progressing(Duration::from_millis(250), Duration::from_secs(30)),
+            StreamBudget::progressing(Duration::from_secs(1), Duration::from_secs(30)),
             Duration::from_secs(1),
         )
         .await
@@ -521,7 +528,7 @@ mod tests {
         while rx.recv().await.is_some() {
             ticks += 1;
         }
-        assert_eq!(ticks, 8);
+        assert_eq!(ticks, 20);
     }
 
     /// And the converse — silence past the allowance is what "stuck" means.
