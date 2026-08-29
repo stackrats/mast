@@ -975,6 +975,42 @@ impl Check for StubDrift {
                     ));
                 }
             }
+
+            // Upstream sometimes fixes a stub by ADDING something, and an
+            // install generated before the fix never gets it retroactively —
+            // the compose file was copied once and is yours from then on.
+            // MongoDB is the live case: laravel/sail#883 added a second
+            // volume for /data/configdb because without it the container
+            // fails to restart once it has written config state.
+            for (service, volumes) in &p.service_volumes {
+                let mongo = p
+                    .service_images
+                    .iter()
+                    .any(|(s, image)| s == service && image.to_ascii_lowercase().contains("mongo"));
+                if !mongo {
+                    continue;
+                }
+                let has_data = volumes.iter().any(|v| !v.to_ascii_lowercase().contains("config"));
+                let has_config = volumes.iter().any(|v| v.to_ascii_lowercase().contains("config"));
+                if has_data && !has_config {
+                    findings.push(for_project(
+                        finding(
+                            self.id(),
+                            Severity::Warning,
+                            format!("{}: \"{service}\" persists /data/db but not /data/configdb", p.name),
+                            format!(
+                                "Sail's MongoDB stub gained a second volume in laravel/sail#883 \
+                                 — without it the container can fail to restart once it has \
+                                 written config state. Compose files generated before that fix \
+                                 keep only the data volume. Add \
+                                 `sail-mongodb-config:/data/configdb` to \"{service}\" and \
+                                 declare `sail-mongodb-config` under top-level volumes."
+                            ),
+                        ),
+                        p,
+                    ));
+                }
+            }
         }
         findings
     }
@@ -2056,6 +2092,7 @@ mod tests {
             env_crlf: false,
             xdebug: None,
             service_images: Vec::new(),
+            service_volumes: Vec::new(),
             compose_name: Some(id.into()),
             dir_basename: id.into(),
             name_from_dir: false,
@@ -2427,6 +2464,45 @@ mod tests {
         let mysql = drift.iter().find(|f| f.title.contains("mysql-server")).unwrap();
         assert!(mysql.repair.is_none(), "retag flow owns the fix");
         assert!(mysql.detail.contains("mysql:8.4"), "{}", mysql.detail);
+    }
+
+    /// laravel/sail#883: the stub gained a /data/configdb volume. An install
+    /// generated before that keeps only the data volume and can fail to
+    /// restart, and nothing re-generates a compose file after the fact.
+    #[test]
+    fn stub_drift_flags_a_mongodb_missing_its_config_volume() {
+        let mut p = sail_project("a");
+        p.service_images = vec![
+            ("mongodb".into(), "mongodb/mongodb-community-server:8.0-ubi9".into()),
+            ("redis".into(), "redis:alpine".into()),
+        ];
+        p.service_volumes = vec![
+            ("mongodb".into(), vec!["sail-mongodb".into()]),
+            ("redis".into(), vec!["sail-redis".into()]),
+        ];
+        let (_, findings) = run_all(&ctx(vec![p]));
+        let drift: Vec<_> = findings.iter().filter(|f| f.check == "stub-drift").collect();
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert!(drift[0].title.contains("configdb"), "{}", drift[0].title);
+        assert!(drift[0].detail.contains("sail#883"), "{}", drift[0].detail);
+
+        // Already fixed (or generated after the fix): silence.
+        let mut fixed = sail_project("b");
+        fixed.service_images =
+            vec![("mongodb".into(), "mongodb/mongodb-community-server:8.0-ubi9".into())];
+        fixed.service_volumes = vec![(
+            "mongodb".into(),
+            vec!["sail-mongodb".into(), "sail-mongodb-config".into()],
+        )];
+        let (_, findings) = run_all(&ctx(vec![fixed]));
+        assert!(findings.iter().all(|f| f.check != "stub-drift"), "{findings:?}");
+
+        // A non-Mongo service with one volume is not this problem.
+        let mut other = sail_project("c");
+        other.service_images = vec![("mysql".into(), "mysql:8.4".into())];
+        other.service_volumes = vec![("mysql".into(), vec!["sail-mysql".into()])];
+        let (_, findings) = run_all(&ctx(vec![other]));
+        assert!(findings.iter().all(|f| f.check != "stub-drift"), "{findings:?}");
     }
 
     #[test]
