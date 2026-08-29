@@ -312,10 +312,10 @@ pub struct ProjectFacts {
     /// (service, image) for every image-based service in the resolved model
     /// — what the stub-drift check reads.
     pub service_images: Vec<(String, String)>,
-    /// (service, named volume sources) from the resolved model. Upstream
-    /// sometimes fixes a stub by ADDING a volume, which existing installs
-    /// never retroactively get — this is how that is noticed.
-    pub service_volumes: Vec<(String, Vec<String>)>,
+    /// (service, things the project's OWN vendored Sail stub has that its
+    /// compose file does not), rendered as `path: value`. Empty when the
+    /// service matches, has no stub, or Sail is not installed.
+    pub stub_deltas: Vec<(String, Vec<String>)>,
     /// Resolved compose project name (None when the model is unresolved).
     pub compose_name: Option<String>,
     /// The project directory's basename, and whether the compose project
