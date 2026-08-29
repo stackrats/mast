@@ -108,6 +108,7 @@ function editWorkspace(ws: WorkspaceSummary) {
       <CommandPalette v-model:open="paletteOpen" @dialog="openPaletteDialog" />
 
       <AppMenubar
+        @open-palette="paletteOpen = true"
         @open-settings="settingsOpen = true"
         @new-workspace="newWorkspace"
         @open-diagnostics="openDiagnostics()"
