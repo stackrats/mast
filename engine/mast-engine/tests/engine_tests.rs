@@ -2348,6 +2348,98 @@ async fn php_switch_rewrites_context_and_tag_together_before_building() {
     assert!(!switched.contains("8.3"), "{switched}");
 }
 
+/// Extensions ride Sail's `PHP_EXTENSIONS` build arg. Two refusals matter
+/// more than the happy path: a name that is not a package name, and a
+/// vendored runtime too old to declare the arg — Docker only *warns* about
+/// an undeclared build arg, so that one would otherwise rebuild for minutes
+/// and install nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn php_extensions_ride_the_build_arg_and_refuse_old_runtimes() {
+    if !compose_cli_available().await {
+        eprintln!("skipping: docker compose CLI not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("extapp");
+    let runtime = project.join("vendor/laravel/sail/runtimes/8.4");
+    std::fs::create_dir_all(&runtime).unwrap();
+    // A runtime from before laravel/sail#879: no PHP_EXTENSIONS arg.
+    std::fs::write(&runtime.join("Dockerfile"), "FROM ubuntu:24.04\nARG NODE_VERSION=24\n")
+        .unwrap();
+    let compose = project.join("compose.yaml");
+    std::fs::write(
+        &compose,
+        "services:\n  laravel.test:\n    build:\n      context: './vendor/laravel/sail/runtimes/8.4'\n      dockerfile: Dockerfile\n      args:\n        WWWGROUP: '${WWWGROUP}'\n    image: 'sail-8.4/app'\n",
+    )
+    .unwrap();
+
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "php info on summary", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.php.is_some() && p.compose_project_name.is_some())
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+
+    // A name outside the package alphabet never reaches the file. The value
+    // is expanded unquoted by the runtime, so this is the shell-injection
+    // guard, not a cosmetic one.
+    match engine.dispatch(Action::SetPhpExtensions {
+        id: pid.clone(),
+        service: "laravel.test".into(),
+        extensions: vec!["redis; rm -rf /".into()],
+    }) {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("not a PHP extension package name"), "{message}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    // The old runtime is refused too, and says why.
+    match engine.dispatch(Action::SetPhpExtensions {
+        id: pid.clone(),
+        service: "laravel.test".into(),
+        extensions: vec!["redis".into()],
+    }) {
+        Err(mast_contract::ErrorInfo::InvalidInput { message }) => {
+            assert!(message.contains("predates"), "{message}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert!(
+        !std::fs::read_to_string(&compose).unwrap().contains("PHP_EXTENSIONS"),
+        "both refusals must leave the file alone"
+    );
+
+    // Publish a runtime that declares the arg and it goes through: the edit
+    // lands before the (Dockerfile-less) build fails.
+    std::fs::write(
+        &runtime.join("Dockerfile"),
+        "FROM ubuntu:24.04\nARG NODE_VERSION=24\nARG PHP_EXTENSIONS=\"\"\n",
+    )
+    .unwrap();
+    let id = engine
+        .dispatch(Action::SetPhpExtensions {
+            id: pid.clone(),
+            service: "laravel.test".into(),
+            extensions: vec!["redis".into(), "intl".into()],
+        })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    while let Some(event) = events.next().await {
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+    let edited = std::fs::read_to_string(&compose).unwrap();
+    assert!(edited.contains("PHP_EXTENSIONS: 'redis intl'"), "{edited}");
+    assert!(edited.contains("WWWGROUP: '${WWWGROUP}'"), "existing args survive: {edited}");
+}
+
 /// The Node switch pins `build.args.NODE_VERSION` (existing args intact)
 /// BEFORE the rebuild, refuses garbage majors without touching the file,
 /// and the summary's effective Node follows the override.
