@@ -120,6 +120,12 @@ pub struct SystemFacts {
     pub compose_version: Option<String>,
     /// Daemon version from `docker info` (`{{.ServerVersion}}`).
     pub docker_server_version: Option<String>,
+    /// `{{.OperatingSystem}}` from `docker info` — "Docker Desktop",
+    /// "OrbStack", a plain distro name on native Linux.
+    pub docker_os: Option<String>,
+    /// `{{.Name}}` from `docker info` — how colima and Rancher Desktop
+    /// identify themselves when the OS string does not.
+    pub docker_daemon_name: Option<String>,
     /// Mast itself runs on Linux (some findings only make sense there).
     pub linux: bool,
     pub socket: Option<SocketFacts>,

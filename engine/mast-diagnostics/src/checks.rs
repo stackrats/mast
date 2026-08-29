@@ -1016,6 +1016,100 @@ impl Check for StubDrift {
     }
 }
 
+/// Which container runtime is serving this daemon — the thing that decides
+/// how slow a bind mount is on macOS and Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFlavor {
+    DockerDesktop,
+    OrbStack,
+    Colima,
+    RancherDesktop,
+    Unknown,
+}
+
+/// Read the flavour off `docker info`'s own two identifying fields.
+///
+/// `OperatingSystem` names Docker Desktop and OrbStack directly; colima and
+/// Rancher Desktop say "Alpine Linux"/"Linux" there and identify themselves
+/// in `Name` instead, so both are consulted.
+pub fn runtime_flavor(os: Option<&str>, name: Option<&str>) -> RuntimeFlavor {
+    let os = os.unwrap_or_default().to_ascii_lowercase();
+    let name = name.unwrap_or_default().to_ascii_lowercase();
+    if os.contains("orbstack") || name.contains("orbstack") {
+        RuntimeFlavor::OrbStack
+    } else if name.contains("colima") {
+        RuntimeFlavor::Colima
+    } else if name.contains("rancher") || name.contains("lima-rancher") {
+        RuntimeFlavor::RancherDesktop
+    } else if os.contains("docker desktop") {
+        RuntimeFlavor::DockerDesktop
+    } else {
+        RuntimeFlavor::Unknown
+    }
+}
+
+/// Bind-mount performance, which is the single most common complaint about
+/// Sail and is entirely a property of the host.
+///
+/// Only fires off Linux. On Linux a bind mount is the host filesystem and
+/// there is nothing to say; on macOS and Windows every file the app reads
+/// crosses a VM boundary, and the whole Laravel tree — vendor, node_modules,
+/// every view — is inside that mount. The advice is per-runtime because the
+/// one setting that matters differs, and saying "install something else"
+/// to someone who already chose their runtime is not advice.
+struct BindMountSpeed;
+impl Check for BindMountSpeed {
+    fn id(&self) -> &'static str {
+        "bind-mount-speed"
+    }
+    fn applies(&self, ctx: &DiagCtx) -> bool {
+        // Linux mounts the host filesystem directly — no boundary, no cost.
+        !ctx.system.linux && ctx.system.docker_connected && !ctx.projects.is_empty()
+    }
+    fn run(&self, ctx: &DiagCtx) -> Vec<Finding> {
+        let flavor = runtime_flavor(
+            ctx.system.docker_os.as_deref(),
+            ctx.system.docker_daemon_name.as_deref(),
+        );
+        // The one genuinely universal mitigation: the directories that hold
+        // tens of thousands of files are the ones that hurt, and neither
+        // needs to live on the host.
+        let shared = "Whatever the runtime, the biggest single win is keeping `vendor` and                       `node_modules` out of the bind mount — mounting each as a named volume                       leaves the code editable on the host while the file-heavy trees stay on                       the container's own filesystem.";
+        let (severity, title, detail) = match flavor {
+            RuntimeFlavor::OrbStack => return Vec::new(),
+            RuntimeFlavor::DockerDesktop => (
+                Severity::Info,
+                "Docker Desktop shares your project over a VM boundary",
+                format!(
+                    "Every file the app reads crosses from the host into the VM, which is                      roughly three times slower than native even at its best, and worst for                      the many-small-file work Laravel does constantly (composer install, a                      Vite rebuild, a test run). Make sure VirtioFS is selected under Settings                      → General → file sharing implementation; gRPC FUSE and osxfs are the                      older, slower ones. {shared}"
+                ),
+            ),
+            RuntimeFlavor::Colima => (
+                Severity::Info,
+                "colima's mount type decides how slow your project files are",
+                format!(
+                    "colima defaults to sshfs, which is the slowest of its options. Restart it                      with `colima start --mount-type virtiofs` (macOS 13+) for a large                      improvement on the file-heavy work Laravel does constantly. {shared}"
+                ),
+            ),
+            RuntimeFlavor::RancherDesktop => (
+                Severity::Info,
+                "Rancher Desktop shares your project over a VM boundary",
+                format!(
+                    "Project files reach the container across a VM boundary, which is slowest                      for the many-small-file work Laravel does constantly. Rancher Desktop's                      virtiofs mount type (Preferences → Virtual Machine → Volumes) is the                      faster option where your macOS version offers it. {shared}"
+                ),
+            ),
+            RuntimeFlavor::Unknown => (
+                Severity::Info,
+                "Your project files reach the container across a VM boundary",
+                format!(
+                    "Off Linux, Docker runs in a virtual machine and every file the app reads                      crosses into it — the reason Sail feels slower here than the same stack                      does on a Linux box. {shared}"
+                ),
+            ),
+        };
+        vec![finding(self.id(), severity, title.to_string(), detail)]
+    }
+}
+
 /// The Xdebug doctor. Every failure mode here looks identical from the
 /// browser — breakpoints never hit — which is why no single piece of advice
 /// in the tracker ever worked. The ladder names which rung actually broke:
@@ -1994,6 +2088,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(DockerDesktopLinux),
         Box::new(Xdebug),
         Box::new(StubDrift),
+        Box::new(BindMountSpeed),
         Box::new(IdentityCollision),
         Box::new(ProjectNameShape),
         Box::new(CliServerWorkers),
@@ -2037,6 +2132,8 @@ mod tests {
             docker_host_env: false,
             compose_version: Some("2.29.0".into()),
             docker_server_version: Some("29.7.2".into()),
+            docker_os: None,
+            docker_daemon_name: None,
             linux: true,
             socket: None,
             rootless: Some(false),
@@ -2503,6 +2600,58 @@ mod tests {
         other.service_volumes = vec![("mysql".into(), vec!["sail-mysql".into()])];
         let (_, findings) = run_all(&ctx(vec![other]));
         assert!(findings.iter().all(|f| f.check != "stub-drift"), "{findings:?}");
+    }
+
+    #[test]
+    fn runtime_flavor_reads_whichever_field_identifies_the_runtime() {
+        use RuntimeFlavor::*;
+        // Docker Desktop and OrbStack say so in OperatingSystem.
+        assert_eq!(runtime_flavor(Some("Docker Desktop"), Some("docker-desktop")), DockerDesktop);
+        assert_eq!(runtime_flavor(Some("OrbStack"), Some("orbstack")), OrbStack);
+        // colima and Rancher look like plain Linux there and identify in Name.
+        assert_eq!(runtime_flavor(Some("Alpine Linux v3.20"), Some("colima")), Colima);
+        assert_eq!(runtime_flavor(Some("Linux"), Some("lima-rancher-desktop")), RancherDesktop);
+        // A native daemon is none of them.
+        assert_eq!(runtime_flavor(Some("Ubuntu 24.04.1 LTS"), Some("thinkpad")), Unknown);
+        assert_eq!(runtime_flavor(None, None), Unknown);
+    }
+
+    /// The check exists to answer the loudest complaint about Sail, so it
+    /// must stay silent exactly where the complaint does not apply: on
+    /// Linux, where a bind mount IS the host filesystem, and on OrbStack,
+    /// which already solved it.
+    #[test]
+    fn bind_mount_speed_is_per_runtime_and_silent_where_it_should_be() {
+        let named = |os: &str, name: &str| {
+            let mut c = ctx(vec![sail_project("a")]);
+            c.system.linux = false;
+            c.system.docker_connected = true;
+            c.system.docker_os = Some(os.into());
+            c.system.docker_daemon_name = Some(name.into());
+            c
+        };
+
+        // Linux: nothing crosses a boundary, so nothing is said.
+        let mut linux = named("Ubuntu 24.04", "thinkpad");
+        linux.system.linux = true;
+        let (_, findings) = run_all(&linux);
+        assert!(findings.iter().all(|f| f.check != "bind-mount-speed"), "{findings:?}");
+
+        // OrbStack already runs near native — advice would be noise.
+        let (_, findings) = run_all(&named("OrbStack", "orbstack"));
+        assert!(findings.iter().all(|f| f.check != "bind-mount-speed"), "{findings:?}");
+
+        // Docker Desktop gets the VirtioFS setting by name.
+        let (_, findings) = run_all(&named("Docker Desktop", "docker-desktop"));
+        let f = findings.iter().find(|f| f.check == "bind-mount-speed").expect("a finding");
+        assert!(f.detail.contains("VirtioFS"), "{}", f.detail);
+        assert!(f.detail.contains("node_modules"), "the universal fix too: {}", f.detail);
+
+        // colima gets its own flag, not Docker Desktop's settings pane.
+        let (_, findings) = run_all(&named("Alpine Linux v3.20", "colima"));
+        let f = findings.iter().find(|f| f.check == "bind-mount-speed").expect("a finding");
+        assert!(f.detail.contains("--mount-type virtiofs"), "{}", f.detail);
+        assert!(!f.detail.contains("Settings → General"), "{}", f.detail);
     }
 
     #[test]
