@@ -715,13 +715,15 @@ impl Engine {
                 .filter(|v| !v.is_empty())
         };
 
-        // Security options, data root and server version in one round trip.
-        let (rootless, docker_root, docker_server_version) = {
+        // Security options, data root, server version and the two fields that
+        // name the runtime, in one round trip.
+        let (rootless, docker_root, docker_server_version, docker_os, docker_daemon_name) = {
             let argv: Vec<String> = [
                 "docker",
                 "info",
                 "--format",
-                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}",
+                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}\t\
+                 {{.OperatingSystem}}\t{{.Name}}",
             ]
             .map(String::from)
             .into();
@@ -732,13 +734,17 @@ impl Engine {
                     let security = cols.next().unwrap_or_default();
                     let root = cols.next().unwrap_or_default();
                     let server = cols.next().unwrap_or_default().trim();
+                    let os = cols.next().unwrap_or_default().trim();
+                    let name = cols.next().unwrap_or_default().trim();
                     (
                         Some(security.contains("rootless")),
                         Some(root.trim().to_string()),
                         (!server.is_empty()).then(|| server.to_string()),
+                        (!os.is_empty()).then(|| os.to_string()),
+                        (!name.is_empty()).then(|| name.to_string()),
                     )
                 }
-                _ => (None, None, None),
+                _ => (None, None, None, None, None),
             }
         };
 
@@ -1115,6 +1121,8 @@ impl Engine {
                 docker_host_env,
                 compose_version,
                 docker_server_version,
+                docker_os,
+                docker_daemon_name,
                 linux: cfg!(target_os = "linux"),
                 socket,
                 rootless,
