@@ -2364,7 +2364,7 @@ async fn php_extensions_ride_the_build_arg_and_refuse_old_runtimes() {
     let runtime = project.join("vendor/laravel/sail/runtimes/8.4");
     std::fs::create_dir_all(&runtime).unwrap();
     // A runtime from before laravel/sail#879: no PHP_EXTENSIONS arg.
-    std::fs::write(&runtime.join("Dockerfile"), "FROM ubuntu:24.04\nARG NODE_VERSION=24\n")
+    std::fs::write(runtime.join("Dockerfile"), "FROM ubuntu:24.04\nARG NODE_VERSION=24\n")
         .unwrap();
     let compose = project.join("compose.yaml");
     std::fs::write(
@@ -2418,7 +2418,7 @@ async fn php_extensions_ride_the_build_arg_and_refuse_old_runtimes() {
     // Publish a runtime that declares the arg and it goes through: the edit
     // lands before the (Dockerfile-less) build fails.
     std::fs::write(
-        &runtime.join("Dockerfile"),
+        runtime.join("Dockerfile"),
         "FROM ubuntu:24.04\nARG NODE_VERSION=24\nARG PHP_EXTENSIONS=\"\"\n",
     )
     .unwrap();
