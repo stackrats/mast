@@ -430,6 +430,14 @@ export type Action =
  */
 { type: "setNodeVersion"; id: ProjectId; service: string; major: string } | 
 /**
+ * Install PHP extensions into the app's runtime image via Sail's
+ * `build.args.PHP_EXTENSIONS` (laravel/sail#879), then the same
+ * verified rebuild as the PHP and Node switches. The list REPLACES
+ * whatever was pinned before; an empty list clears it. Extensions the
+ * runtime already carries in its base set are unaffected either way.
+ */
+{ type: "setPhpExtensions"; id: ProjectId; service: string; extensions: string[] } | 
+/**
  * Publish the running app through Sail's expose tunnel (`sail share`,
  * same image, flags and `.env` knobs). Long-running: the operation
  * stays live while the tunnel is up, cancelling it stops the share.
@@ -844,7 +852,21 @@ iniFile: string | null;
 /**
  * The vendored runtime's `Dockerfile` — where extensions are added.
  */
-dockerfile: string | null }
+dockerfile: string | null; 
+/**
+ * Extensions this project pins through `build.args.PHP_EXTENSIONS`,
+ * i.e. the ones Mast installed rather than the runtime's base set.
+ */
+managed?: string[]; 
+/**
+ * Whether [`Action::SetPhpExtensions`] can work here at all.
+ */
+canManage?: boolean; 
+/**
+ * Why not, when it cannot — a runtime published before Sail grew the
+ * build arg, or a build shape that carries no args.
+ */
+manageBlocked?: string | null }
 /**
  * The app's Sail PHP runtime: what `build.context` currently pins and which
  * vendored runtimes it could switch to (drives the PHP version picker).
