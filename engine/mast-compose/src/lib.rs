@@ -16,6 +16,7 @@ pub mod network;
 pub mod sail;
 pub mod transaction;
 pub mod versions;
+pub mod stubs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

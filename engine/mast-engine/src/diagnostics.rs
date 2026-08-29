@@ -296,7 +296,47 @@ fn app_url_rewrite(
     mast_laravel::rewrite_explicit_port(&url, from, to)
 }
 
+/// Per service, the entries its vendored stub has that the compose file does
+/// not.
+///
+/// Only that direction is collected. A key the project has and the stub does
+/// not is a local addition, and a value that merely differs is usually a
+/// deliberate pin (`redis:7.2` over `redis:alpine`) — reporting either would
+/// make the check noise on every customised project, which is most of them.
+fn stub_deltas_for(seed: &ProjectSeed) -> Vec<(String, Vec<String>)> {
+    let Some(source) = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
+        .iter()
+        .find_map(|name| std::fs::read_to_string(seed.path.join(name)).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (service, _) in &seed.services {
+        let Some(stub_path) = mast_compose::stubs::stub_path_for(&seed.path, service) else {
+            continue;
+        };
+        let Ok(stub) = std::fs::read_to_string(&stub_path) else { continue };
+        let Ok(deltas) = mast_compose::stubs::compare_service_to_stub(&source, service, &stub)
+        else {
+            continue;
+        };
+        let missing: Vec<String> = deltas
+            .into_iter()
+            .filter(|d| d.kind == mast_compose::stubs::DeltaKind::MissingHere)
+            .filter_map(|d| d.stub.map(|value| format!("{}: {value}", d.path)))
+            .collect();
+        if !missing.is_empty() {
+            out.push((service.clone(), missing));
+        }
+    }
+    out
+}
+
 fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
+    // What this project's OWN vendored Sail would generate today, against
+    // what its compose file actually says. Filesystem-only, so it belongs in
+    // the blocking half; `None` everywhere Sail is not installed.
+    let stub_deltas = stub_deltas_for(&seed);
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
     let env = mast_compose::parse_env_file(&env_path);
@@ -424,7 +464,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
                 .unwrap_or(false),
         xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
         service_images: Vec::new(), // filled from the resolved model in gather
-        service_volumes: Vec::new(),
+        stub_deltas,
     };
     (facts, db_target)
 }
@@ -800,11 +840,6 @@ impl Engine {
                     .services
                     .iter()
                     .map(|(service, image, _)| (service.clone(), image.clone()))
-                    .collect();
-                facts.service_volumes = meta
-                    .services
-                    .iter()
-                    .map(|(service, _, volumes)| (service.clone(), volumes.clone()))
                     .collect();
                 facts.compose_name = Some(meta.compose_name.clone());
             }
