@@ -6,6 +6,7 @@ import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 import type { ProjectSummary, WorkspaceSummary } from "./bindings";
 import AboutDialog from "./components/AboutDialog.vue";
 import AppMenubar from "./components/AppMenubar.vue";
+import CommandPalette from "./components/CommandPalette.vue";
 import DiagnosticsDialog from "./components/DiagnosticsDialog.vue";
 import LogsDialog from "./components/LogsDialog.vue";
 import LogsPanel from "./components/LogsPanel.vue";
@@ -35,6 +36,23 @@ function openDiagnostics(scope: ProjectSummary | null = null) {
 }
 const newProjectOpen = ref(false);
 const aboutOpen = ref(false);
+const paletteOpen = ref(false);
+
+// Ctrl/Cmd-K from anywhere, including from inside a text field — the palette
+// is how you leave wherever you are, so it must not be capturable by the
+// thing you are trying to leave. The one exception is itself.
+function onKeydown(event: KeyboardEvent) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    paletteOpen.value = !paletteOpen.value;
+  }
+}
+
+function openPaletteDialog(what: "settings" | "newProject" | "newWorkspace") {
+  if (what === "settings") settingsOpen.value = true;
+  else if (what === "newProject") newProjectOpen.value = true;
+  else newWorkspace();
+}
 const workspaceDialogOpen = ref(false);
 const editingWorkspace = ref<WorkspaceSummary | null>(null);
 
@@ -51,10 +69,12 @@ function syncUsageToVisibility() {
 onMounted(() => {
   void store.connect();
   document.addEventListener("visibilitychange", syncUsageToVisibility);
+  window.addEventListener("keydown", onKeydown);
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", syncUsageToVisibility);
+  window.removeEventListener("keydown", onKeydown);
 });
 
 const selectedProject = computed(() => {
@@ -85,6 +105,8 @@ function editWorkspace(ws: WorkspaceSummary) {
     <div
       class="flex h-screen flex-col bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100"
     >
+      <CommandPalette v-model:open="paletteOpen" @dialog="openPaletteDialog" />
+
       <AppMenubar
         @open-settings="settingsOpen = true"
         @new-workspace="newWorkspace"
