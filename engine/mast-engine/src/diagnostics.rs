@@ -424,6 +424,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
                 .unwrap_or(false),
         xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
         service_images: Vec::new(), // filled from the resolved model in gather
+        service_volumes: Vec::new(),
     };
     (facts, db_target)
 }
@@ -793,6 +794,11 @@ impl Engine {
                     .services
                     .iter()
                     .map(|(service, image, _)| (service.clone(), image.clone()))
+                    .collect();
+                facts.service_volumes = meta
+                    .services
+                    .iter()
+                    .map(|(service, _, volumes)| (service.clone(), volumes.clone()))
                     .collect();
                 facts.compose_name = Some(meta.compose_name.clone());
             }
