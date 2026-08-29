@@ -21,11 +21,63 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Nothing ships from a red tree. A tag push does not itself run ci.yml, so
+  # this looks up the CI run for the very commit being released and demands
+  # that it concluded `success` — waiting out a run still in flight, because
+  # tagging straight after a merge races the main-branch run. Deliberately
+  # strict and with no bypass input: a re-cut of an existing release has to
+  # be green too. Gate both entry jobs, so a red tree does not even get as
+  # far as creating the draft.
+  verify:
+    name: CI must be green
+    runs-on: ubuntu-latest
+    # The workflow-level `permissions:` block zeroes every scope it does not
+    # name, so reading another workflow's runs has to be asked for here.
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Release commit: $SHA"
+          deadline=$(( SECONDS + 1800 ))
+          while :; do
+            latest=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=100" \
+              --jq '[.workflow_runs[]] | sort_by(.created_at) | last // empty')
+            if [ -z "$latest" ]; then
+              status=""; conclusion=""
+              echo "No CI run recorded for $SHA yet."
+            else
+              status=$(printf '%s' "$latest" | jq -r '.status')
+              conclusion=$(printf '%s' "$latest" | jq -r '.conclusion // "pending"')
+              echo "CI run $(printf '%s' "$latest" | jq -r '.html_url') — status=$status conclusion=$conclusion"
+            fi
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI is green for $SHA — the release may proceed."
+                exit 0
+              fi
+              echo "::error::CI concluded '$conclusion' for $SHA. Release blocked until CI is green."
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out after 30m waiting for CI on $SHA (last status: ${status:-none}). Release blocked."
+              exit 1
+            fi
+            sleep 30
+          done
+
   # The web assets are platform-independent — build them once, with the
   # same Vite Plus toolchain CI already proves, and hand the dist to the
   # per-OS bundle jobs so Windows never needs the vp installer.
   frontend:
     name: Frontend dist
+    needs: [verify]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -54,6 +106,7 @@ jobs:
   # published release leaves it exactly as it is.
   ensure-release:
     name: Ensure release exists
+    needs: [verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
