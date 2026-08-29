@@ -20,12 +20,16 @@ import Tooltip from "./ui/Tooltip.vue";
 const store = useEngineStore();
 
 const rows = computed(() => fleetRows(store.projects, store.usage));
-const running = computed(() => rows.value.filter((r) => r.project.status === "running"));
+// Only projects that are up get a row. Every column here is a cost, and a
+// stopped project has none — the rows were four cells of "—" repeating what
+// the sidebar's status dots already say. The header keeps the total, so the
+// inventory is not lost, and starting one is the sidebar's job (or Ctrl-K).
+const active = computed(() => rows.value.filter((r) => r.project.status !== "stopped"));
 const quiet = computed(() => rows.value.filter((r) => r.quiet));
 const totals = computed(() => ({
-  cpuCores: running.value.reduce((n, r) => n + r.cpuCores, 0),
-  memoryBytes: running.value.reduce((n, r) => n + r.memoryBytes, 0),
-  containers: running.value.reduce((n, r) => n + r.containers, 0),
+  cpuCores: active.value.reduce((n, r) => n + r.cpuCores, 0),
+  memoryBytes: active.value.reduce((n, r) => n + r.memoryBytes, 0),
+  containers: active.value.reduce((n, r) => n + r.containers, 0),
 }));
 const hostCores = computed(() => store.latestUsage?.hostCores ?? 0);
 
@@ -41,6 +45,10 @@ function busy(id: ProjectId): boolean {
 
 function stop(id: ProjectId) {
   void store.runLifecycle(id, "stop", { type: "stopProject", id });
+}
+
+function open(id: ProjectId) {
+  store.selection = { kind: "project", id };
 }
 
 function stopQuiet() {
@@ -61,8 +69,8 @@ const cellClass = "px-3 py-2 text-sm";
       <div class="flex items-baseline gap-2">
         <h2 class="text-sm font-medium text-slate-900 dark:text-slate-100">Fleet</h2>
         <p class="text-xs text-slate-500 tabular-nums dark:text-slate-400">
-          {{ running.length }} of {{ rows.length }} running
-          <template v-if="running.length > 0">
+          {{ active.length }} of {{ rows.length }} up
+          <template v-if="active.length > 0">
             · {{ totals.containers }} container{{ totals.containers === 1 ? "" : "s" }} ·
             {{ formatCores(totals.cpuCores)
             }}<template v-if="hostCores > 0"> of {{ hostCores }} </template> cores ·
@@ -81,7 +89,19 @@ const cellClass = "px-3 py-2 text-sm";
       </Tooltip>
     </header>
 
-    <div class="overflow-x-auto border-t border-slate-200 dark:border-slate-800">
+    <p
+      v-if="active.length === 0"
+      class="border-t border-slate-200 px-3 py-3 text-sm text-slate-500 dark:border-slate-800 dark:text-slate-400"
+    >
+      Nothing running. Start a project from the sidebar, or press
+      <kbd class="rounded border border-slate-300 px-1 font-mono text-xs dark:border-slate-600">
+        Ctrl</kbd
+      >+<kbd class="rounded border border-slate-300 px-1 font-mono text-xs dark:border-slate-600">
+        K</kbd
+      >.
+    </p>
+
+    <div v-else class="overflow-x-auto border-t border-slate-200 dark:border-slate-800">
       <table class="w-full min-w-[34rem] border-collapse">
         <thead>
           <tr class="text-left text-xs text-slate-500 dark:text-slate-400">
@@ -94,16 +114,18 @@ const cellClass = "px-3 py-2 text-sm";
         </thead>
         <tbody>
           <tr
-            v-for="row in rows"
+            v-for="row in active"
             :key="row.project.id"
-            class="border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800/70 dark:hover:bg-slate-800/40"
+            tabindex="0"
+            role="button"
+            :aria-label="`Open ${row.project.name}`"
+            class="cursor-pointer border-t border-slate-100 hover:bg-slate-50 focus-visible:bg-slate-50 focus-visible:outline-none dark:border-slate-800/70 dark:hover:bg-slate-800/40 dark:focus-visible:bg-slate-800/40"
+            @click="open(row.project.id)"
+            @keydown.enter="open(row.project.id)"
+            @keydown.space.prevent="open(row.project.id)"
           >
             <td :class="cellClass">
-              <button
-                type="button"
-                class="flex min-w-0 items-center gap-2 text-left"
-                @click="store.selection = { kind: 'project', id: row.project.id }"
-              >
+              <span class="flex min-w-0 items-center gap-2">
                 <span
                   class="h-2 w-2 shrink-0 rounded-full"
                   :class="statusDot[row.project.status]"
@@ -117,32 +139,25 @@ const cellClass = "px-3 py-2 text-sm";
                 >
                   <Badge variant="secondary">quiet</Badge>
                 </Tooltip>
-              </button>
+              </span>
             </td>
             <td :class="[cellClass, 'text-right tabular-nums text-slate-600 dark:text-slate-300']">
-              <template v-if="row.project.status === 'running'">{{ row.containers }}</template>
-              <span v-else class="text-slate-300 dark:text-slate-600">—</span>
+              {{ row.containers }}
             </td>
             <td :class="[cellClass, 'text-right tabular-nums text-slate-600 dark:text-slate-300']">
-              <template v-if="row.project.status === 'running'">
-                {{ formatCores(row.cpuCores) }}
-              </template>
-              <span v-else class="text-slate-300 dark:text-slate-600">—</span>
+              {{ formatCores(row.cpuCores) }}
             </td>
             <td :class="[cellClass, 'text-right tabular-nums text-slate-600 dark:text-slate-300']">
-              <template v-if="row.project.status === 'running'">
-                {{ formatBytes(row.memoryBytes) }}
-              </template>
-              <span v-else class="text-slate-300 dark:text-slate-600">—</span>
+              {{ formatBytes(row.memoryBytes) }}
             </td>
             <td :class="[cellClass, 'text-right']">
               <Button
-                v-if="row.project.status !== 'stopped' && !store.readOnly"
+                v-if="!store.readOnly"
                 variant="ghost"
                 size="sm"
                 :disabled="busy(row.project.id)"
                 :aria-label="`Stop ${row.project.name}`"
-                @click="stop(row.project.id)"
+                @click.stop="stop(row.project.id)"
               >
                 <CircleStop class="h-3.5 w-3.5" />
                 Stop
