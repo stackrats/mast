@@ -159,13 +159,20 @@ export function rankServices(
 // something for nothing. ---
 
 /**
- * Below this many cores a project is doing nothing you asked for. An idle
- * Sail stack (php-fpm waiting, mysql parked, redis parked) sits near a
- * hundredth of a core; anything actually serving a request leaves it far
- * behind. Deliberately generous, because the cost of calling a busy project
- * quiet is stopping someone's work.
+ * Below this many cores a project is doing nothing you asked for.
+ *
+ * Calibrated against real readings, not a guess: a five-container Sail
+ * stack sitting with nobody using it measured 0.08–0.2 cores across several
+ * samples, so the original 0.05 was below the idle floor and the verdict
+ * could never fire. 0.25 clears that floor with headroom while staying far
+ * under anything serving requests.
+ *
+ * Erring high is the safer direction here. Too low and the feature is dead;
+ * too high and a lightly-busy project gets a badge and joins a bulk action
+ * the user still has to click, having been told the count and the window —
+ * and stopping a project loses nothing but the containers.
  */
-export const QUIET_CORES = 0.05;
+export const QUIET_CORES = 0.25;
 
 /**
  * How many consecutive samples must agree. At the engine's 2s cadence 30
