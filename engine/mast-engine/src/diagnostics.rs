@@ -296,7 +296,47 @@ fn app_url_rewrite(
     mast_laravel::rewrite_explicit_port(&url, from, to)
 }
 
+/// Per service, the entries its vendored stub has that the compose file does
+/// not.
+///
+/// Only that direction is collected. A key the project has and the stub does
+/// not is a local addition, and a value that merely differs is usually a
+/// deliberate pin (`redis:7.2` over `redis:alpine`) — reporting either would
+/// make the check noise on every customised project, which is most of them.
+fn stub_deltas_for(seed: &ProjectSeed) -> Vec<(String, Vec<String>)> {
+    let Some(source) = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
+        .iter()
+        .find_map(|name| std::fs::read_to_string(seed.path.join(name)).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (service, _) in &seed.services {
+        let Some(stub_path) = mast_compose::stubs::stub_path_for(&seed.path, service) else {
+            continue;
+        };
+        let Ok(stub) = std::fs::read_to_string(&stub_path) else { continue };
+        let Ok(deltas) = mast_compose::stubs::compare_service_to_stub(&source, service, &stub)
+        else {
+            continue;
+        };
+        let missing: Vec<String> = deltas
+            .into_iter()
+            .filter(|d| d.kind == mast_compose::stubs::DeltaKind::MissingHere)
+            .filter_map(|d| d.stub.map(|value| format!("{}: {value}", d.path)))
+            .collect();
+        if !missing.is_empty() {
+            out.push((service.clone(), missing));
+        }
+    }
+    out
+}
+
 fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair::DbProbeTarget>) {
+    // What this project's OWN vendored Sail would generate today, against
+    // what its compose file actually says. Filesystem-only, so it belongs in
+    // the blocking half; `None` everywhere Sail is not installed.
+    let stub_deltas = stub_deltas_for(&seed);
     let env_path = seed.path.join(".env");
     let env_present = env_path.is_file();
     let env = mast_compose::parse_env_file(&env_path);
@@ -424,6 +464,7 @@ fn inspect_project(seed: ProjectSeed) -> (ProjectFacts, Option<crate::db_repair:
                 .unwrap_or(false),
         xdebug: if sail_flavored { xdebug_facts(&seed.path, &pairs, &env) } else { None },
         service_images: Vec::new(), // filled from the resolved model in gather
+        stub_deltas,
     };
     (facts, db_target)
 }
@@ -714,13 +755,15 @@ impl Engine {
                 .filter(|v| !v.is_empty())
         };
 
-        // Security options, data root and server version in one round trip.
-        let (rootless, docker_root, docker_server_version) = {
+        // Security options, data root, server version and the two fields that
+        // name the runtime, in one round trip.
+        let (rootless, docker_root, docker_server_version, docker_os, docker_daemon_name) = {
             let argv: Vec<String> = [
                 "docker",
                 "info",
                 "--format",
-                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}",
+                "{{.SecurityOptions}}\t{{.DockerRootDir}}\t{{.ServerVersion}}\t\
+                 {{.OperatingSystem}}\t{{.Name}}",
             ]
             .map(String::from)
             .into();
@@ -731,13 +774,17 @@ impl Engine {
                     let security = cols.next().unwrap_or_default();
                     let root = cols.next().unwrap_or_default();
                     let server = cols.next().unwrap_or_default().trim();
+                    let os = cols.next().unwrap_or_default().trim();
+                    let name = cols.next().unwrap_or_default().trim();
                     (
                         Some(security.contains("rootless")),
                         Some(root.trim().to_string()),
                         (!server.is_empty()).then(|| server.to_string()),
+                        (!os.is_empty()).then(|| os.to_string()),
+                        (!name.is_empty()).then(|| name.to_string()),
                     )
                 }
-                _ => (None, None, None),
+                _ => (None, None, None, None, None),
             }
         };
 
@@ -1109,6 +1156,8 @@ impl Engine {
                 docker_host_env,
                 compose_version,
                 docker_server_version,
+                docker_os,
+                docker_daemon_name,
                 linux: cfg!(target_os = "linux"),
                 socket,
                 rootless,

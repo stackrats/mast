@@ -120,6 +120,12 @@ pub struct SystemFacts {
     pub compose_version: Option<String>,
     /// Daemon version from `docker info` (`{{.ServerVersion}}`).
     pub docker_server_version: Option<String>,
+    /// `{{.OperatingSystem}}` from `docker info` — "Docker Desktop",
+    /// "OrbStack", a plain distro name on native Linux.
+    pub docker_os: Option<String>,
+    /// `{{.Name}}` from `docker info` — how colima and Rancher Desktop
+    /// identify themselves when the OS string does not.
+    pub docker_daemon_name: Option<String>,
     /// Mast itself runs on Linux (some findings only make sense there).
     pub linux: bool,
     pub socket: Option<SocketFacts>,
@@ -306,6 +312,10 @@ pub struct ProjectFacts {
     /// (service, image) for every image-based service in the resolved model
     /// — what the stub-drift check reads.
     pub service_images: Vec<(String, String)>,
+    /// (service, things the project's OWN vendored Sail stub has that its
+    /// compose file does not), rendered as `path: value`. Empty when the
+    /// service matches, has no stub, or Sail is not installed.
+    pub stub_deltas: Vec<(String, Vec<String>)>,
     /// Resolved compose project name (None when the model is unresolved).
     pub compose_name: Option<String>,
     /// The project directory's basename, and whether the compose project

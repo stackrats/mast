@@ -1438,11 +1438,16 @@ impl crate::Engine {
                 .map(|context| format!("{}/{name}", context.trim_end_matches('/')))
                 .filter(|rel| path.join(rel).is_file())
         };
+        let (managed, can_manage, manage_blocked) =
+            crate::php::extension_support(&path, &app_service_of(&path));
         Ok(mast_contract::PhpRuntimeReport {
             extensions,
             ini,
             ini_file: runtime_file("php.ini"),
             dockerfile: runtime_file("Dockerfile"),
+            managed,
+            can_manage,
+            manage_blocked,
         })
     }
 }

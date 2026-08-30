@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import type { ServiceUsage, UsageSample, WorkspaceSummary } from "../bindings";
+import type { ProjectSummary, ServiceUsage, UsageSample, WorkspaceSummary } from "../bindings";
 import {
   cpuTone,
   defaultDirection,
+  fleetRows,
   formatBytes,
   formatCores,
   formatPercent,
   memoryTone,
+  quietProjects,
+  QUIET_SAMPLES,
   rankServices,
   rollupByProject,
   rollupByWorkspace,
@@ -197,5 +200,76 @@ describe("defaultDirection", () => {
     expect(defaultDirection("service")).toBe("asc");
     expect(defaultDirection("cpu")).toBe("desc");
     expect(defaultDirection("memory")).toBe("desc");
+  });
+});
+
+describe("the fleet", () => {
+  function project(overrides: Partial<ProjectSummary> = {}): ProjectSummary {
+    return {
+      id: "p1",
+      name: "storefront",
+      path: "/home/dev/storefront",
+      status: "running",
+      composeProjectName: "storefront",
+      isSail: true,
+      services: [],
+      resolutionError: null,
+      commands: [],
+      processes: [],
+      warnings: [],
+      ...overrides,
+    } as ProjectSummary;
+  }
+  const window = (cores: number, count = QUIET_SAMPLES) =>
+    Array.from({ length: count }, () => sample([service({ project: "p1", cpuCores: cores })]));
+
+  it("calls a project quiet only on a full window of evidence", () => {
+    expect(quietProjects(window(0.01)).has("p1")).toBe(true);
+    // One sample short: no verdict yet, so a freshly opened window never
+    // offers to stop anything.
+    expect(quietProjects(window(0.01, QUIET_SAMPLES - 1)).has("p1")).toBe(false);
+    expect(quietProjects([]).size).toBe(0);
+  });
+
+  it("does not average away a spike", () => {
+    const samples = window(0.01);
+    samples[5] = sample([service({ project: "p1", cpuCores: 3 })]);
+    // The mean would still be tiny; every sample must agree, so it is not quiet.
+    expect(quietProjects(samples).has("p1")).toBe(false);
+  });
+
+  it("ranks running projects first, then by cost", () => {
+    const projects = [
+      project({ id: "idle", name: "parked", status: "stopped" }),
+      project({ id: "small", name: "small", status: "running" }),
+      project({ id: "big", name: "big", status: "running" }),
+    ];
+    const latest = sample([
+      service({ project: "small", cpuCores: 0.2 }),
+      service({ project: "big", cpuCores: 2 }),
+    ]);
+    const rows = fleetRows(projects, [latest]);
+    expect(rows.map((r) => r.project.id)).toEqual(["big", "small", "idle"]);
+    expect(rows[0].cpuCores).toBe(2);
+  });
+
+  it("never marks a stopped project quiet — it costs nothing to stop again", () => {
+    const projects = [project({ id: "p1", status: "stopped" })];
+    const rows = fleetRows(projects, window(0));
+    expect(rows[0].quiet).toBe(false);
+    expect(rows[0].quietFor).toBe(0);
+  });
+
+  it("counts only running containers", () => {
+    const projects = [
+      project({
+        services: [
+          { name: "app", state: "running" },
+          { name: "mysql", state: "running" },
+          { name: "redis", state: "exited" },
+        ] as ProjectSummary["services"],
+      }),
+    ];
+    expect(fleetRows(projects, []).at(0)?.containers).toBe(2);
   });
 });

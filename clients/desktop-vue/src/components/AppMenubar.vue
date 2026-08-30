@@ -12,6 +12,7 @@ import { useEngineStore } from "../stores/engine";
 import Tooltip from "./ui/Tooltip.vue";
 
 const emit = defineEmits<{
+  openPalette: [];
   openSettings: [];
   newWorkspace: [];
   openDiagnostics: [];
@@ -81,6 +82,11 @@ const panelClass =
 const itemClass =
   "flex w-full cursor-default items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-700 outline-none hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800";
 const separatorClass = "my-1 h-px bg-slate-100 dark:bg-slate-800";
+const accelClass = "ml-auto pl-4 font-mono text-[0.68rem] text-slate-400 dark:text-slate-500";
+// Mac writes the modifier as a symbol and everyone else spells it. Read off
+// the platform once — a menu that says Ctrl on a Mac teaches the wrong key.
+const isMac = /mac/i.test(globalThis.navigator?.platform ?? globalThis.navigator?.userAgent ?? "");
+const paletteAccel = isMac ? "⌘K" : "Ctrl K";
 
 const MENUS: { id: MenuId; title: string }[] = [
   { id: "app", title: "App" },
@@ -125,6 +131,16 @@ async function closeToTray() {
 
       <div v-if="openMenu === menu.id" role="menu" :class="panelClass">
         <template v-if="menu.id === 'app'">
+          <button
+            type="button"
+            role="menuitem"
+            :class="itemClass"
+            @click="select(() => emit('openPalette'))"
+          >
+            Command palette…
+            <span :class="accelClass">{{ paletteAccel }}</span>
+          </button>
+          <div :class="separatorClass" />
           <button
             type="button"
             role="menuitem"
