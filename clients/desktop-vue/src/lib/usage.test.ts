@@ -10,6 +10,7 @@ import {
   formatPercent,
   memoryTone,
   quietProjects,
+  QUIET_CORES_PER_CONTAINER,
   QUIET_SAMPLES,
   rankServices,
   rollupByProject,
@@ -220,8 +221,15 @@ describe("the fleet", () => {
       ...overrides,
     } as ProjectSummary;
   }
-  const window = (cores: number, count = QUIET_SAMPLES) =>
-    Array.from({ length: count }, () => sample([service({ project: "p1", cpuCores: cores })]));
+  /** `count` samples of one project with `containers` services sharing `cores`. */
+  const window = (cores: number, count = QUIET_SAMPLES, containers = 1) =>
+    Array.from({ length: count }, () =>
+      sample(
+        Array.from({ length: containers }, (_, i) =>
+          service({ project: "p1", service: `s${i}`, cpuCores: cores / containers }),
+        ),
+      ),
+    );
 
   it("calls a project quiet only on a full window of evidence", () => {
     expect(quietProjects(window(0.01)).has("p1")).toBe(true);
@@ -229,6 +237,24 @@ describe("the fleet", () => {
     // offers to stop anything.
     expect(quietProjects(window(0.01, QUIET_SAMPLES - 1)).has("p1")).toBe(false);
     expect(quietProjects([]).size).toBe(0);
+  });
+
+  it("scales the allowance with the container count", () => {
+    // The whole point of per-container: the SAME total is quiet for a big
+    // stack and busy for a small one, because five idle containers
+    // legitimately cost more than one.
+    const total = QUIET_CORES_PER_CONTAINER * 3;
+    expect(quietProjects(window(total, QUIET_SAMPLES, 5)).has("p1")).toBe(true);
+    expect(quietProjects(window(total, QUIET_SAMPLES, 2)).has("p1")).toBe(false);
+  });
+
+  it("judges a project on its own size, right at the boundary", () => {
+    const containers = 4;
+    const allowance = QUIET_CORES_PER_CONTAINER * containers;
+    expect(quietProjects(window(allowance, QUIET_SAMPLES, containers)).has("p1")).toBe(true);
+    expect(quietProjects(window(allowance * 1.01, QUIET_SAMPLES, containers)).has("p1")).toBe(
+      false,
+    );
   });
 
   it("does not average away a spike", () => {

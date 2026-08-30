@@ -11,7 +11,7 @@ import { CircleStop, Moon } from "lucide-vue-next";
 
 import type { ProjectId } from "../bindings";
 import { statusDot } from "../lib/status";
-import { fleetRows, formatBytes, formatCores, QUIET_CORES } from "../lib/usage";
+import { fleetRows, formatBytes, formatCores, QUIET_CORES_PER_CONTAINER } from "../lib/usage";
 import { useEngineStore } from "../stores/engine";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
@@ -80,7 +80,7 @@ const cellClass = "px-3 py-2 text-sm";
       </div>
       <Tooltip
         v-if="quiet.length > 0 && !store.readOnly"
-        :text="`Stop the ${quiet.length} project${quiet.length === 1 ? '' : 's'} that have stayed under ${QUIET_CORES} cores for ${quietWindow}. Nothing is lost — containers stop, volumes stay.`"
+        :text="`Stop the ${quiet.length} project${quiet.length === 1 ? '' : 's'} that have stayed under ${QUIET_CORES_PER_CONTAINER} cores per container for ${quietWindow}. Nothing is lost — containers stop, volumes stay.`"
       >
         <Button variant="outline" size="sm" @click="stopQuiet">
           <Moon class="h-3.5 w-3.5" />
@@ -135,7 +135,7 @@ const cellClass = "px-3 py-2 text-sm";
                 </span>
                 <Tooltip
                   v-if="row.quiet"
-                  :text="`Under ${QUIET_CORES} cores for the last ${quietWindow}. Still running — nothing has been stopped.`"
+                  :text="`Under ${QUIET_CORES_PER_CONTAINER} cores per container (${formatCores(QUIET_CORES_PER_CONTAINER * row.containers)} across its ${row.containers}) for the last ${quietWindow}. Still running — nothing has been stopped.`"
                 >
                   <Badge variant="secondary">quiet</Badge>
                 </Tooltip>
