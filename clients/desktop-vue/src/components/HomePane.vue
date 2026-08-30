@@ -17,6 +17,7 @@ import {
 import { loadRecentWorkspaces } from "../lib/prefs";
 import { statusBadgeVariant } from "../lib/status";
 import { createdName, useEngineStore } from "../stores/engine";
+import FleetTable from "./FleetTable.vue";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
 
@@ -75,7 +76,7 @@ const scaffolding = computed(() =>
 </script>
 
 <template>
-  <div class="mx-auto max-w-2xl space-y-4">
+  <div class="mx-auto max-w-4xl space-y-4">
     <div
       v-if="store.docker && !store.docker.available"
       class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
@@ -155,6 +156,8 @@ const scaffolding = computed(() =>
         </div>
       </div>
     </section>
+
+    <FleetTable />
 
     <section v-if="overview.projectsTotal > 0" class="space-y-2">
       <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300">Overview</h2>

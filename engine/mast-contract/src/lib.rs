@@ -494,6 +494,17 @@ pub struct PhpRuntimeReport {
     pub ini_file: Option<String>,
     /// The vendored runtime's `Dockerfile` — where extensions are added.
     pub dockerfile: Option<String>,
+    /// Extensions this project pins through `build.args.PHP_EXTENSIONS`,
+    /// i.e. the ones Mast installed rather than the runtime's base set.
+    #[serde(default)]
+    pub managed: Vec<String>,
+    /// Whether [`Action::SetPhpExtensions`] can work here at all.
+    #[serde(default)]
+    pub can_manage: bool,
+    /// Why not, when it cannot — a runtime published before Sail grew the
+    /// build arg, or a build shape that carries no args.
+    #[serde(default)]
+    pub manage_blocked: Option<String>,
 }
 
 /// The local HTTPS proxy's root certificate, exported for manual trust —
@@ -1008,6 +1019,12 @@ pub enum Action {
     /// same verified switch as PHP: rebuild without cache, recreate when
     /// running, confirm `node -v` inside the container.
     SetNodeVersion { id: ProjectId, service: String, major: String },
+    /// Install PHP extensions into the app's runtime image via Sail's
+    /// `build.args.PHP_EXTENSIONS` (laravel/sail#879), then the same
+    /// verified rebuild as the PHP and Node switches. The list REPLACES
+    /// whatever was pinned before; an empty list clears it. Extensions the
+    /// runtime already carries in its base set are unaffected either way.
+    SetPhpExtensions { id: ProjectId, service: String, extensions: Vec<String> },
     /// Publish the running app through Sail's expose tunnel (`sail share`,
     /// same image, flags and `.env` knobs). Long-running: the operation
     /// stays live while the tunnel is up, cancelling it stops the share.

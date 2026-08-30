@@ -576,6 +576,53 @@ function editRuntimeFile(file: string) {
   void store.run({ type: "openProjectFile", id: project.id, file });
 }
 
+// --- Extensions Sail can install for us (build.args.PHP_EXTENSIONS). Only
+// the ones WE pin are editable here; the runtime's base set is not ours to
+// remove, which is why this list starts from `managed` and not `extensions`.
+const managedExts = ref<string[]>([]);
+const newExt = ref("");
+const extAddError = ref<string | null>(null);
+// The same alphabet the engine enforces. Checked here too so a typo is a
+// message under the field rather than a failed operation.
+const EXT_NAME = /^[a-z0-9][a-z0-9.+-]*$/;
+watch(phpRt, (report) => {
+  managedExts.value = [...(report?.managed ?? [])];
+  newExt.value = "";
+  extAddError.value = null;
+});
+const extsDirty = computed(
+  () => managedExts.value.join(" ") !== (phpRt.value?.managed ?? []).join(" "),
+);
+function addExt() {
+  const name = newExt.value.trim().toLowerCase();
+  if (!name) return;
+  if (!EXT_NAME.test(name)) {
+    extAddError.value = `"${name}" is not a package name — lowercase letters, digits, . + - only`;
+    return;
+  }
+  if (managedExts.value.includes(name)) {
+    extAddError.value = `${name} is already in the list`;
+    return;
+  }
+  managedExts.value.push(name);
+  newExt.value = "";
+  extAddError.value = null;
+}
+function removeExt(name: string) {
+  managedExts.value = managedExts.value.filter((e) => e !== name);
+  extAddError.value = null;
+}
+async function applyExtensions() {
+  if (!project.php) return;
+  extOpen.value = false;
+  await store.run({
+    type: "setPhpExtensions",
+    id: project.id,
+    service: project.php.service,
+    extensions: [...managedExts.value],
+  });
+}
+
 // Two-step clear for the app log: first click arms, second truncates —
 // destructive enough for a pause, not enough for a whole modal.
 const appLogClearArmed = ref(false);
@@ -1468,6 +1515,59 @@ async function clearAppLog() {
             {{ ext }}
           </span>
         </div>
+        <p class="mt-4 text-xs font-medium text-slate-600 dark:text-slate-300">Install</p>
+        <p v-if="!phpRt.canManage" class="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
+          {{ phpRt.manageBlocked ?? "This project cannot install extensions from here." }}
+        </p>
+        <template v-else>
+          <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            Added to the runtime image as
+            <span class="font-mono">php{{ project.php?.current }}-&lt;name&gt;</span> and installed
+            on the next rebuild. The runtime's own extensions above stay either way.
+          </p>
+          <div v-if="managedExts.length > 0" class="mt-2 flex flex-wrap gap-1.5">
+            <span
+              v-for="ext in managedExts"
+              :key="ext"
+              class="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+            >
+              {{ ext }}
+              <button
+                type="button"
+                class="text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
+                :disabled="locked"
+                :aria-label="`Remove ${ext}`"
+                @click="removeExt(ext)"
+              >
+                <X class="h-3 w-3" />
+              </button>
+            </span>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <Input
+              v-model="newExt"
+              placeholder="redis"
+              class="max-w-[14rem] font-mono text-xs"
+              :disabled="locked"
+              @keydown.enter.prevent="addExt"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              :disabled="locked || !newExt.trim()"
+              @click="addExt"
+            >
+              Add
+            </Button>
+            <Button v-if="extsDirty" size="sm" :disabled="locked" @click="applyExtensions">
+              <RotateCw class="h-3.5 w-3.5" /> Rebuild with these
+            </Button>
+          </div>
+          <p v-if="extAddError" class="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
+            {{ extAddError }}
+          </p>
+        </template>
+
         <div class="mt-4 flex flex-wrap items-center gap-2">
           <Button
             v-if="phpRt.iniFile"

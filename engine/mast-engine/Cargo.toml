@@ -18,8 +18,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 libc = "0.2.189"
 mast-diagnostics = { workspace = true }
-mast-laravel = { version = "0.5.0", path = "../mast-laravel" }
-mast-yaml-edit = { version = "0.5.0", path = "../mast-yaml-edit" }
+mast-laravel = { version = "0.6.0", path = "../mast-laravel" }
+mast-yaml-edit = { version = "0.6.0", path = "../mast-yaml-edit" }
 serde_json.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true

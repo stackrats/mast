@@ -5,7 +5,13 @@
 // derived here from one sample, so there is no second source of truth to keep
 // in step — and the rollups stay unit-testable without a running engine.
 
-import type { ProjectId, ServiceUsage, UsageSample, WorkspaceSummary } from "../bindings";
+import type {
+  ProjectId,
+  ProjectSummary,
+  ServiceUsage,
+  UsageSample,
+  WorkspaceSummary,
+} from "../bindings";
 
 /** A rolled-up total for a project, a workspace, or everything. */
 export interface UsageTotal {
@@ -147,4 +153,111 @@ export function rankServices(
           : b.cpuCores - a.cpuCores || b.memoryBytes - a.memoryBytes;
     return by * sign;
   });
+}
+
+// --- The fleet: every project at once, and which of them are costing you
+// something for nothing. ---
+
+/**
+ * Below this many cores a project is doing nothing you asked for.
+ *
+ * Calibrated against real readings, not a guess: a five-container Sail
+ * stack sitting with nobody using it measured 0.08–0.2 cores across several
+ * samples, so the original 0.05 was below the idle floor and the verdict
+ * could never fire. 0.25 clears that floor with headroom while staying far
+ * under anything serving requests.
+ *
+ * Erring high is the safer direction here. Too low and the feature is dead;
+ * too high and a lightly-busy project gets a badge and joins a bulk action
+ * the user still has to click, having been told the count and the window —
+ * and stopping a project loses nothing but the containers.
+ */
+export const QUIET_CORES = 0.25;
+
+/**
+ * How many consecutive samples must agree. At the engine's 2s cadence 30
+ * samples is a minute — long enough that a request lull is not mistaken for
+ * a project nobody is using.
+ */
+export const QUIET_SAMPLES = 30;
+
+/** One project's line in the fleet table. */
+export interface FleetRow {
+  project: ProjectSummary;
+  cpuCores: number;
+  memoryBytes: number;
+  /** Services currently up — the containers this project is costing you. */
+  containers: number;
+  /** Running, and under [`QUIET_CORES`] for every retained sample. */
+  quiet: boolean;
+  /** Seconds the quiet verdict is based on; 0 when it is not quiet. */
+  quietFor: number;
+}
+
+/**
+ * Projects that have stayed under the threshold across the whole retained
+ * window.
+ *
+ * Judged on EVERY sample rather than an average: a project that spiked once
+ * and settled is still being used, and averaging would hide that. Requires
+ * a full window of evidence, so a project cannot be called quiet moments
+ * after the app opens.
+ */
+export function quietProjects(
+  samples: UsageSample[],
+  cores = QUIET_CORES,
+  minSamples = QUIET_SAMPLES,
+): Set<ProjectId> {
+  const recent = samples.slice(-minSamples);
+  if (recent.length < minSamples) return new Set();
+  const seen = new Map<ProjectId, boolean>();
+  for (const sample of recent) {
+    const perProject = new Map<ProjectId, number>();
+    for (const s of sample.services) {
+      perProject.set(s.project, (perProject.get(s.project) ?? 0) + s.cpuCores);
+    }
+    for (const [project, total] of perProject) {
+      seen.set(project, (seen.get(project) ?? true) && total <= cores);
+    }
+  }
+  return new Set([...seen].filter(([, quiet]) => quiet).map(([project]) => project));
+}
+
+/**
+ * The fleet table's rows. Running projects first — they are the ones with a
+ * cost to answer for — then by CPU, so the row you would stop is at the top
+ * of the half you would stop from.
+ */
+export function fleetRows(
+  projects: ProjectSummary[],
+  samples: UsageSample[],
+  intervalMs = 2000,
+): FleetRow[] {
+  const latest = samples.at(-1) ?? null;
+  const quiet = quietProjects(samples);
+  const window = Math.round((Math.min(samples.length, QUIET_SAMPLES) * intervalMs) / 1000);
+  return projects
+    .map((project) => {
+      const total = rollupByProject(latest, project.id);
+      const running = project.status === "running";
+      const isQuiet = running && quiet.has(project.id);
+      return {
+        project,
+        cpuCores: total.cpuCores,
+        memoryBytes: total.memoryBytes,
+        containers: project.services.filter((s) => s.state === "running").length,
+        quiet: isQuiet,
+        quietFor: isQuiet ? window : 0,
+      };
+    })
+    .sort((a, b) => {
+      const aUp = a.project.status === "running" ? 0 : 1;
+      const bUp = b.project.status === "running" ? 0 : 1;
+      return (
+        aUp - bUp ||
+        b.cpuCores - a.cpuCores ||
+        b.memoryBytes - a.memoryBytes ||
+        a.project.name.localeCompare(b.project.name)
+      );
+    });
 }

@@ -546,6 +546,13 @@ impl Engine {
             Action::SetNodeVersion { id, service, major } => {
                 return self.dispatch_node_switch(id.clone(), service.clone(), major.clone());
             }
+            Action::SetPhpExtensions { id, service, extensions } => {
+                return self.dispatch_php_extensions(
+                    id.clone(),
+                    service.clone(),
+                    extensions.clone(),
+                );
+            }
             Action::ShareProject { id } => {
                 return self.dispatch_share(id.clone());
             }
@@ -1231,6 +1238,7 @@ impl Engine {
             | Action::RebuildService { .. }
             | Action::SetPhpVersion { .. }
             | Action::SetNodeVersion { .. }
+            | Action::SetPhpExtensions { .. }
             | Action::ShareProject { .. }
             | Action::SetLocalDomain { .. } => unreachable!("handled above"),
         }

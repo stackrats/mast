@@ -39,6 +39,62 @@ fn base_compose_source(dir: &Path) -> Option<String> {
         .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())
 }
 
+/// What [`mast_contract::Action::SetPhpExtensions`] can do for this project:
+/// the list currently pinned, whether the pin is usable at all, and why not
+/// when it is not.
+///
+/// Two things can block it, and they fail differently. A `build:` in the
+/// short string form carries no args at all. A runtime published before
+/// Sail added the arg (laravel/sail#879) would *accept* the edit and then
+/// quietly install nothing, which is the worse of the two — Docker only
+/// warns about an undeclared build arg — so the Dockerfile is read rather
+/// than assumed.
+pub(crate) fn extension_support(dir: &Path, service: &str) -> (Vec<String>, bool, Option<String>) {
+    let blocked = |why: &str| (Vec::new(), false, Some(why.to_string()));
+    let Some(source) = base_compose_source(dir) else {
+        return blocked("no compose file to edit");
+    };
+    let Some(build) =
+        mast_compose::sail::sail_builds(&source).into_iter().find(|b| b.service == service)
+    else {
+        return blocked(&format!("service {service} does not build an image"));
+    };
+    let managed: Vec<String> = build
+        .php_extensions_arg
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if !build.build_is_mapping {
+        return (
+            managed,
+            false,
+            Some(format!(
+                "{service} uses the short `build: <path>` form, which carries no build args"
+            )),
+        );
+    }
+    let Some(context) = build.context.as_deref() else {
+        return (managed, false, Some(format!("{service} has no build context")));
+    };
+    let dockerfile = dir.join(context.trim_start_matches("./")).join("Dockerfile");
+    match std::fs::read_to_string(&dockerfile) {
+        Ok(text) if mast_compose::sail::runtime_supports_php_extensions(&text) => {
+            (managed, true, None)
+        }
+        Ok(_) => (
+            managed,
+            false,
+            Some(format!(
+                "the vendored runtime at {context} predates Sail's PHP_EXTENSIONS support \
+                 (laravel/sail#879) — re-publish the runtimes to install extensions this way"
+            )),
+        ),
+        Err(_) => (managed, false, Some(format!("no Dockerfile at {context}"))),
+    }
+}
+
 /// PHP series present under `vendor/laravel/sail/runtimes/`.
 pub(crate) fn available_runtimes(dir: &Path) -> Vec<String> {
     let mut series: Vec<String> = std::fs::read_dir(dir.join("vendor/laravel/sail/runtimes"))
@@ -375,6 +431,201 @@ impl Engine {
             });
         }
         out(format!("verified: {service} runs {label}"));
+        Ok(())
+    }
+
+    /// `Action::SetPhpExtensions`: pin `build.args.PHP_EXTENSIONS`, then the
+    /// same verified rebuild the runtime switches use.
+    pub(crate) fn dispatch_php_extensions(
+        &self,
+        project: ProjectId,
+        service: String,
+        extensions: Vec<String>,
+    ) -> Result<OperationId, ErrorInfo> {
+        let (invocation, file) = self.catalog_context(&project)?;
+        let (path, redactor, running) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            (
+                entry.record.path.clone(),
+                entry.redactor.clone(),
+                entry.summary.status != mast_contract::ProjectStatus::Stopped,
+            )
+        };
+        // Refuse before the lock, as the runtime switches do: a name that is
+        // not a package name, or a runtime that cannot take the arg at all.
+        // The second is the important one — the edit would otherwise apply,
+        // rebuild for minutes and install nothing.
+        let source = std::fs::read_to_string(&file).map_err(internal_err)?;
+        mast_compose::sail::plan_set_php_extensions(&source, &service, &extensions)
+            .map_err(|message| ErrorInfo::InvalidInput { message })?;
+        if let (_, false, Some(why)) = extension_support(&path, &service) {
+            return Err(ErrorInfo::InvalidInput { message: why });
+        }
+
+        self.inner.crash_notices.lock().unwrap().remove(&project.0);
+        {
+            let mut busy = self.inner.busy_projects.lock().unwrap();
+            if !busy.insert(project.0.clone()) {
+                return Err(ErrorInfo::Conflict {
+                    message: format!("an operation is already running on {}", project.0),
+                });
+            }
+        }
+
+        let (id, handle) = self.new_operation();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _ = engine.inner.deps.store.journal_push(mast_project::OperationJournalEntry {
+                operation: id.0,
+                project_id: project.0.clone(),
+                verb: "set PHP extensions".to_string(),
+                started_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            });
+            engine.emit_op(&handle, id, OperationEventKind::Started);
+            let result = engine
+                .php_extensions_work(
+                    &handle,
+                    id,
+                    &invocation,
+                    &file,
+                    &path,
+                    &service,
+                    &extensions,
+                    running,
+                    &redactor,
+                )
+                .await;
+            let kind = match result {
+                Ok(()) => OperationEventKind::Completed,
+                Err(_) if handle.cancel.is_cancelled() => OperationEventKind::Cancelled,
+                Err(e) => {
+                    engine.flush_signature_explanations(&handle, id, Some(&project));
+                    OperationEventKind::Failed { error: redactor.redact(&e.to_string()) }
+                }
+            };
+            let _ = engine.inner.deps.store.journal_remove(id.0);
+            engine.inner.busy_projects.lock().unwrap().remove(&project.0);
+            engine.emit_op(&handle, id, kind);
+            engine.hint();
+        });
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn php_extensions_work(
+        &self,
+        handle: &Arc<crate::OpHandle>,
+        op: OperationId,
+        invocation: &mast_compose::ComposeInvocation,
+        file: &Path,
+        project_dir: &Path,
+        service: &str,
+        extensions: &[String],
+        running: bool,
+        redactor: &crate::Redactor,
+    ) -> Result<(), ErrorInfo> {
+        let out = |line: String| {
+            self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+        };
+        let source = tokio::task::spawn_blocking({
+            let file = file.to_path_buf();
+            move || std::fs::read_to_string(file)
+        })
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+
+        let (edits, summary) =
+            mast_compose::sail::plan_set_php_extensions(&source, service, extensions)
+                .map_err(|message| ErrorInfo::InvalidInput { message })?;
+        let already = mast_compose::sail::sail_builds(&source)
+            .into_iter()
+            .find(|b| b.service == service)
+            .map(|b| {
+                b.php_extensions_arg
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if already == extensions {
+            out(format!(
+                "{service} already pins {} — nothing to do",
+                if extensions.is_empty() {
+                    "no extensions".to_string()
+                } else {
+                    extensions.join(" ")
+                }
+            ));
+            return Ok(());
+        }
+
+        self.write_compose(invocation, file, &edits, summary.clone()).await?;
+        for line in summary {
+            out(line);
+        }
+        // The rebuild is verified on PHP itself rather than on the extension
+        // list: a package name is not a module name (php8.4-mysql answers to
+        // `mysqli` and `pdo_mysql`), so `php -m` is reported below instead of
+        // being made the pass/fail gate.
+        self.rebuild_runtime_and_verify(
+            handle,
+            op,
+            invocation,
+            project_dir,
+            service,
+            running,
+            redactor,
+            &["php".into(), "-v".into()],
+            "PHP ",
+            "the rebuilt runtime",
+        )
+        .await?;
+
+        if !running || extensions.is_empty() {
+            return Ok(());
+        }
+        let argv = crate::project_ops::compose_exec_argv(
+            invocation,
+            service,
+            &["php".to_string(), "-m".to_string()],
+        );
+        let Some(modules) = mast_docker::run_command(
+            &argv,
+            Some(&invocation.project_dir),
+            &[],
+            Duration::from_secs(30),
+            crate::diagnostics::PROBE_CAP,
+        )
+        .await
+        .ok()
+        .filter(|o| o.success())
+        .map(|o| o.stdout.to_ascii_lowercase())
+        else {
+            out("could not read `php -m` to confirm the extension list".into());
+            return Ok(());
+        };
+        let missing: Vec<&String> =
+            extensions.iter().filter(|e| !modules.contains(e.as_str())).collect();
+        if missing.is_empty() {
+            out(format!("verified: {} loaded in {service}", extensions.join(", ")));
+        } else {
+            out(format!(
+                "`php -m` does not name {} — a package can expose a differently named module \
+                 (the mysql package provides mysqli and pdo_mysql), or it may not exist for \
+                 this PHP series",
+                missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
         Ok(())
     }
 
