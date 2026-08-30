@@ -159,20 +159,28 @@ export function rankServices(
 // something for nothing. ---
 
 /**
- * Below this many cores a project is doing nothing you asked for.
+ * Below this many cores PER RUNNING CONTAINER a project is doing nothing you
+ * asked for.
  *
- * Calibrated against real readings, not a guess: a five-container Sail
- * stack sitting with nobody using it measured 0.08–0.2 cores across several
- * samples, so the original 0.05 was below the idle floor and the verdict
- * could never fire. 0.25 clears that floor with headroom while staying far
- * under anything serving requests.
+ * Per container, not per project, because that is the only shape that can be
+ * right for both. Idle cost scales with how much is running: a five-service
+ * Sail stack idles around five times what a single container does, so one
+ * flat per-project number is simultaneously too tight for the big project
+ * and too loose for the small one — it would call a two-container project
+ * quiet while it was serving, and never clear the bar for a ten-container
+ * one. Dividing by the container count removes the project-size variable
+ * entirely, which is what makes the remaining constant meaningful.
  *
- * Erring high is the safer direction here. Too low and the feature is dead;
- * too high and a lightly-busy project gets a badge and joins a bulk action
- * the user still has to click, having been told the count and the window —
- * and stopping a project loses nothing but the containers.
+ * The value is the idle cost of one Sail container with margin. Observed on
+ * a real five-container fleet with nobody using it: 0.08–0.2 cores total,
+ * i.e. 0.016–0.04 each. 0.06 sits at 1.5x the highest of those, and still
+ * far below anything serving a request.
+ *
+ * This is a property of an idle container rather than of a machine or a
+ * project, so unlike a per-project figure it is measurable once and holds
+ * everywhere.
  */
-export const QUIET_CORES = 0.25;
+export const QUIET_CORES_PER_CONTAINER = 0.06;
 
 /**
  * How many consecutive samples must agree. At the engine's 2s cadence 30
@@ -188,7 +196,7 @@ export interface FleetRow {
   memoryBytes: number;
   /** Services currently up — the containers this project is costing you. */
   containers: number;
-  /** Running, and under [`QUIET_CORES`] for every retained sample. */
+  /** Running, and within its per-container allowance for every sample. */
   quiet: boolean;
   /** Seconds the quiet verdict is based on; 0 when it is not quiet. */
   quietFor: number;
@@ -205,19 +213,25 @@ export interface FleetRow {
  */
 export function quietProjects(
   samples: UsageSample[],
-  cores = QUIET_CORES,
+  perContainer = QUIET_CORES_PER_CONTAINER,
   minSamples = QUIET_SAMPLES,
 ): Set<ProjectId> {
   const recent = samples.slice(-minSamples);
   if (recent.length < minSamples) return new Set();
   const seen = new Map<ProjectId, boolean>();
   for (const sample of recent) {
-    const perProject = new Map<ProjectId, number>();
+    // Counted per sample, not once: the allowance has to follow a project
+    // that gained or lost a container midway through the window.
+    const totals = new Map<ProjectId, { cores: number; containers: number }>();
     for (const s of sample.services) {
-      perProject.set(s.project, (perProject.get(s.project) ?? 0) + s.cpuCores);
+      const t = totals.get(s.project) ?? { cores: 0, containers: 0 };
+      t.cores += s.cpuCores;
+      t.containers += 1;
+      totals.set(s.project, t);
     }
-    for (const [project, total] of perProject) {
-      seen.set(project, (seen.get(project) ?? true) && total <= cores);
+    for (const [project, { cores, containers }] of totals) {
+      const allowed = perContainer * containers;
+      seen.set(project, (seen.get(project) ?? true) && cores <= allowed);
     }
   }
   return new Set([...seen].filter(([, quiet]) => quiet).map(([project]) => project));
