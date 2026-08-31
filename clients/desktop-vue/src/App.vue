@@ -21,7 +21,9 @@ import UsageReadout from "./components/UsageReadout.vue";
 import Button from "./components/ui/Button.vue";
 import { TooltipProvider } from "reka-ui";
 
+import { parseDeepLink } from "./lib/deeplink";
 import { applyTheme, loadTheme } from "./lib/prefs";
+import { onDeepLink, takeDeepLinks } from "./lib/transport";
 import { useEngineStore } from "./stores/engine";
 
 const store = useEngineStore();
@@ -35,6 +37,42 @@ function openDiagnostics(scope: ProjectSummary | null = null) {
   diagnosticsOpen.value = true;
 }
 const newProjectOpen = ref(false);
+/** A mast://clone link's URL, waiting to prefill the add-project dialog. */
+const clonePrefill = ref<string | null>(null);
+// Consumed with the dialog: closing it (submitted or not) spends the link.
+watch(newProjectOpen, (open) => {
+  if (!open) clonePrefill.value = null;
+});
+
+// mast:// links may only navigate or prefill, never act (see lib/deeplink).
+function applyDeepLink(raw: string) {
+  const link = parseDeepLink(raw);
+  if (!link) {
+    store.pushActivity(`⚠ ignored an unrecognized link: ${raw}`, true);
+    return;
+  }
+  if (link.kind === "clone") {
+    clonePrefill.value = link.url;
+    newProjectOpen.value = true;
+    return;
+  }
+  void selectProjectSoon(link.ref);
+}
+
+/** A launch-time link races the first snapshot, so give the project list a
+ * few seconds to exist before declaring the target unknown. */
+async function selectProjectSoon(ref: string) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const match = store.projects.find((p) => p.name === ref || p.path.endsWith(ref));
+    if (match) {
+      store.selection = { kind: "project", id: match.id };
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  store.pushActivity(`⚠ no project matches the link "${ref}"`, true);
+}
 const aboutOpen = ref(false);
 const paletteOpen = ref(false);
 
@@ -97,6 +135,11 @@ onMounted(() => {
   void store.connect();
   document.addEventListener("visibilitychange", syncUsageToVisibility);
   window.addEventListener("keydown", onKeydown);
+  // Live links first, then the parked launch-time ones — that order is what
+  // keeps a link from falling between the two.
+  void onDeepLink(applyDeepLink).then(async () => {
+    for (const url of await takeDeepLinks()) applyDeepLink(url);
+  });
 });
 
 onBeforeUnmount(() => {
@@ -189,7 +232,7 @@ function editWorkspace(ws: WorkspaceSummary) {
 
       <SettingsDialog v-model:open="settingsOpen" />
       <DiagnosticsDialog v-model:open="diagnosticsOpen" :scope="diagnosticsScope" />
-      <NewProjectDialog v-model:open="newProjectOpen" />
+      <NewProjectDialog v-model:open="newProjectOpen" :clone-url="clonePrefill" />
       <WorkspaceDialog v-model:open="workspaceDialogOpen" :editing="editingWorkspace" />
       <AboutDialog v-model:open="aboutOpen" />
       <LogsDialog />

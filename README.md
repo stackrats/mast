@@ -399,6 +399,16 @@ You don't need a local PHP installation just to create the project that will ult
 
 The same dialog takes a git URL. Mast clones it, then bootstraps exactly what a fresh clone is missing — containerized `composer install`, `.env` from `.env.example`, an app key — and imports it, committed `mast.yml` commands included. Whatever's still missing (Sail itself, node modules) shows up in Diagnostics with a one-click fix. URLs with embedded credentials are refused: effect history records every command verbatim, and a token must never land there.
 
+### Link straight into it
+
+Put an **Open in Mast** link in your repo's README and onboarding becomes one click:
+
+```
+mast://clone?url=git%40github.com%3Aacme%2Fshop.git
+```
+
+opens the dialog prefilled (`mast://project/<name>` jumps to an existing project). Links can only navigate or prefill — never clone, start, or stop anything by themselves — because any webpage can fire a registered URL scheme, and a link that acted on its own would be remote control of your machine. You still click the button.
+
 ---
 
 # CLI

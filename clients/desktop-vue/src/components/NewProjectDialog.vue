@@ -12,6 +12,9 @@ import Select from "./ui/Select.vue";
 import Tooltip from "./ui/Tooltip.vue";
 
 const open = defineModel<boolean>("open", { default: false });
+/** A mast://clone link's repository URL — opening with one lands in From
+ * Git mode, prefilled but untouched: the person still reviews and clicks. */
+const { cloneUrl = null } = defineProps<{ cloneUrl?: string | null }>();
 const store = useEngineStore();
 
 // Two ways in, one dialog: scaffold something new, or clone what the team
@@ -77,6 +80,14 @@ function nameFromUrl(url: string): string {
 
 watch(gitUrl, (url) => {
   if (!namedManually.value) name.value = nameFromUrl(url);
+});
+
+watch(open, (now) => {
+  if (now && cloneUrl) {
+    mode.value = "clone";
+    namedManually.value = false;
+    gitUrl.value = cloneUrl; // the name follows via the watch above
+  }
 });
 
 /** Fill the parent from a native picker; the watched-directory chips stay as shortcuts. */
@@ -148,8 +159,11 @@ function submit() {
         <Input v-model="gitUrl" placeholder="git@github.com:acme/shop.git" mono class="mt-1" />
       </label>
 
-      <div class="grid grid-cols-2 gap-2">
-        <label class="text-xs text-slate-600 dark:text-slate-300">
+      <!-- Create mode pairs the name with a narrow PHP picker; clone mode
+           has no second column, so the name goes full width like every
+           other field — a half-width input beside nothing reads as broken. -->
+      <div :class="mode === 'create' ? 'grid grid-cols-[1fr_7rem] gap-2' : ''">
+        <label class="block text-xs text-slate-600 dark:text-slate-300">
           Project name
           <Input v-model="name" placeholder="my-app" class="mt-1" @input="namedManually = true" />
           <span v-if="name && !nameValid" class="text-red-600">
