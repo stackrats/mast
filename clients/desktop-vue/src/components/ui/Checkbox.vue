@@ -2,15 +2,22 @@
 import { Check } from "lucide-vue-next";
 
 const model = defineModel<boolean>({ default: false });
-defineProps<{ disabled?: boolean; label?: string }>();
+const { block = false } = defineProps<{
+  disabled?: boolean;
+  label?: string;
+  /** Fill the line rather than hugging the text, so the whole width of a
+   * list row toggles — a box drawn around a row promises that, and a
+   * promise the empty space to the right does not keep reads as broken. */
+  block?: boolean;
+}>();
 </script>
 
 <template>
   <!-- align-top + an always-rendered check (opacity toggle): the box's
        baseline must not change on tick, or the whole label nudges. -->
   <label
-    class="inline-flex cursor-pointer items-start gap-2 align-top text-xs leading-4 text-slate-600 select-none dark:text-slate-300"
-    :class="{ 'cursor-not-allowed opacity-50': disabled }"
+    class="cursor-pointer items-start gap-2 align-top text-xs leading-4 text-slate-600 select-none dark:text-slate-300"
+    :class="[block ? 'flex w-full' : 'inline-flex', { 'cursor-not-allowed opacity-50': disabled }]"
   >
     <input v-model="model" type="checkbox" class="peer sr-only" :disabled="disabled" />
     <span
