@@ -100,6 +100,170 @@ function toggleCollapsed(key: string) {
 function isCollapsed(key: string): boolean {
   return !needle.value && collapsed.value[key] === true;
 }
+
+// --- drag & drop: reorder both lists, and move projects in and out of
+// workspaces. Every drop ends in a persisted action; nothing is
+// session-only. Disabled while the filter narrows the view — reordering a
+// list you can only see part of writes an order you never saw.
+type DragPayload =
+  | { kind: "project"; id: string }
+  | { kind: "workspace"; id: string }
+  | { kind: "member"; id: string; ws: string };
+const drag = ref<DragPayload | null>(null);
+const dropHint = ref<{ key: string; edge: "before" | "after" | "into" } | null>(null);
+const canDrag = computed(() => !needle.value && !store.readOnly);
+
+function startRowDrag(payload: DragPayload, event: DragEvent) {
+  drag.value = payload;
+  // Firefox refuses to start a drag with an empty data store.
+  event.dataTransfer?.setData("text/plain", payload.id);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+}
+function endRowDrag() {
+  drag.value = null;
+  dropHint.value = null;
+}
+function hintIs(key: string, edge: "before" | "after" | "into"): boolean {
+  return dropHint.value?.key === key && dropHint.value.edge === edge;
+}
+function edgeOf(event: DragEvent): "before" | "after" {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+}
+/** The dragged id moved next to the target, everything else untouched. */
+function reorderedIds(
+  list: string[],
+  dragged: string,
+  target: string,
+  edge: "before" | "after",
+): string[] {
+  const without = list.filter((id) => id !== dragged);
+  const at = without.indexOf(target) + (edge === "after" ? 1 : 0);
+  return [...without.slice(0, at), dragged, ...without.slice(at)];
+}
+
+function overProject(id: string, event: DragEvent) {
+  if (drag.value?.kind !== "project" || drag.value.id === id) return;
+  event.preventDefault();
+  dropHint.value = { key: `p:${id}`, edge: edgeOf(event) };
+}
+function dropOnProject(id: string) {
+  const dragged = drag.value;
+  const hint = dropHint.value;
+  endRowDrag();
+  if (dragged?.kind !== "project" || !hint || hint.edge === "into") return;
+  void store.reorderProjects(
+    reorderedIds(
+      store.projects.map((p) => p.id),
+      dragged.id,
+      id,
+      hint.edge,
+    ),
+  );
+}
+
+function overWorkspace(ws: WorkspaceSummary, event: DragEvent) {
+  const dragged = drag.value;
+  if (!dragged) return;
+  if (dragged.kind === "workspace") {
+    if (dragged.id === ws.id) return;
+    event.preventDefault();
+    dropHint.value = { key: `ws:${ws.id}`, edge: edgeOf(event) };
+    return;
+  }
+  // A project (or another workspace's member) dropped ON a workspace joins it.
+  const from = dragged.kind === "member" ? dragged.ws : null;
+  if (from === ws.id) return;
+  if (ws.members.some((m) => m.project === dragged.id)) return;
+  event.preventDefault();
+  dropHint.value = { key: `ws:${ws.id}`, edge: "into" };
+}
+function dropOnWorkspace(ws: WorkspaceSummary) {
+  const dragged = drag.value;
+  const hint = dropHint.value;
+  endRowDrag();
+  if (!dragged || !hint) return;
+  if (dragged.kind === "workspace" && hint.edge !== "into") {
+    void store.reorderWorkspaces(
+      reorderedIds(
+        store.workspaces.map((w) => w.id),
+        dragged.id,
+        ws.id,
+        hint.edge,
+      ),
+    );
+    return;
+  }
+  if (hint.edge === "into") {
+    saveMembers(ws, [...ws.members, { project: dragged.id, dependsOn: [] }]);
+    if (dragged.kind === "member") removeMember(dragged.ws, dragged.id);
+  }
+}
+
+function overMember(ws: WorkspaceSummary, id: string, event: DragEvent) {
+  const dragged = drag.value;
+  if (dragged?.kind !== "member" || dragged.ws !== ws.id || dragged.id === id) return;
+  event.preventDefault();
+  dropHint.value = { key: `m:${ws.id}:${id}`, edge: edgeOf(event) };
+}
+function dropOnMember(ws: WorkspaceSummary, id: string) {
+  const dragged = drag.value;
+  const hint = dropHint.value;
+  endRowDrag();
+  if (dragged?.kind !== "member" || dragged.ws !== ws.id || !hint || hint.edge === "into") return;
+  const order = reorderedIds(
+    ws.members.map((m) => m.project),
+    dragged.id,
+    id,
+    hint.edge,
+  );
+  saveMembers(
+    ws,
+    order.flatMap((project) => ws.members.filter((m) => m.project === project)),
+  );
+}
+
+/** Dropping a member onto the Projects section takes it out of its
+ * workspace — the project itself always stays in the flat list. */
+function overProjectsSection(event: DragEvent) {
+  if (drag.value?.kind !== "member") return;
+  event.preventDefault();
+  dropHint.value = { key: "section:projects", edge: "into" };
+}
+function dropOnProjectsSection() {
+  const dragged = drag.value;
+  endRowDrag();
+  if (dragged?.kind !== "member") return;
+  removeMember(dragged.ws, dragged.id);
+}
+
+function saveMembers(ws: WorkspaceSummary, members: WorkspaceSummary["members"]) {
+  void store.run({ type: "saveWorkspace", id: ws.id, name: ws.name, members });
+}
+function removeMember(wsId: string, projectId: string) {
+  const ws = store.workspaces.find((w) => w.id === wsId);
+  if (!ws) return;
+  if (ws.members.length <= 1) {
+    store.pushActivity(
+      "⚠ a workspace needs at least one member — edit the workspace to delete it instead",
+      true,
+    );
+    return;
+  }
+  // Anything that depended on the leaver stops naming it, or the graph
+  // check would refuse the save.
+  saveMembers(
+    ws,
+    ws.members
+      .filter((m) => m.project !== projectId)
+      .map((m) => ({ ...m, dependsOn: m.dependsOn.filter((d) => d !== projectId) })),
+  );
+}
+
+/** The insertion line between rows while a reorder drag hovers. */
+const dropLineClass = "mx-2 h-0.5 rounded bg-slate-400 dark:bg-slate-500";
+/** The ring around a workspace row while a join drag hovers. */
+const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-dashed";
 </script>
 
 <template>
@@ -161,9 +325,17 @@ function isCollapsed(key: string): boolean {
         </Tooltip>
         <SidebarMenu v-if="!isCollapsed('group:workspaces')">
           <SidebarMenuItem v-for="ws in visibleWorkspaces" :key="ws.id">
+            <div v-if="hintIs(`ws:${ws.id}`, 'before')" :class="dropLineClass" />
             <WorkspaceContextMenu :workspace="ws" @edit="emit('editWorkspace', ws)">
               <SidebarMenuButton
                 :is-active="isSelected('workspace', ws.id)"
+                :class="hintIs(`ws:${ws.id}`, 'into') ? dropIntoClass : ''"
+                :draggable="canDrag"
+                @dragstart="startRowDrag({ kind: 'workspace', id: ws.id }, $event)"
+                @dragend="endRowDrag"
+                @dragover="overWorkspace(ws, $event)"
+                @dragleave="dropHint = null"
+                @drop.prevent="dropOnWorkspace(ws)"
                 @click="store.selection = { kind: 'workspace', id: ws.id }"
               >
                 <Boxes class="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -186,6 +358,7 @@ function isCollapsed(key: string): boolean {
                 </Tooltip>
               </SidebarMenuButton>
             </WorkspaceContextMenu>
+            <div v-if="hintIs(`ws:${ws.id}`, 'after')" :class="dropLineClass" />
             <!-- Edit moved into the right-click menu; the one action slot
                  folds the member list instead. -->
             <Tooltip :text="isCollapsed(`ws:${ws.id}`) ? 'Show projects' : 'Hide projects'">
@@ -199,9 +372,21 @@ function isCollapsed(key: string): boolean {
 
             <SidebarMenuSub v-if="!isCollapsed(`ws:${ws.id}`)">
               <SidebarMenuItem v-for="member in ws.members" :key="member.project">
+                <div
+                  v-if="hintIs(`m:${ws.id}:${member.project}`, 'before')"
+                  :class="dropLineClass"
+                />
                 <ProjectContextMenu :project="member.project">
                   <SidebarMenuButton
                     :is-active="isSelected('project', member.project)"
+                    :draggable="canDrag"
+                    @dragstart="
+                      startRowDrag({ kind: 'member', id: member.project, ws: ws.id }, $event)
+                    "
+                    @dragend="endRowDrag"
+                    @dragover="overMember(ws, member.project, $event)"
+                    @dragleave="dropHint = null"
+                    @drop.prevent="dropOnMember(ws, member.project)"
                     @click="store.selection = { kind: 'project', id: member.project }"
                   >
                     <Loader2
@@ -225,17 +410,27 @@ function isCollapsed(key: string): boolean {
                     </Tooltip>
                   </SidebarMenuButton>
                 </ProjectContextMenu>
+                <div
+                  v-if="hintIs(`m:${ws.id}:${member.project}`, 'after')"
+                  :class="dropLineClass"
+                />
               </SidebarMenuItem>
             </SidebarMenuSub>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarGroup>
 
-      <!-- Every project, workspace member or not: always individually usable. -->
-      <SidebarGroup v-if="store.projects.length">
+      <!-- Every project, workspace member or not: always individually usable.
+           Also the drop target that takes a member OUT of its workspace. -->
+      <SidebarGroup
+        v-if="store.projects.length"
+        @dragover="overProjectsSection"
+        @drop.prevent="dropOnProjectsSection"
+      >
         <SidebarGroupLabel>
           <button
             class="flex h-6 w-full items-center gap-1 rounded-md px-2 pr-6 text-left hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+            :class="hintIs('section:projects', 'into') ? dropIntoClass : ''"
             @click="toggleCollapsed('group:projects')"
           >
             <ChevronRight
@@ -247,9 +442,16 @@ function isCollapsed(key: string): boolean {
         </SidebarGroupLabel>
         <SidebarMenu v-if="!isCollapsed('group:projects')">
           <SidebarMenuItem v-for="project in visibleProjects" :key="project.id">
+            <div v-if="hintIs(`p:${project.id}`, 'before')" :class="dropLineClass" />
             <ProjectContextMenu :project="project.id">
               <SidebarMenuButton
                 :is-active="isSelected('project', project.id)"
+                :draggable="canDrag"
+                @dragstart="startRowDrag({ kind: 'project', id: project.id }, $event)"
+                @dragend="endRowDrag"
+                @dragover.stop="overProject(project.id, $event)"
+                @dragleave="dropHint = null"
+                @drop.prevent.stop="dropOnProject(project.id)"
                 @click="store.selection = { kind: 'project', id: project.id }"
               >
                 <Folder class="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -272,6 +474,7 @@ function isCollapsed(key: string): boolean {
                 </Tooltip>
               </SidebarMenuButton>
             </ProjectContextMenu>
+            <div v-if="hintIs(`p:${project.id}`, 'after')" :class="dropLineClass" />
           </SidebarMenuItem>
           <p v-if="needle && visibleProjects.length === 0" class="px-2 py-1 text-xs text-slate-400">
             No project matches "{{ filter.trim() }}".

@@ -3331,3 +3331,62 @@ async fn clone_project_imports_and_bootstraps_env() {
     .expect("an occupied target must refuse");
     assert!(taken.contains("already exists"), "{taken}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dragged_orderings_persist_for_projects_and_workspaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alpha = make_project(tmp.path(), "alpha");
+    let beta = make_project(tmp.path(), "beta");
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: alpha.to_string_lossy().into() }).await;
+    run_action(&engine, Action::ImportProject { path: beta.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "both projects listed", |s| s.projects.len() == 2).await;
+    // Every rank 0 → the pre-ordering world stays alphabetical.
+    assert_eq!(
+        snap.projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        ["alpha", "beta"]
+    );
+    let ids: Vec<_> = snap.projects.iter().map(|p| p.id.clone()).collect();
+
+    run_action(
+        &engine,
+        Action::ReorderProjects { ids: vec![ids[1].clone(), ids[0].clone()] },
+    )
+    .await;
+    let snap = engine.snapshot();
+    assert_eq!(
+        snap.projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        ["beta", "alpha"]
+    );
+    // The order is a record fact, not session state.
+    let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
+    let ranks: Vec<(String, u32)> =
+        store.load_projects().unwrap().iter().map(|r| (r.display_name.clone(), r.rank)).collect();
+    assert!(ranks.contains(&("beta".into(), 0)) && ranks.contains(&("alpha".into(), 1)));
+
+    // Workspaces: same drag, stable for anything unnamed.
+    for name in ["one", "two"] {
+        let member = if name == "one" { ids[0].clone() } else { ids[1].clone() };
+        run_action(
+            &engine,
+            Action::SaveWorkspace {
+                id: None,
+                name: name.into(),
+                members: vec![mast_contract::WorkspaceMember {
+                    project: member,
+                    depends_on: Vec::new(),
+                }],
+            },
+        )
+        .await;
+    }
+    let snap = engine.snapshot();
+    let ws_ids: Vec<_> = snap.workspaces.iter().map(|w| w.id.clone()).collect();
+    assert_eq!(snap.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+    run_action(&engine, Action::ReorderWorkspaces { ids: vec![ws_ids[1].clone()] }).await;
+    let snap = engine.snapshot();
+    // Naming only "two" pulls it first; "one" keeps its place after.
+    assert_eq!(snap.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["two", "one"]);
+}
