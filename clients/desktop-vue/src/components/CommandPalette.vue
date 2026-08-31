@@ -11,7 +11,9 @@ import { buildPalette, filterPalette, groupPalette, type PaletteEffect } from ".
 import { useEngineStore } from "../stores/engine";
 
 const open = defineModel<boolean>("open", { required: true });
-const emit = defineEmits<{ dialog: [what: "settings" | "newProject" | "newWorkspace"] }>();
+const emit = defineEmits<{
+  dialog: [what: "settings" | "newProject" | "newWorkspace" | "shortcuts"];
+}>();
 
 const store = useEngineStore();
 const query = ref("");
