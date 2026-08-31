@@ -24,6 +24,20 @@ const emit = defineEmits<{
 }>();
 const store = useEngineStore();
 
+// The wordmark half of the CLI's banner (clients/mast-cli/src/main.rs), so
+// the desktop and the terminal still introduce the app the same way. Only
+// the mark that preceded it is drawn as vectors now — the glyph rows spell
+// letters, but the mark relied on those same rows touching pixel-exactly at
+// 3px, which is a promise no font makes.
+const WORDMARK = [
+  " ███╗   ███╗  █████╗  ███████╗ ████████╗",
+  " ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝",
+  " ██╔████╔██║ ███████║ ███████╗    ██║",
+  " ██║╚██╔╝██║ ██╔══██║ ╚════██║    ██║",
+  " ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║",
+  " ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝",
+].join("\n");
+
 type MenuId = "app" | "workspace" | "view";
 
 const openMenu = ref<MenuId | null>(null);
@@ -98,13 +112,20 @@ async function closeToTray() {
   >
     <!-- The mark as vectors, from the same source the app icons are rendered
          from, so the two finally agree at every size. -->
+    <!-- Both halves are the same six-row grid the CLI banner draws, so they
+         line up by sharing it: `items-start` puts row 0 against row 0, and
+         the mark's height is the grid's height times the fraction its art
+         actually fills (365 of 6×65 units) — center them instead and the
+         mark floats, because its last row is shorter than a full one. -->
     <span
-      class="mr-2 flex shrink-0 items-center gap-1.5 px-1 text-slate-900 select-none dark:text-slate-100"
+      class="mr-2 flex shrink-0 items-start gap-1.5 px-1 text-slate-900 select-none dark:text-slate-100"
       role="img"
       aria-label="Mast"
     >
-      <MastMark class="h-4 w-auto" />
-      <span class="text-[11px] leading-none font-semibold tracking-[0.18em]">MAST</span>
+      <MastMark class="h-[16.85px] w-auto" />
+      <!-- v-text, not interpolation: inside `white-space: pre` the template's
+           own indentation would become part of the art. -->
+      <pre class="font-mono text-[3px] leading-none" v-text="WORDMARK" />
     </span>
 
     <div v-for="menu in MENUS" :key="menu.id" class="relative">
