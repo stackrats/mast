@@ -18,7 +18,7 @@ export type PaletteEffect =
   /** Fire-and-forget engine action with no operation of its own. */
   | { kind: "run"; action: Action }
   /** Open one of the app's own dialogs. */
-  | { kind: "dialog"; what: "settings" | "newProject" | "newWorkspace" };
+  | { kind: "dialog"; what: "settings" | "newProject" | "newWorkspace" | "shortcuts" };
 
 export interface PaletteItem {
   id: string;
@@ -200,6 +200,13 @@ export function buildPalette(
       group: "App",
       keywords: "create group",
       effect: { kind: "dialog", what: "newWorkspace" },
+    },
+    {
+      id: "app:shortcuts",
+      title: "Keyboard shortcuts",
+      group: "App",
+      keywords: "keys hotkeys bindings help",
+      effect: { kind: "dialog", what: "shortcuts" },
     },
   );
 
