@@ -9,6 +9,13 @@
     "beforeBuildCommand": "vp run --filter mast-desktop-ui build",
     "frontendDist": "../dist"
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["mast"]
+      }
+    }
+  },
   "app": {
     "windows": [
       {

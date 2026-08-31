@@ -51,6 +51,27 @@ pub struct PatchStreamItem {
     pub item: SubscriptionItem,
 }
 
+/// A `mast://` URL the OS handed to a running app — a link click while the
+/// window is up (or forwarded from a second launch's argv). Links that
+/// arrive at launch, before the frontend listens, wait in [`DeepLinks`]
+/// instead and are collected by [`take_deep_links`].
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepLinkEvent {
+    pub url: String,
+}
+
+/// Launch-time deep links, parked until the frontend is ready to ask.
+struct DeepLinks(Mutex<Vec<String>>);
+
+/// Drain the links the app was launched with. Called once at startup, after
+/// the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+#[tauri::command]
+#[specta::specta]
+fn take_deep_links(state: State<'_, DeepLinks>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
+}
+
 #[tauri::command]
 #[specta::specta]
 async fn snapshot(state: State<'_, AppState>) -> Result<EngineSnapshot, String> {
@@ -420,11 +441,12 @@ fn specta_builder() -> tauri_specta::Builder {
             start_history_stream,
             log_captures,
             volume_snapshots,
+            take_deep_links,
             start_capture_stream,
             start_usage_stream,
             stop_usage_stream,
         ])
-        .events(tauri_specta::collect_events![PatchStreamItem])
+        .events(tauri_specta::collect_events![PatchStreamItem, DeepLinkEvent])
 }
 
 /// A Finder/Dock/Spotlight launch inherits launchd's bare
@@ -489,6 +511,17 @@ pub fn run() {
     adopt_login_shell_path();
     let builder = specta_builder();
     tauri::Builder::default()
+        // First, per its docs. A second launch — double-clicking the icon
+        // while tray-resident, or the OS handing us a mast:// link — surfaces
+        // the window this instance already has and exits; the deep-link
+        // feature forwards any URL in its argv to on_open_url below. This
+        // retires the old second-window-read-only behavior for the desktop:
+        // the CLI keeps its read-only fallback, and one window that comes to
+        // the front beats two that disagree about who may act.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::reveal_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         // Autostarted instances launch minimized to the tray.
@@ -564,6 +597,29 @@ pub fn run() {
                 usage_task: Mutex::new(None),
             });
             builder.mount_events(app);
+            app.manage(DeepLinks(Mutex::new(Vec::new())));
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                // The bundlers register the scheme for installed builds;
+                // dev builds and portable Linux binaries register at
+                // runtime, best-effort — a refusal only costs the links.
+                #[cfg(any(target_os = "linux", windows))]
+                let _ = app.deep_link().register_all();
+                // Launched BY a link: park it for take_deep_links — the
+                // frontend is not listening yet.
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    let parked: Vec<String> = urls.iter().map(|u| u.to_string()).collect();
+                    app.state::<DeepLinks>().0.lock().unwrap().extend(parked);
+                }
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    // A link is a knock on the door — answer it visibly.
+                    tray::reveal_window(&handle);
+                    for url in event.urls() {
+                        let _ = DeepLinkEvent { url: url.to_string() }.emit(&handle);
+                    }
+                });
+            }
             tauri::async_runtime::spawn(tray::refresh_loop(app.handle().clone()));
             Ok(())
         })

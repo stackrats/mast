@@ -43,6 +43,16 @@ export function onPatchStreamItem(
   return events.patchStreamItem.listen((e) => cb(e.payload.streamId, e.payload.item));
 }
 
+/** Live mast:// links — the OS knocking while the app runs. */
+export function onDeepLink(cb: (url: string) => void): Promise<() => void> {
+  return events.deepLinkEvent.listen((e) => cb(e.payload.url));
+}
+
+/** The links the app was LAUNCHED with, drained once after subscribing. */
+export function takeDeepLinks(): Promise<string[]> {
+  return commands.takeDeepLinks();
+}
+
 /** Dispatch an action; `onEvent` receives its full operation event history. */
 export async function dispatchAction(
   action: Action,
