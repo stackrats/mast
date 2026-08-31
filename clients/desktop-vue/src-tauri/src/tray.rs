@@ -12,7 +12,7 @@ use crate::AppState;
 
 /// Bring the main window back from close-to-tray: unhide, undo any minimise,
 /// then focus.
-fn reveal_window(app: &AppHandle) {
+pub(crate) fn reveal_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else { return };
     let _ = window.unminimize();
     let _ = window.show();

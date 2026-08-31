@@ -12,6 +12,9 @@ import Select from "./ui/Select.vue";
 import Tooltip from "./ui/Tooltip.vue";
 
 const open = defineModel<boolean>("open", { default: false });
+/** A mast://clone link's repository URL — opening with one lands in From
+ * Git mode, prefilled but untouched: the person still reviews and clicks. */
+const { cloneUrl = null } = defineProps<{ cloneUrl?: string | null }>();
 const store = useEngineStore();
 
 // Two ways in, one dialog: scaffold something new, or clone what the team
@@ -77,6 +80,14 @@ function nameFromUrl(url: string): string {
 
 watch(gitUrl, (url) => {
   if (!namedManually.value) name.value = nameFromUrl(url);
+});
+
+watch(open, (now) => {
+  if (now && cloneUrl) {
+    mode.value = "clone";
+    namedManually.value = false;
+    gitUrl.value = cloneUrl; // the name follows via the watch above
+  }
 });
 
 /** Fill the parent from a native picker; the watched-directory chips stay as shortcuts. */
