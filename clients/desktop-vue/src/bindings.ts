@@ -584,7 +584,18 @@ export type Action =
  * Refuses http(s) URLs with embedded credentials — effect history
  * records every argv verbatim, and a token must never land there.
  */
-{ type: "cloneProject"; url: string; parent: string; name: string }
+{ type: "cloneProject"; url: string; parent: string; name: string } | 
+/**
+ * Persist a dragged ordering of the project list: rank = index in
+ * `ids`. Projects the list does not name keep their old rank — a stale
+ * client cannot shuffle what it never saw.
+ */
+{ type: "reorderProjects"; ids: ProjectId[] } | 
+/**
+ * Persist a dragged ordering of the workspace list; workspaces not
+ * named keep their relative order after the named ones.
+ */
+{ type: "reorderWorkspaces"; ids: WorkspaceId[] }
 /**
  * Why a capture was taken. The reason is the whole diagnostic frame: the same
  * forty lines mean something different before a user-requested restart than
@@ -1097,7 +1108,13 @@ localDomain?: string | null;
  * Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
  * missing .env, both compose-file families present, …
  */
-warnings: string[] }
+warnings: string[]; 
+/**
+ * The user's dragged position in the project list
+ * ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
+ * pre-ordering world — every rank 0 — stays exactly alphabetical.
+ */
+rank?: number }
 /**
  * The local HTTPS proxy's root certificate, exported for manual trust —
  * Firefox's import dialog wants the file, `curl --cacert` and

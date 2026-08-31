@@ -29,7 +29,7 @@ import {
   saveCapturesSeen,
   saveLogsOpen,
 } from "../lib/prefs";
-import { applyPatchEvent } from "../lib/projects";
+import { applyPatchEvent, sortProjects } from "../lib/projects";
 import { pushBounded } from "../lib/ring";
 import {
   cancelOperation,
@@ -260,7 +260,7 @@ export const useEngineStore = defineStore("engine", {
   actions: {
     /** Fold a full snapshot into state (resync entry point). */
     applySnapshot(snapshot: EngineSnapshot) {
-      this.projects = [...snapshot.projects].sort((a, b) => a.name.localeCompare(b.name));
+      this.projects = sortProjects(snapshot.projects);
       this.docker = snapshot.docker;
       this.readOnly = snapshot.readOnly;
       this.integrations = snapshot.integrations;
@@ -689,6 +689,27 @@ export const useEngineStore = defineStore("engine", {
      * toast, which may never have been seen. */
     clearAttention(project: ProjectId) {
       delete this.attention[project];
+    },
+
+    /** Persist a dragged project order — applied locally first, so the row
+     * lands where it was dropped instead of after a round trip. */
+    async reorderProjects(ids: ProjectId[]) {
+      const rank = new Map(ids.map((id, index) => [id, index]));
+      this.projects = sortProjects(
+        this.projects.map((p) => ({ ...p, rank: rank.get(p.id) ?? p.rank })),
+      );
+      await this.run({ type: "reorderProjects", ids });
+    },
+
+    /** Same optimistic shape for the workspace list (stable: unnamed keep
+     * their relative order after the named ones, like the engine). */
+    async reorderWorkspaces(ids: string[]) {
+      const pos = new Map(ids.map((id, index) => [id, index]));
+      this.workspaces = [...this.workspaces].sort(
+        (a, b) =>
+          (pos.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (pos.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+      );
+      await this.run({ type: "reorderWorkspaces", ids });
     },
 
     /** Drop a finished operation so its card stops being shown. */

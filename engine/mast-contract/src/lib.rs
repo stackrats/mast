@@ -280,6 +280,11 @@ pub struct ProjectSummary {
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
+    /// The user's dragged position in the project list
+    /// ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
+    /// pre-ordering world — every rank 0 — stays exactly alphabetical.
+    #[serde(default)]
+    pub rank: u32,
 }
 
 /// A candidate found under a watched directory, not yet imported.
@@ -1158,6 +1163,13 @@ pub enum Action {
     /// Refuses http(s) URLs with embedded credentials — effect history
     /// records every argv verbatim, and a token must never land there.
     CloneProject { url: String, parent: String, name: String },
+    /// Persist a dragged ordering of the project list: rank = index in
+    /// `ids`. Projects the list does not name keep their old rank — a stale
+    /// client cannot shuffle what it never saw.
+    ReorderProjects { ids: Vec<ProjectId> },
+    /// Persist a dragged ordering of the workspace list; workspaces not
+    /// named keep their relative order after the named ones.
+    ReorderWorkspaces { ids: Vec<WorkspaceId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1306,6 +1318,7 @@ mod tests {
             services: vec![sample_service()],
             resolution_error: None,
             warnings: vec!["Sail project without vendor/".into()],
+            rank: 3,
             commands: vec![ProjectCommand {
                 name: "dev".into(),
                 command: "sail npm run dev".into(),
@@ -1564,6 +1577,10 @@ mod tests {
                 parent: "/home/dev/code".into(),
                 name: "shop".into(),
             },
+            Action::ReorderProjects {
+                ids: vec![ProjectId("p2".into()), ProjectId("p1".into())],
+            },
+            Action::ReorderWorkspaces { ids: vec![WorkspaceId("w1".into())] },
         ] {
             roundtrip(&action);
         }
