@@ -20,11 +20,16 @@ export function comboLabel(parts: string[], mac: boolean = isMac): string {
   return parts.map((part) => keyLabel(part, mac)).join(mac && parts[0] === "mod" ? "" : " ");
 }
 
-/** Everything the keyboard can do, in the order worth learning it. */
+/** Everything the keyboard can do, in the order worth learning it. The
+ * command-palette rows sit together: the second is meaningless without the
+ * first, and "the palette" alone read as a riddle in the field. */
 export const SHORTCUTS: { combo: string[]; does: string }[] = [
   { combo: ["mod", "K"], does: "Open the command palette — every action, from anywhere" },
+  {
+    combo: ["↑", "↓", "Enter"],
+    does: "…then move through the command palette's results and run one",
+  },
   { combo: ["mod", "1–9"], does: "Jump to the nth project in the sidebar" },
-  { combo: ["↑", "↓", "Enter"], does: "Move and choose inside the palette" },
   { combo: ["Esc"], does: "Clear the sidebar filter; close menus and dialogs" },
   { combo: ["?"], does: "Show this list" },
 ];
