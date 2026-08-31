@@ -148,8 +148,11 @@ function submit() {
         <Input v-model="gitUrl" placeholder="git@github.com:acme/shop.git" mono class="mt-1" />
       </label>
 
-      <div class="grid grid-cols-2 gap-2">
-        <label class="text-xs text-slate-600 dark:text-slate-300">
+      <!-- Create mode pairs the name with a narrow PHP picker; clone mode
+           has no second column, so the name goes full width like every
+           other field — a half-width input beside nothing reads as broken. -->
+      <div :class="mode === 'create' ? 'grid grid-cols-[1fr_7rem] gap-2' : ''">
+        <label class="block text-xs text-slate-600 dark:text-slate-300">
           Project name
           <Input v-model="name" placeholder="my-app" class="mt-1" @input="namedManually = true" />
           <span v-if="name && !nameValid" class="text-red-600">
