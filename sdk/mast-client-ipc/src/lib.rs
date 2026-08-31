@@ -265,6 +265,13 @@ impl MastClient for IpcClient {
         self.open_stream::<mast_contract::LogCapture>("subscribeLogCaptures", json!({})).await
     }
 
+    async fn volume_snapshots(
+        &self,
+        project: mast_contract::ProjectId,
+    ) -> Result<Vec<mast_contract::VolumeSnapshot>, ClientError> {
+        self.call("volumeSnapshots", json!({"project": project})).await
+    }
+
     async fn subscribe_usage(&self) -> Result<mast_client::UsageStream, ClientError> {
         self.open_stream::<mast_contract::UsageSample>("subscribeUsage", json!({})).await
     }

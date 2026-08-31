@@ -257,6 +257,40 @@ impl Engine {
         redactor: &Redactor,
         budget: impl Into<mast_docker::StreamBudget>,
     ) -> Result<(), ErrorInfo> {
+        let outcome = self
+            .stream_child(handle, op, argv, cwd, env_overlay, redactor, budget, handle.cancel.clone())
+            .await?;
+        match outcome {
+            mast_docker::CommandOutcome::Exited(0) => Ok(()),
+            mast_docker::CommandOutcome::Exited(code) => Err(ErrorInfo::Internal {
+                message: format!(
+                    "{} exited with status {code}",
+                    argv.first().cloned().unwrap_or_default()
+                ),
+            }),
+            mast_docker::CommandOutcome::Cancelled => {
+                Err(ErrorInfo::Internal { message: "cancelled".into() })
+            }
+        }
+    }
+
+    /// One child subprocess streamed into the operation's output, returning
+    /// the raw outcome. `cancel` decides which token kills it — normally the
+    /// operation's own, but a supervisor ([`Engine::supervise_command`])
+    /// passes a per-run child token so it can restart the child without
+    /// ending the operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_child(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env_overlay: &[(String, String)],
+        redactor: &Redactor,
+        budget: impl Into<mast_docker::StreamBudget>,
+        cancel: CancellationToken,
+    ) -> Result<mast_docker::CommandOutcome, ErrorInfo> {
         let (line_tx, mut line_rx) = mpsc::channel::<mast_docker::OutputLine>(256);
         let forwarder = {
             let engine = self.clone();
@@ -280,24 +314,12 @@ impl Engine {
             cwd,
             env_overlay,
             line_tx,
-            handle.cancel.clone(),
+            cancel,
             budget,
             Duration::from_secs(8),
         )
         .await;
         let _ = forwarder.await;
-        match result {
-            Ok(mast_docker::CommandOutcome::Exited(0)) => Ok(()),
-            Ok(mast_docker::CommandOutcome::Exited(code)) => Err(ErrorInfo::Internal {
-                message: format!(
-                    "{} exited with status {code}",
-                    argv.first().cloned().unwrap_or_default()
-                ),
-            }),
-            Ok(mast_docker::CommandOutcome::Cancelled) => {
-                Err(ErrorInfo::Internal { message: "cancelled".into() })
-            }
-            Err(e) => Err(ErrorInfo::Internal { message: redactor.redact(&e.to_string()) }),
-        }
+        result.map_err(|e| ErrorInfo::Internal { message: redactor.redact(&e.to_string()) })
     }
 }

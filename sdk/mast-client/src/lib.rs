@@ -8,8 +8,8 @@ use futures::stream::BoxStream;
 use mast_contract::{
     Action, CatalogEntry, DiagnosticReport, DiagnosticsHistory, EngineSnapshot, EnvReport, LaravelLogReport, PhpRuntimeReport, ProxyCa,
     ErrorInfo, FileEditPreview, HistoryEntry, LogCapture, LogLine, OperationEvent, OperationId,
-    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, WorkspaceId,
-    WorkspaceSnapshot,
+    ProjectId, RepairPlan, SnapshotReport, SubscriptionItem, UsageSample, VolumeSnapshot,
+    WorkspaceId, WorkspaceSnapshot,
 };
 
 pub type PatchStream = BoxStream<'static, SubscriptionItem>;
@@ -92,6 +92,14 @@ pub trait MastClient: Send + Sync {
     /// process: they are on disk, because a container that dies while Mast is
     /// closed is exactly the one nobody can explain afterwards.
     async fn log_captures(&self, limit: u32) -> Result<Vec<LogCapture>, ClientError>;
+
+    /// Data snapshots for a project's services, newest first — labeled
+    /// docker volumes, so the list is read from docker itself (take via
+    /// `Action::SnapshotServiceData`, restore via `RestoreServiceData`).
+    async fn volume_snapshots(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<VolumeSnapshot>, ClientError>;
 
     /// Live log captures. Append-only — a capture is never revised after it is
     /// written, so consumers only prepend.

@@ -169,6 +169,13 @@ function toggleCapture(capture: LogCapture) {
   expandedCaptures.value = next;
 }
 
+/** A capture line named a project file; open it at that line. Captures
+ * outlive projects (that is their point), so a capture of a since-removed
+ * project answers with the engine's not-found rather than a dead click. */
+function openCaptureFile(capture: LogCapture, file: string, line: number | null) {
+  void store.run({ type: "openProjectFile", id: capture.project, file, line });
+}
+
 async function copyCapture(capture: LogCapture) {
   try {
     await navigator.clipboard.writeText(copyableCapture(capture));
@@ -583,7 +590,11 @@ watch(
                       : 'text-slate-600 dark:text-slate-300',
                   ]"
                 >
-                  <AnsiText :text="line.message" />
+                  <AnsiText
+                    :text="line.message"
+                    file-links
+                    @open-file="(file, ln) => openCaptureFile(capture, file, ln)"
+                  />
                 </span>
               </div>
             </div>
@@ -698,7 +709,7 @@ watch(
                     })
                   "
                 >
-                  <CircleStop class="h-3.5 w-3.5" />
+                  <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
                 </button>
               </Tooltip>
             </div>

@@ -181,6 +181,13 @@ pub struct ProjectCommandRecord {
     /// Text in this command's own output that marks it as finished starting.
     #[serde(default)]
     pub ready_when: Option<String>,
+    /// Relaunch after any exit the user did not ask for.
+    #[serde(default)]
+    pub auto_restart: bool,
+    /// Glob patterns (relative to the command's cwd) whose changes restart
+    /// the running command.
+    #[serde(default)]
+    pub restart_when_changed: Vec<String>,
 }
 
 /// `Default` is what a machine with no `settings.json` starts from, so it has
@@ -195,6 +202,9 @@ pub struct Settings {
     /// Preferred editor binary (None = auto-detect).
     #[serde(default)]
     pub editor: Option<String>,
+    /// Preferred browser binary (None = the desktop's default browser).
+    #[serde(default)]
+    pub browser: Option<String>,
     /// Move a busy host port into `.env` on start rather than failing the
     /// bind. Absent in settings written before this existed — on by default.
     #[serde(default = "yes")]
@@ -211,6 +221,7 @@ impl Default for Settings {
             watched_directories: Vec::new(),
             terminal: None,
             editor: None,
+            browser: None,
             auto_port_remap: yes(),
         }
     }
@@ -590,6 +601,7 @@ mod tests {
             watched_directories: vec![tmp.path().to_path_buf()],
             terminal: Some("kitty".into()),
             editor: None,
+            browser: Some("vivaldi".into()),
             auto_port_remap: false,
         };
         store.save_settings(&settings).unwrap();
