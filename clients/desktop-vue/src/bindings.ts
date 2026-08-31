@@ -235,6 +235,13 @@ async volumeSnapshots(project: ProjectId) : Promise<Result<VolumeSnapshot[], str
 }
 },
 /**
+ * Drain the links the app was launched with. Called once at startup, after
+ * the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+ */
+async takeDeepLinks() : Promise<string[]> {
+    return await TAURI_INVOKE("take_deep_links");
+},
+/**
  * Follow log captures. Append-only — the frontend prepends. Replaces any
  * earlier subscription.
  */
@@ -277,8 +284,10 @@ async stopUsageStream() : Promise<Result<null, string>> {
 
 
 export const events = __makeEvents__<{
+deepLinkEvent: DeepLinkEvent,
 patchStreamItem: PatchStreamItem
 }>({
+deepLinkEvent: "deep-link-event",
 patchStreamItem: "patch-stream-item"
 })
 
@@ -649,6 +658,13 @@ export type CustomServiceSpec = { name: string; image: string; ports?: string[];
  * Container path persisted into a named volume `{name}-data`.
  */
 volume?: string | null; command?: string | null }
+/**
+ * A `mast://` URL the OS handed to a running app — a link click while the
+ * window is up (or forwarded from a second launch's argv). Links that
+ * arrive at launch, before the frontend listens, wait in [`DeepLinks`]
+ * instead and are collected by [`take_deep_links`].
+ */
+export type DeepLinkEvent = { url: string }
 export type DiagSeverity = "info" | "warning" | "error"
 export type DiagnosticFinding = { check: string; severity: DiagSeverity; title: string; detail: string; project: ProjectId | null; projectName: string | null; repair: RepairOffer | null }
 /**

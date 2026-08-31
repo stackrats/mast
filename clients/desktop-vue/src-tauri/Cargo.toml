@@ -29,6 +29,10 @@ tracing.workspace = true
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2.4.0"
+tauri-plugin-deep-link = "2.4.5"
+# The deep-link feature forwards a second launch's mast:// argv into the
+# deep-link plugin before the second instance exits.
+tauri-plugin-single-instance = { version = "2.3.6", features = ["deep-link"] }
 
 # Raising the window from the tray needs a real X11 activation (see
 # tray::reveal_window). Versions must track the gtk stack tao/wry already

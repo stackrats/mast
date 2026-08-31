@@ -1,13 +1,20 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Mast",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "identifier": "dev.mast.desktop",
   "build": {
     "beforeDevCommand": "vp run --filter mast-desktop-ui dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "vp run --filter mast-desktop-ui build",
     "frontendDist": "../dist"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["mast"]
+      }
+    }
   },
   "app": {
     "windows": [
@@ -30,7 +37,8 @@
     "shortDescription": "Control tower for local Laravel Sail development",
     "linux": {
       "deb": {
-        "depends": ["docker-ce | docker.io"]
+        "depends": ["docker-ce | docker.io"],
+        "desktopTemplate": "./mast.desktop"
       }
     }
   }
