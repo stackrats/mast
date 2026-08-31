@@ -176,7 +176,7 @@ function when(atUnixMs: number): string {
             <p class="text-xs text-amber-800 dark:text-amber-200">
               Restoring overwrites {{ service?.name }}'s current data with this snapshot.
             </p>
-            <Checkbox v-model="snapshotFirst" label="Snapshot the current data first" />
+            <Checkbox block v-model="snapshotFirst" label="Snapshot the current data first" />
             <div class="flex justify-end gap-2">
               <Button variant="outline" size="sm" @click="arming = null">Cancel</Button>
               <Button size="sm" :disabled="busy" @click="restore(snapshot.group)">
