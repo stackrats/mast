@@ -14,6 +14,7 @@ import NewProjectDialog from "./components/NewProjectDialog.vue";
 import HomePane from "./components/HomePane.vue";
 import ProjectCard from "./components/ProjectCard.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import Sidebar from "./components/Sidebar.vue";
 import WorkspaceDetail from "./components/WorkspaceDetail.vue";
 import WorkspaceDialog from "./components/WorkspaceDialog.vue";
@@ -75,6 +76,7 @@ async function selectProjectSoon(ref: string) {
 }
 const aboutOpen = ref(false);
 const paletteOpen = ref(false);
+const shortcutsOpen = ref(false);
 
 // Ctrl/Cmd-K from anywhere, including from inside a text field — the palette
 // is how you leave wherever you are, so it must not be capturable by the
@@ -97,11 +99,24 @@ function onKeydown(event: KeyboardEvent) {
       }
     }
   }
+  // `?` opens the shortcut list — but only outside text fields, where the
+  // character is just typing. `event.key` keeps it layout-independent.
+  if (event.key === "?" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    const target = event.target as HTMLElement | null;
+    const editable =
+      target != null &&
+      (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+    if (!editable) {
+      event.preventDefault();
+      shortcutsOpen.value = true;
+    }
+  }
 }
 
-function openPaletteDialog(what: "settings" | "newProject" | "newWorkspace") {
+function openPaletteDialog(what: "settings" | "newProject" | "newWorkspace" | "shortcuts") {
   if (what === "settings") settingsOpen.value = true;
   else if (what === "newProject") newProjectOpen.value = true;
+  else if (what === "shortcuts") shortcutsOpen.value = true;
   else newWorkspace();
 }
 const workspaceDialogOpen = ref(false);
@@ -184,6 +199,7 @@ function editWorkspace(ws: WorkspaceSummary) {
         @open-diagnostics="openDiagnostics()"
         @new-project="newProjectOpen = true"
         @open-about="aboutOpen = true"
+        @open-shortcuts="shortcutsOpen = true"
       />
 
       <div class="flex min-h-0 flex-1">
@@ -235,6 +251,7 @@ function editWorkspace(ws: WorkspaceSummary) {
       <NewProjectDialog v-model:open="newProjectOpen" :clone-url="clonePrefill" />
       <WorkspaceDialog v-model:open="workspaceDialogOpen" :editing="editingWorkspace" />
       <AboutDialog v-model:open="aboutOpen" />
+      <ShortcutsDialog v-model:open="shortcutsOpen" />
       <LogsDialog />
     </div>
   </TooltipProvider>
