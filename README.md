@@ -20,7 +20,7 @@ Manage all your Laravel Sail projects, containers, logs, workers, and developmen
 
 [**mast.sh**](https://mast.sh) · [**Download Mast**](../../releases/latest) · [Features](#features) · [Build from source](#development)
 
-<img src="docs/media/workspace-start.gif" alt="Starting the Acme workspace: billing-api starts first, Mast waits for it to become healthy, then storefront follows" width="900">
+<img src="docs/media/workspace-start.gif" alt="Starting the Acme workspace: storefront starts first, Mast waits for it to become healthy, then billing-api follows" width="900">
 
 <sub>Starting a workspace in dependency order. Mast waits for each layer to become healthy before starting the next.</sub>
 
@@ -178,7 +178,7 @@ Mast automatically discovers Laravel Sail and Docker Compose projects from the d
 
 Every project shows its services, application processes, saved commands, and live container state.
 
-<img src="docs/media/project.png" alt="Project pane showing live CPU and memory alongside service, process, and command chips for a running Sail project" width="900">
+<img src="docs/media/project.png" alt="Project pane showing live CPU and memory alongside service, runtime, process, and command chips for a running Sail project" width="900">
 
 ### Project & service controls
 
@@ -188,7 +188,11 @@ Mast reads the real Docker state rather than maintaining a separate idea of what
 
 A service's chip also knows what the service is for. Mailpit, Meilisearch, or the MinIO console open in your browser from the chip — on whatever port they actually publish, so nobody memorises that Mailpit lives on 8025. A database chip offers **Connection info**: host, port, database, username, and password read fresh from `.env`, each with a copy button, plus a ready-made connection URL for TablePlus or DBeaver — and an **Open in database client** button that hands that URL straight to whichever client owns the scheme on your machine.
 
-A **Tinker** button opens the REPL in the app container — no PHP needed on the host. Right-clicking any project in the sidebar offers start/stop/restart and the open-in verbs without leaving the list, and right-clicking a workspace offers start/stop/edit the same way; `Ctrl`+`1`–`9` jumps straight to a project, a filter box narrows the sidebar by typing, and workspaces — or the whole Workspaces/Projects sections — fold shut and stay that way (a live filter always shows its matches, folded or not).
+A **Tinker** button opens the REPL in the app container — no PHP needed on the host. Right-clicking any project in the sidebar offers start/stop/restart and the open-in verbs without leaving the list, and right-clicking a workspace offers start/stop/edit the same way; `Ctrl`+`1`–`9` jumps straight to a project, a filter box narrows the sidebar by typing, and workspaces — or the whole Workspaces/Projects sections — fold shut and stay that way (a live filter always shows its matches, folded or not). Drag any row to reorder it, drop a project onto a workspace to add it, or onto the Projects heading to take it back out.
+
+Press `?` for the full list, written in your platform's own modifiers:
+
+<img src="docs/media/shortcuts.png" alt="Keyboard shortcuts dialog listing the command palette, project jumps, palette navigation, Escape and the ? key" width="900">
 
 ### Workspaces
 
@@ -362,6 +366,8 @@ Mast matches services against your existing Compose file and can expose availabl
 Insurance against the `-v` flag. Any service with named volumes — MySQL, Postgres, Redis, Meilisearch — gets **Data snapshots** on its chip: one click copies its volumes (container briefly stopped for a clean copy, restarted after) into labeled docker volumes on your machine.
 
 Restore is deliberately harder than take: it's a two-step confirm that offers to snapshot the current data first, checked by default. Snapshots are plain docker volumes with `mast.*` labels — they survive reinstalls, show up in `docker volume ls`, and delete like anything else.
+
+<img src="docs/media/snapshots.png" alt="Data snapshots dialog for a mariadb service, listing one snapshot with its volume name, a Restore button and a delete control" width="900">
 
 Taking one also works from the CLI (`mast snapshot <project> <service>`, `mast snapshots <project>`) and from coding agents via MCP — an agent can buy insurance before running your migration, but restoring stays in the app, behind its confirm.
 
