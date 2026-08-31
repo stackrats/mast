@@ -124,11 +124,14 @@ function indexOf(id: string): number {
         class="max-h-[52vh] overflow-y-auto py-1"
       >
         <div v-for="group in groups" :key="group.group">
-          <p
-            class="px-4 pt-2 pb-1 text-[0.68rem] font-medium tracking-wide text-slate-400 uppercase"
-          >
+          <p class="px-4 pt-2 pb-1 text-[0.68rem] font-medium text-slate-400">
             {{ group.group }}
           </p>
+          <!-- Hover tracks mousemove, not mouseenter: an arrow press scrolls
+               the list, rows slide under a STATIONARY pointer, and mouseenter
+               snapped the highlight straight back to whatever landed there —
+               arrows felt dead whenever the mouse rested on the list.
+               mousemove fires only for a hand that actually moved. -->
           <button
             v-for="item in group.items"
             :key="item.id"
@@ -142,7 +145,7 @@ function indexOf(id: string): number {
                 ? 'bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100'
                 : 'text-slate-700 dark:text-slate-300'
             "
-            @mouseenter="active = indexOf(item.id)"
+            @mousemove="active = indexOf(item.id)"
             @click="perform(item.effect)"
           >
             <span class="truncate">{{ item.title }}</span>
