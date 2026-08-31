@@ -6,7 +6,7 @@ defineProps<{
 }>();
 
 const base =
-  "absolute top-1 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-slate-400 outline-none hover:bg-slate-200 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200";
+  "absolute top-1 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200";
 // `pointer-events-none` while hidden matters: an invisible but clickable
 // button sitting over the row would eat clicks meant for the row itself.
 // Focus is unaffected by it, so tabbing to the action still works.

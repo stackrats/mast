@@ -30,7 +30,7 @@ const {
 }>();
 
 const base =
-  "inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-xs whitespace-nowrap outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 disabled:cursor-default disabled:opacity-50";
+  "inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-xs whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 disabled:cursor-default disabled:opacity-50";
 
 const variants = {
   active:
