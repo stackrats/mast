@@ -74,15 +74,19 @@ onBeforeUnmount(() => {
   document.removeEventListener("keydown", onDocumentKeydown);
 });
 
+// No `outline-none` anywhere here: Tailwind 4's outline-none sets
+// --tw-outline-style to none, which a later focus-visible:outline-2 then
+// inherits — the ring exists but has no style, which is how tabbing through
+// half the app looked like focus went missing.
 const triggerClass =
-  "rounded px-2.5 py-1 text-xs font-medium text-slate-600 outline-none hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800";
+  "rounded px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:text-slate-300 dark:hover:bg-slate-800";
 const triggerOpenClass = "bg-slate-100 dark:bg-slate-800";
 // lib/menu's content/item recipes, with hover: variants standing in for the
 // data-highlighted state reka would have managed.
 const panelClass =
   "absolute top-full left-0 z-50 mt-1 min-w-44 rounded-md border border-slate-200 bg-white p-1 shadow-lg dark:border-slate-700 dark:bg-slate-900";
 const itemClass =
-  "flex w-full cursor-default items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-700 outline-none hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800";
+  "flex w-full cursor-default items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:text-slate-200 dark:hover:bg-slate-800";
 const separatorClass = "my-1 h-px bg-slate-100 dark:bg-slate-800";
 const accelClass = "ml-auto pl-4 font-mono text-[0.68rem] text-slate-400 dark:text-slate-500";
 const paletteAccel = comboLabel(["mod", "K"]);
