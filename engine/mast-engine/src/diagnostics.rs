@@ -3784,7 +3784,7 @@ mod tests {
         assert_eq!(
             grouped_cmdlines(&lines),
             vec![
-                format!("3 × {}", &lines[0]),
+                format!("3 × {}", lines[0]),
                 "php artisan serve".to_string(),
             ]
         );
