@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "mast-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "futures",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "mast-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "mast-client-ipc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "mast-client-local"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "mast-compose"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "mast-docker",
  "mast-yaml-edit",
@@ -2546,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "mast-contract"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "mast-daemon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "mast-desktop"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "futures",
  "gdkx11",
@@ -2605,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "mast-diagnostics"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "mast-laravel",
  "rusqlite",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "mast-docker"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "mast-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "mast-laravel"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "mast-docker",
  "tempfile",
@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "mast-project"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "mast-registry"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "mast-yaml-edit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "saphyr",
  "tempfile",
