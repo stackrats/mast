@@ -164,6 +164,10 @@ pub struct ProjectRecord {
     /// Local HTTPS domain served by the shared `mast-proxy` container.
     #[serde(default)]
     pub local_domain: Option<String>,
+    /// The user's dragged position in the project list; ties (all the
+    /// pre-ordering records at 0) fall back to name order.
+    #[serde(default)]
+    pub rank: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +406,7 @@ impl MetadataStore {
             path: canonical,
             commands: Vec::new(),
             local_domain: None,
+            rank: 0,
         };
         projects.push(record.clone());
         self.save_projects(&projects)?;

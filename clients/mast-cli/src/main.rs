@@ -607,6 +607,7 @@ mod tests {
             services: Vec::new(),
             resolution_error: None,
             warnings: Vec::new(),
+            rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),
             git_branch: None,
