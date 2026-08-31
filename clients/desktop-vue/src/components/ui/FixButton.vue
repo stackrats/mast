@@ -116,6 +116,7 @@ async function apply() {
         </div>
         <Checkbox
           v-if="plan.repair.risk === 'highRisk' && !plan.noOp"
+          block
           v-model="consented"
           label="I understand what this changes"
         />

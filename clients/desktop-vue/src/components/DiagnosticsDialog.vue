@@ -232,7 +232,7 @@ const riskLabel: Record<string, string> = {
           v-if="plan.repair.risk === 'highRisk' && !plan.noOp"
           class="rounded-md border border-red-200 bg-red-50 p-2.5 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
         >
-          <Checkbox v-model="consented" class="text-inherit!">
+          <Checkbox block v-model="consented" class="text-inherit!">
             <span>
               <ShieldAlert class="mr-1 inline h-3.5 w-3.5" />
               I understand this changes system security: docker-group membership is equivalent to
