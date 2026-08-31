@@ -186,7 +186,9 @@ Start, stop, or restart an entire project or an individual service.
 
 Mast reads the real Docker state rather than maintaining a separate idea of what should be running.
 
-A service's chip also knows what the service is for. Mailpit, Meilisearch, or the MinIO console open in your browser from the chip — on whatever port they actually publish, so nobody memorises that Mailpit lives on 8025. A database chip offers **Connection info**: host, port, database, username, and password read fresh from `.env`, each with a copy button, plus a ready-made connection URL for TablePlus or DBeaver.
+A service's chip also knows what the service is for. Mailpit, Meilisearch, or the MinIO console open in your browser from the chip — on whatever port they actually publish, so nobody memorises that Mailpit lives on 8025. A database chip offers **Connection info**: host, port, database, username, and password read fresh from `.env`, each with a copy button, plus a ready-made connection URL for TablePlus or DBeaver — and an **Open in database client** button that hands that URL straight to whichever client owns the scheme on your machine.
+
+A **Tinker** button opens the REPL in the app container — no PHP needed on the host. Right-clicking any project in the sidebar offers start/stop/restart and the open-in verbs without leaving the list, and right-clicking a workspace offers start/stop/edit the same way; `Ctrl`+`1`–`9` jumps straight to a project, a filter box narrows the sidebar by typing, and workspaces — or the whole Workspaces/Projects sections — fold shut and stay that way (a live filter always shows its matches, folded or not).
 
 ### Workspaces
 
@@ -214,6 +216,32 @@ Mast can automatically start:
 These processes remain attached to the project they belong to rather than disappearing into another terminal window.
 
 Saved commands can also run somewhere else: give one a working directory like `../frontend` and your separate frontend's dev server lives on the same card — streamed, stoppable, and startable together with the backend it belongs to.
+
+### Keep them alive, keep them current
+
+A command can **auto-restart**: any exit you didn't ask for relaunches it, with backoff, and a crash loop stops instead of hammering the same failure. Add **restart-on-change** globs — `app/** config/**` — and the command is stopped and relaunched when matching files change, which is exactly what a queue worker needs: it never sees new code until it restarts. Supervisor semantics, locally, with the output still streaming into the same panel.
+
+### Share the setup with your team — `mast.yml`
+
+Commands can live in a `mast.yml` committed at the project root instead of on one person's machine:
+
+```yaml
+commands:
+  vite:
+    command: sail npm run dev
+    auto_start: true
+    ready_when: "ready in"
+  queue:
+    command: sail artisan queue:work
+    auto_start: true
+    after: vite
+    auto_restart: true
+    restart_when_changed:
+      - app/**
+      - config/**
+```
+
+Clone, import, done — everyone gets the same commands, ordering, and readiness. Saving a command under the same name overrides the shared one locally, and the **Share** chip writes your current saved commands into a first `mast.yml` for you. Mistakes in the file surface as project warnings that name the line's problem; they never stop the project from loading.
 
 ---
 
@@ -258,7 +286,7 @@ Captures are written to disk, so they survive both the container being replaced 
 
 Values that look like secrets in your `.env` are removed before a capture is stored — unlike a live stream, a capture is persisted and copyable.
 
-And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab. When the history outlives its usefulness, one button clears the file in place.
+And container logs are only half the story: the application confesses in `storage/logs/laravel.log`. The **App log** button shows it parsed — each error with its stack trace grouped as one entry, level badges, and an errors-only filter — instead of two hundred raw lines in an editor tab. Every file a trace names is a link: click `/var/www/html/app/Jobs/Ship.php(25)` in a stack trace — or in a capture — and your editor opens that file at that line. When the history outlives its usefulness, one button clears the file in place.
 
 <img src="docs/media/app-log.png" alt="Application log dialog with level badges and an expanded SQL error showing its grouped stack trace" width="704">
 
@@ -329,6 +357,16 @@ Mast matches services against your existing Compose file and can expose availabl
 
 ---
 
+## Data snapshots
+
+Insurance against the `-v` flag. Any service with named volumes — MySQL, Postgres, Redis, Meilisearch — gets **Data snapshots** on its chip: one click copies its volumes (container briefly stopped for a clean copy, restarted after) into labeled docker volumes on your machine.
+
+Restore is deliberately harder than take: it's a two-step confirm that offers to snapshot the current data first, checked by default. Snapshots are plain docker volumes with `mast.*` labels — they survive reinstalls, show up in `docker volume ls`, and delete like anything else.
+
+Taking one also works from the CLI (`mast snapshot <project> <service>`, `mast snapshots <project>`) and from coding agents via MCP — an agent can buy insurance before running your migration, but restoring stays in the app, behind its confirm.
+
+---
+
 ## Switch PHP and Node versions
 
 Pick another PHP runtime from the project's Runtimes row and Mast runs the whole switch as one operation: the build context and the `sail-X.Y/app` image tag move together, the image rebuilds without cache, the container is recreated if it was running — and `php -v` inside the container has the last word.
@@ -356,6 +394,10 @@ Sensitive values remain masked while Mast edits the existing file in place.
 Mast can bootstrap new Laravel applications using containers.
 
 You don't need a local PHP installation just to create the project that will ultimately run inside Docker anyway.
+
+### Or clone the team's
+
+The same dialog takes a git URL. Mast clones it, then bootstraps exactly what a fresh clone is missing — containerized `composer install`, `.env` from `.env.example`, an app key — and imports it, committed `mast.yml` commands included. Whatever's still missing (Sail itself, node modules) shows up in Diagnostics with a one-click fix. URLs with embedded credentials are refused: effect history records every command verbatim, and a token must never land there.
 
 ---
 
@@ -385,6 +427,18 @@ Projects can be matched by name or path fragment.
 When the desktop application or daemon is running, the CLI connects to it over IPC.
 
 Otherwise, the CLI starts its own embedded engine. If another Mast process already holds the ownership lock, that engine operates read-only.
+
+---
+
+# Coding agents (MCP)
+
+Coding agents can use Mast as their window into your dev environment instead of shelling `docker compose` blind. Register the command below as an stdio MCP server in your agent's MCP settings:
+
+```bash
+mast mcp
+```
+
+It speaks the Model Context Protocol over stdio, talking to the same engine as the app. An agent gets `mast_status` (projects, services, health, ports), `mast_logs`, `mast_laravel_log` (parsed, stack traces included), `mast_captures` (a dead container's last words), `mast_diagnose`, `mast_history`, `mast_wait`, the lifecycle verbs, and `mast_run_command` — which runs your **saved** commands only, so the command list you curated stays the consent boundary.
 
 ---
 

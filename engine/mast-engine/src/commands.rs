@@ -58,6 +58,9 @@ mod tests {
             cwd: None,
             after: after.map(String::from),
             ready_when: None,
+            auto_restart: false,
+            restart_when_changed: Vec::new(),
+            from_manifest: false,
         }
     }
 

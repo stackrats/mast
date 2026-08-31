@@ -139,3 +139,31 @@ describe("groupPalette", () => {
     expect(titles(grouped[0].items)).toEqual(["A", "C"]);
   });
 });
+
+describe("attention and tinker entries", () => {
+  it("projects with unread markers lead, and selecting is the effect", () => {
+    const items = buildPalette([project()], [], { p1: ["went degraded", "recovered"] });
+    const attention = items.find((i) => i.group === "Needs attention");
+    expect(attention).toBeDefined();
+    expect(attention!.hint).toBe("recovered"); // the newest word wins the hint
+    expect(attention!.effect).toEqual({ kind: "select", id: "p1" });
+    // Built before the plain jump entry, so an empty query surfaces it first.
+    expect(items.findIndex((i) => i.group === "Needs attention")).toBeLessThan(
+      items.findIndex((i) => i.id === "go:p1"),
+    );
+  });
+
+  it("no markers, no group", () => {
+    const items = buildPalette([project()], []);
+    expect(items.some((i) => i.group === "Needs attention")).toBe(false);
+  });
+
+  it("tinker is offered only where an app container exists to exec into", () => {
+    const up = buildPalette([project()], []);
+    expect(titles(up)).toContain("Tinker — storefront");
+    const stopped = buildPalette([project({ status: "stopped" })], []);
+    expect(titles(stopped)).not.toContain("Tinker — storefront");
+    const plainCompose = buildPalette([project({ isSail: false })], []);
+    expect(titles(plainCompose)).not.toContain("Tinker — storefront");
+  });
+});

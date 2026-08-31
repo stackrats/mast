@@ -19,7 +19,7 @@ const active = ref(0);
 const input = ref<HTMLInputElement | null>(null);
 const listbox = ref<HTMLElement | null>(null);
 
-const items = computed(() => buildPalette(store.projects, store.workspaces));
+const items = computed(() => buildPalette(store.projects, store.workspaces, store.attention));
 const results = computed(() => filterPalette(items.value, query.value));
 const groups = computed(() => groupPalette(results.value));
 /** Flat ranked order — what the arrow keys walk, regardless of grouping. */

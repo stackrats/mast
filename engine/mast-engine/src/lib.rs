@@ -13,8 +13,11 @@ mod history;
 pub mod integrations;
 mod lifecycle;
 mod lock;
+mod manifest;
 mod catalog_ops;
 mod ops;
+mod supervise;
+mod volumes;
 mod php;
 mod ports;
 mod proxy;
@@ -137,6 +140,11 @@ pub(crate) struct ProjectEntry {
     /// in-place edit (catalog add, retag, external editor) changes content
     /// without changing the invocation — the model must refresh then too.
     pub compose_fingerprint: Option<u64>,
+    /// Commands the project's committed `mast.yml` contributes, refreshed on
+    /// every reconcile. Kept beside the record's saved commands so anything
+    /// rebuilding `summary.commands` off-reconcile (SetProjectCommands, the
+    /// export) can merge without touching the filesystem.
+    pub manifest: crate::manifest::Manifest,
 }
 
 pub(crate) struct EngineState {
@@ -216,6 +224,9 @@ fn commands_to_contract(record: &ProjectRecord) -> Vec<mast_contract::ProjectCom
             cwd: c.cwd.clone(),
             after: c.after.clone(),
             ready_when: c.ready_when.clone(),
+            auto_restart: c.auto_restart,
+            restart_when_changed: c.restart_when_changed.clone(),
+            from_manifest: false,
         })
         .collect()
 }
@@ -298,6 +309,7 @@ impl Engine {
                     app_port: None,
                     host_ports: Vec::new(),
                     compose_fingerprint: None,
+                    manifest: manifest::Manifest::default(),
                 };
                 (entry.record.id.clone(), entry)
             })
@@ -317,6 +329,7 @@ impl Engine {
                     integrations: IntegrationSettings {
                         terminal: settings.terminal.clone(),
                         editor: settings.editor.clone(),
+                        browser: settings.browser.clone(),
                         auto_port_remap: settings.auto_port_remap,
                     },
                     // Heal pre-strip_verbatim stores: `\\?\C:\…` entries
@@ -494,6 +507,8 @@ impl Engine {
                 | Action::OpenHostsFile
                 | Action::RevealPath { .. }
                 | Action::OpenProjectFile { .. }
+                | Action::OpenTinker { .. }
+                | Action::OpenDbUrl { .. }
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
@@ -539,6 +554,12 @@ impl Engine {
                     LifecycleVerb::Rebuild,
                     Some(service.clone()),
                 );
+            }
+            Action::SnapshotServiceData { id, service } => {
+                return self.dispatch_volume_snapshot(id.clone(), service.clone());
+            }
+            Action::RestoreServiceData { id, group } => {
+                return self.dispatch_volume_restore(id.clone(), group.clone());
             }
             Action::SetPhpVersion { id, service, series } => {
                 return self.dispatch_php_switch(id.clone(), service.clone(), series.clone());
@@ -704,6 +725,20 @@ impl Engine {
                 self.spawn_operation(id, handle, async move {
                     engine.clear_log_captures().await?;
                     Ok(())
+                });
+            }
+            Action::ExportProjectManifest { id: project } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.export_project_manifest(&h, id, &project).await
+                });
+            }
+            Action::RemoveServiceDataSnapshot { group } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.remove_volume_snapshot(&h, id, &group).await
                 });
             }
             Action::SaveWorkspace { id: ws_id, name, members } => {
@@ -926,6 +961,13 @@ impl Engine {
                     engine.create_project(&h, id, &parent, &name, &php, &services).await
                 });
             }
+            Action::CloneProject { url, parent, name } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.clone_project(&h, id, &url, &parent, &name).await
+                });
+            }
             Action::StartProcess { id: project, process } => {
                 let engine = self.clone();
                 let h = handle.clone();
@@ -943,6 +985,11 @@ impl Engine {
             Action::SetProjectCommands { id: project, commands } => {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
+                    // Clients send the merged list back; entries the manifest
+                    // contributed live in mast.yml, not app data, so they are
+                    // dropped here rather than persisted as copies.
+                    let commands: Vec<_> =
+                        commands.into_iter().filter(|c| !c.from_manifest).collect();
                     let mut names = std::collections::HashSet::new();
                     for c in &commands {
                         if c.name.trim().is_empty() || c.command.trim().is_empty() {
@@ -955,13 +1002,18 @@ impl Engine {
                                 message: format!("duplicate command name \"{}\"", c.name),
                             });
                         }
-                    }
-                    // A dependency that cannot be satisfied is worse than no
-                    // dependency: the command simply never starts, and the
-                    // only symptom is a chip that stays grey. Refuse it here,
-                    // where there is a dialog to show the reason in.
-                    if let Err(message) = crate::commands::check_order(&commands) {
-                        return Err(ErrorInfo::InvalidInput { message });
+                        // A bad glob would otherwise surface as a watch that
+                        // silently never fires. Refuse it here, in the dialog.
+                        for pattern in &c.restart_when_changed {
+                            if let Err(e) = glob::Pattern::new(pattern) {
+                                return Err(ErrorInfo::InvalidInput {
+                                    message: format!(
+                                        "\"{}\": \"{pattern}\" is not a glob pattern ({e})",
+                                        c.name
+                                    ),
+                                });
+                            }
+                        }
                     }
                     let records: Vec<mast_project::ProjectCommandRecord> = commands
                         .iter()
@@ -972,18 +1024,37 @@ impl Engine {
                             cwd: c.cwd.clone().filter(|w| !w.trim().is_empty()),
                             after: c.after.clone().filter(|a| !a.trim().is_empty()),
                             ready_when: c.ready_when.clone().filter(|r| !r.trim().is_empty()),
+                            auto_restart: c.auto_restart,
+                            restart_when_changed: c
+                                .restart_when_changed
+                                .iter()
+                                .map(|p| p.trim().to_string())
+                                .filter(|p| !p.is_empty())
+                                .collect(),
                         })
                         .collect();
                     let all = engine.with_state(|st, events| {
                         if let Some(entry) = st.projects.get_mut(&project.0) {
+                            // A dependency that cannot be satisfied is worse
+                            // than no dependency: the command simply never
+                            // starts, and the only symptom is a chip that
+                            // stays grey. Refuse it here, where there is a
+                            // dialog to show the reason in — and check the
+                            // merged view, since `after` may point at a
+                            // manifest command.
+                            let merged =
+                                crate::manifest::merged(&entry.manifest.commands, &commands);
+                            if let Err(message) = crate::commands::check_order(&merged) {
+                                return Err(ErrorInfo::InvalidInput { message });
+                            }
                             entry.record.commands = records.clone();
-                            entry.summary.commands = commands.clone();
+                            entry.summary.commands = merged;
                             events.push(PatchEvent::ProjectUpdated {
                                 project: entry.summary.clone(),
                             });
                         }
-                        st.projects.values().map(|e| e.record.clone()).collect::<Vec<_>>()
-                    });
+                        Ok(st.projects.values().map(|e| e.record.clone()).collect::<Vec<_>>())
+                    })?;
                     engine
                         .inner
                         .deps
@@ -1036,8 +1107,43 @@ impl Engine {
                 self.spawn_operation(id, handle, async move {
                     let path = engine.project_path(&project)?;
                     let editor = engine.inner.state.lock().unwrap().integrations.editor.clone();
-                    integrations::open_editor(editor.as_deref(), &path)
+                    integrations::open_editor(editor.as_deref(), &path, None)
                         .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::OpenTinker { id: project } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    let (path, terminal) = engine.project_launch_context(&project)?;
+                    // Tinker lives in the app service's container; the other
+                    // services have no artisan to speak of.
+                    let app_service = crate::project_ops::app_service_of(&path);
+                    let container_id = {
+                        let st = engine.inner.state.lock().unwrap();
+                        st.projects
+                            .get(&project.0)
+                            .and_then(|e| {
+                                e.summary
+                                    .services
+                                    .iter()
+                                    .find(|s| s.name == app_service)
+                                    .and_then(|s| s.container_id.clone())
+                            })
+                            .ok_or(ErrorInfo::InvalidInput {
+                                message: "the app container is not running — start the \
+                                          project first"
+                                    .into(),
+                            })?
+                    };
+                    let command = integrations::container_tinker_command(&container_id);
+                    integrations::open_terminal(terminal.as_deref(), &path, Some(&command))
+                        .map_err(|message| ErrorInfo::Internal { message })
+                });
+            }
+            Action::OpenDbUrl { url } => {
+                self.spawn_operation(id, handle, async move {
+                    integrations::open_db_url(&url)
+                        .map_err(|message| ErrorInfo::InvalidInput { message })
                 });
             }
             Action::RevealInFileManager { id: project } => {
@@ -1053,22 +1159,27 @@ impl Engine {
                 self.spawn_operation(id, handle, async move {
                     // The reconciled summary is the same address the UI shows,
                     // so the button never opens something else than its label.
-                    let url = {
+                    let (url, browser) = {
                         let st = engine.inner.state.lock().unwrap();
-                        st.projects
+                        let url = st
+                            .projects
                             .get(&project.0)
                             .and_then(|e| e.summary.app_url.clone())
                             .ok_or(ErrorInfo::NotFound {
                                 what: "APP_URL for this project".to_string(),
-                            })?
+                            })?;
+                        (url, st.integrations.browser.clone())
                     };
-                    integrations::open_in_browser(&url)
+                    integrations::open_in_browser(browser.as_deref(), &url)
                         .map_err(|message| ErrorInfo::Internal { message })
                 });
             }
             Action::OpenUrl { url } => {
+                let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
-                    integrations::open_in_browser(&url)
+                    let browser =
+                        engine.inner.state.lock().unwrap().integrations.browser.clone();
+                    integrations::open_in_browser(browser.as_deref(), &url)
                         .map_err(|message| ErrorInfo::InvalidInput { message })
                 });
             }
@@ -1078,7 +1189,7 @@ impl Engine {
                         .map_err(|message| ErrorInfo::Internal { message })
                 });
             }
-            Action::OpenProjectFile { id: project, file } => {
+            Action::OpenProjectFile { id: project, file, line } => {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
                     let root = engine.project_path(&project)?;
@@ -1099,7 +1210,7 @@ impl Engine {
                         });
                     }
                     let editor = engine.inner.state.lock().unwrap().integrations.editor.clone();
-                    integrations::open_editor(editor.as_deref(), &target)
+                    integrations::open_editor(editor.as_deref(), &target, line)
                         .map_err(|message| ErrorInfo::Internal { message })
                 });
             }
@@ -1240,7 +1351,9 @@ impl Engine {
             | Action::SetNodeVersion { .. }
             | Action::SetPhpExtensions { .. }
             | Action::ShareProject { .. }
-            | Action::SetLocalDomain { .. } => unreachable!("handled above"),
+            | Action::SetLocalDomain { .. }
+            | Action::SnapshotServiceData { .. }
+            | Action::RestoreServiceData { .. } => unreachable!("handled above"),
         }
         Ok(id)
     }
@@ -1252,6 +1365,7 @@ impl Engine {
                 watched_directories: st.watched_directories.clone(),
                 terminal: st.integrations.terminal.clone(),
                 editor: st.integrations.editor.clone(),
+                browser: st.integrations.browser.clone(),
                 auto_port_remap: st.integrations.auto_port_remap,
             }
         };

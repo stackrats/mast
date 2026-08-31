@@ -90,6 +90,13 @@ impl MastClient for LocalClient {
         Ok(self.engine.subscribe_log_captures())
     }
 
+    async fn volume_snapshots(
+        &self,
+        project: mast_contract::ProjectId,
+    ) -> Result<Vec<mast_contract::VolumeSnapshot>, ClientError> {
+        self.engine.volume_snapshots(&project).await.map_err(ClientError::from)
+    }
+
     async fn subscribe_usage(&self) -> Result<mast_client::UsageStream, ClientError> {
         Ok(self.engine.subscribe_usage())
     }

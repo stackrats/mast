@@ -43,8 +43,26 @@ export interface PaletteItem {
 export function buildPalette(
   projects: ProjectSummary[],
   workspaces: WorkspaceSummary[],
+  attention: Record<string, string[]> = {},
 ): PaletteItem[] {
   const items: PaletteItem[] = [];
+
+  // What happened while you were elsewhere, first: the palette's whole job
+  // is "take me to the thing", and a project with an unread marker is the
+  // likeliest thing. Selecting it clears the marker, so the group drains
+  // itself.
+  for (const p of projects) {
+    const titles = attention[p.id];
+    if (!titles?.length) continue;
+    items.push({
+      id: `attention:${p.id}`,
+      title: p.name,
+      hint: titles[titles.length - 1],
+      group: "Needs attention",
+      keywords: `attention while away ${titles.join(" ")}`,
+      effect: { kind: "select", id: p.id },
+    });
+  }
 
   for (const p of projects) {
     items.push({
@@ -93,6 +111,10 @@ export function buildPalette(
     items.push(open("Files", { type: "revealInFileManager", id: p.id }, "finder explorer reveal"));
     if (p.appUrl) {
       items.push(open("Browser", { type: "openInBrowser", id: p.id }, `web url ${p.appUrl}`));
+    }
+    // The REPL execs into the app container, so only a project that has one.
+    if (p.isSail && (p.status === "running" || p.status === "degraded")) {
+      items.push(open("Tinker", { type: "openTinker", id: p.id }, "artisan repl php console"));
     }
   }
 

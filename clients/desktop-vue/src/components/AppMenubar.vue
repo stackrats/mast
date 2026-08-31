@@ -137,7 +137,7 @@ async function closeToTray() {
             :class="itemClass"
             @click="select(() => emit('openPalette'))"
           >
-            Command palette…
+            Commands…
             <span :class="accelClass">{{ paletteAccel }}</span>
           </button>
           <div :class="separatorClass" />

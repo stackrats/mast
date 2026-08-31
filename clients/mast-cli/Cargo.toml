@@ -17,4 +17,5 @@ mast-client-ipc.workspace = true
 mast-daemon.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures.workspace = true
+serde_json.workspace = true
 tokio.workspace = true

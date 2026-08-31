@@ -550,3 +550,70 @@ describe("log captures", () => {
     expect(dispatchMock).toHaveBeenCalledWith({ type: "clearLogCaptures" }, expect.any(Function));
   });
 });
+
+describe("attention markers", () => {
+  const summary = (id: string) =>
+    ({
+      id,
+      name: id,
+      path: `/code/${id}`,
+      status: "running",
+      composeProjectName: id,
+      isSail: true,
+      services: [],
+      resolutionError: null,
+      warnings: [],
+      commands: [],
+      processes: [],
+      gitBranch: null,
+      gitDirty: null,
+    }) as never;
+
+  it("a failed operation marks its project until the user visits it", async () => {
+    let emit: ((event: OperationEvent) => void) | null = null;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 7;
+    });
+    const store = useEngineStore();
+    store.projects = [summary("p1")];
+    // The command key carries the project id as its prefix — the marker must
+    // land on the project, not on the op-slot string.
+    await store.runLifecycle("p1:cmd:dev", "dev", {
+      type: "runProjectCommand",
+      id: "p1",
+      name: "dev",
+    });
+    emit!({ operation: 7, kind: { type: "failed", error: "exit 1" } });
+
+    expect(store.attentionFor("p1")).toEqual(["dev failed"]);
+    // Visiting clears it; a toast that was never seen cannot.
+    store.clearAttention("p1");
+    expect(store.attentionFor("p1")).toEqual([]);
+  });
+
+  it("keeps only the newest three titles per project", () => {
+    const store = useEngineStore();
+    store.projects = [summary("p1")];
+    for (const n of [1, 2, 3, 4]) store.noteAttention("p1", `event ${n}`);
+    expect(store.attentionFor("p1")).toEqual(["event 2", "event 3", "event 4"]);
+  });
+
+  it("keys that belong to no project mark nothing", () => {
+    const store = useEngineStore();
+    store.projects = [summary("p1")];
+    expect(store.projectOfOpKey("new:scaffold")).toBeNull();
+    expect(store.projectOfOpKey("p1:share")).toBe("p1");
+    expect(store.projectOfOpKey("p1")).toBe("p1");
+  });
+
+  it("a health transition marks the project", () => {
+    const store = useEngineStore();
+    store.applyPatch({ seq: 1, event: { type: "projectAdded", project: summary("p1") } });
+    store.applyPatch({
+      seq: 2,
+      event: { type: "projectStatusChanged", id: "p1", status: "degraded" },
+    });
+    expect(store.attentionFor("p1")).toEqual(["went degraded"]);
+  });
+});

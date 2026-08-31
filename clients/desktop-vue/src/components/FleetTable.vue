@@ -126,13 +126,24 @@ const cellClass = "px-3 py-2 text-sm";
           >
             <td :class="cellClass">
               <span class="flex min-w-0 items-center gap-2">
-                <span
-                  class="h-2 w-2 shrink-0 rounded-full"
-                  :class="statusDot[row.project.status]"
-                />
+                <!-- The word behind the colour, for anyone the hue excludes. -->
+                <Tooltip :text="row.project.status">
+                  <span
+                    class="h-2 w-2 shrink-0 rounded-full"
+                    :class="statusDot[row.project.status]"
+                  />
+                </Tooltip>
                 <span class="truncate text-slate-900 dark:text-slate-100">
                   {{ row.project.name }}
                 </span>
+                <!-- Something happened here while you were elsewhere; the dot
+                     stays until you open the project. -->
+                <Tooltip
+                  v-if="store.attentionFor(row.project.id).length"
+                  :text="`While you were away: ${store.attentionFor(row.project.id).join(' · ')}`"
+                >
+                  <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
+                </Tooltip>
                 <Tooltip
                   v-if="row.quiet"
                   :text="`Under ${QUIET_CORES_PER_CONTAINER} cores per container (${formatCores(QUIET_CORES_PER_CONTAINER * row.containers)} across its ${row.containers}) for the last ${quietWindow}. Still running — nothing has been stopped.`"
@@ -159,7 +170,7 @@ const cellClass = "px-3 py-2 text-sm";
                 :aria-label="`Stop ${row.project.name}`"
                 @click.stop="stop(row.project.id)"
               >
-                <CircleStop class="h-3.5 w-3.5" />
+                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
                 Stop
               </Button>
             </td>
