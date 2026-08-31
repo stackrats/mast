@@ -58,6 +58,7 @@ pub const REPAIR_MIGRATE_MAILPIT: &str = "migrate-mailpit";
 pub const REPAIR_SET_PROJECT_NAME: &str = "set-project-name";
 pub const REPAIR_HOSTS_ENTRY: &str = "add-hosts-entry";
 pub const REPAIR_DISCONNECT_STALE: &str = "disconnect-stale-endpoints";
+pub const REPAIR_STOP_STALE_DEV: &str = "stop-stale-dev-servers";
 pub const REPAIR_STORAGE_WRITABLE: &str = "storage-writable";
 pub const REPAIR_PHP_AS_ROOT: &str = "php-as-root";
 pub const REPAIR_TRUST_PROXY_CA: &str = "trust-proxy-ca";
@@ -472,6 +473,21 @@ pub fn repair_spec(id: &str, arg: Option<&str>) -> Option<RepairSpec> {
                           images are untouched."
                 .into(),
             arg: arg.map(String::from),
+        }),
+        REPAIR_STOP_STALE_DEV => Some(RepairSpec {
+            id: REPAIR_STOP_STALE_DEV,
+            title: "Stop the leftover dev-server processes".into(),
+            risk: RiskTier::Caution,
+            description: "SIGTERMs every process in the app container whose command line \
+                          matches the dev stack — vite, the multiplex/concurrently \
+                          runner, `npm run dev`, `artisan serve`, `artisan pail` — the \
+                          copies a cancelled or crashed dev command leaves holding its \
+                          ports (stopping the host-side client never stops them). The \
+                          preview lists the exact processes. Nothing else in the \
+                          container is touched, and no data is; start the dev command \
+                          again afterwards."
+                .into(),
+            arg: None,
         }),
         REPAIR_NODE_INSTALL => Some(RepairSpec {
             id: REPAIR_NODE_INSTALL,

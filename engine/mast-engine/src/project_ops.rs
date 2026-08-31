@@ -202,6 +202,7 @@ impl Engine {
                     app_port: None,
                     host_ports: Vec::new(),
                     compose_fingerprint: None,
+                    manifest: crate::manifest::Manifest::default(),
                 };
                 events.push(PatchEvent::ProjectAdded { project: entry.summary.clone() });
                 st.projects.insert(entry.record.id.clone(), entry);
@@ -232,16 +233,7 @@ impl Engine {
             "meilisearch", "typesense", "minio", "rustfs", "mailpit", "rabbitmq", "selenium",
             "soketi",
         ];
-        let valid_name = !name.is_empty()
-            && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-        if !valid_name {
-            return Err(ErrorInfo::InvalidInput {
-                message: "project name must be lowercase letters, digits, - or _".into(),
-            });
-        }
+        let target = new_project_target(parent, name)?;
         // Runtimes Sail ships in vendor/laravel/sail/runtimes.
         if !["80", "81", "82", "83", "84", "85"].contains(&php) {
             return Err(ErrorInfo::InvalidInput { message: format!("unsupported PHP series {php}") });
@@ -267,18 +259,6 @@ impl Engine {
         build_services.sort_by_key(|s| ALLOWED_SERVICES.iter().position(|a| a == &s.as_str()));
         build_services.dedup();
 
-        let parent_dir = PathBuf::from(parent);
-        if !parent_dir.is_dir() {
-            return Err(ErrorInfo::InvalidInput {
-                message: format!("{parent} is not a directory"),
-            });
-        }
-        let target = parent_dir.join(name);
-        if target.exists() {
-            return Err(ErrorInfo::InvalidInput {
-                message: format!("{} already exists", target.display()),
-            });
-        }
         if !self.inner.state.lock().unwrap().docker.available {
             return Err(ErrorInfo::InvalidInput {
                 message: "docker is not reachable — the installer runs in a container".into(),
@@ -320,7 +300,7 @@ impl Engine {
                     stderr: false,
                 },
             );
-            let mut create = composer_run(&parent_dir, None);
+            let mut create = composer_run(&PathBuf::from(parent), None);
             create.extend(
                 ["create-project", "laravel/laravel", name, "--no-interaction"].map(String::from),
             );
@@ -763,26 +743,25 @@ impl Engine {
         project: &ProjectId,
         name: &str,
     ) -> Result<(), ErrorInfo> {
-        let (path, redactor, command, cwd, invocation) = {
+        let (path, redactor, cmd, invocation) = {
             let st = self.inner.state.lock().unwrap();
             let entry = st
                 .projects
                 .get(&project.0)
                 .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            // The summary's list is the merged view — saved commands plus
+            // whatever the committed mast.yml contributes.
             let cmd = entry
-                .record
+                .summary
                 .commands
                 .iter()
                 .find(|c| c.name == name)
+                .cloned()
                 .ok_or(ErrorInfo::NotFound { what: format!("command \"{name}\"") })?;
-            (
-                entry.record.path.clone(),
-                entry.redactor.clone(),
-                cmd.command.clone(),
-                cmd.cwd.clone(),
-                entry.invocation.clone(),
-            )
+            (entry.record.path.clone(), entry.redactor.clone(), cmd, entry.invocation.clone())
         };
+        let command = cmd.command.clone();
+        let cwd = cmd.cwd.clone();
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
@@ -858,9 +837,77 @@ impl Engine {
                 stderr: false,
             },
         );
+        if cmd.auto_restart || !cmd.restart_when_changed.is_empty() {
+            return self.supervise_command(handle, op, &cmd, &argv, &run_dir, &redactor).await;
+        }
         // A week ≈ unbounded: dev servers run until the user stops them.
         self.run_streamed_command(handle, op, &argv, Some(&run_dir), &redactor, Duration::from_secs(7 * 24 * 3600))
             .await
+    }
+
+    /// Move the project's saved commands into a committed `mast.yml`. After
+    /// the export a command lives in exactly one place: the file the repo
+    /// carries. The saved list is cleared — leaving copies behind would make
+    /// every later edit a question of which one wins.
+    pub(crate) async fn export_project_manifest(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        project: &ProjectId,
+    ) -> Result<(), ErrorInfo> {
+        let (dir, saved) = {
+            let st = self.inner.state.lock().unwrap();
+            let entry = st
+                .projects
+                .get(&project.0)
+                .ok_or(ErrorInfo::NotFound { what: format!("project {}", project.0) })?;
+            (entry.record.path.clone(), crate::commands_to_contract(&entry.record))
+        };
+        if saved.is_empty() {
+            return Err(ErrorInfo::InvalidInput {
+                message: "no saved commands to share — add one first".into(),
+            });
+        }
+        if let Some(existing) = crate::manifest::manifest_path(&dir) {
+            return Err(ErrorInfo::InvalidInput {
+                message: format!(
+                    "{} already exists — add your commands there directly",
+                    existing.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            });
+        }
+        let path = dir.join(crate::manifest::MANIFEST_NAMES[0]);
+        let body = crate::manifest::render(&saved);
+        let result = std::fs::write(&path, &body)
+            .map_err(|e| ErrorInfo::Internal { message: format!("cannot write mast.yml: {e}") });
+        self.record_config_write(
+            &path,
+            saved.iter().map(|c| format!("{}: {}", c.name, c.command)).collect(),
+            &result,
+        );
+        result?;
+        let all = self.with_state(|st, events| {
+            if let Some(entry) = st.projects.get_mut(&project.0) {
+                entry.record.commands.clear();
+                entry.manifest = crate::manifest::parse(&body);
+                entry.summary.commands = entry.manifest.commands.clone();
+                events.push(PatchEvent::ProjectUpdated { project: entry.summary.clone() });
+            }
+            st.projects.values().map(|e| e.record.clone()).collect::<Vec<_>>()
+        });
+        self.inner.deps.store.save_projects(&all).map_err(internal_err)?;
+        self.emit_op(
+            handle,
+            op,
+            OperationEventKind::Output {
+                line: format!(
+                    "wrote {} — commit it and every clone of this repo gets these commands",
+                    path.display()
+                ),
+                stderr: false,
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn dispatch_lifecycle(
@@ -1450,6 +1497,160 @@ impl crate::Engine {
             manage_blocked,
         })
     }
+
+    /// Clone a repository and make it a working Mast project: the
+    /// team-onboarding mirror of [`Engine::create_project`]. Bootstrap runs
+    /// only where a fresh clone is actually missing something — vendor/,
+    /// .env, APP_KEY — and never edits files the repository committed:
+    /// those belong to the team, and the diagnostics doctors already handle
+    /// their drift.
+    pub(crate) async fn clone_project(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        url: &str,
+        parent: &str,
+        name: &str,
+    ) -> Result<(), ErrorInfo> {
+        let url = url.trim();
+        if let Some(problem) = clone_url_problem(url) {
+            return Err(ErrorInfo::InvalidInput { message: problem });
+        }
+        let target = new_project_target(parent, name)?;
+        let redactor = Redactor::default();
+        let emit = |line: String| {
+            self.emit_op(handle, op, OperationEventKind::Output { line, stderr: false });
+        };
+
+        emit(format!("cloning into {}", target.display()));
+        let clone: Vec<String> = [
+            "git",
+            "clone",
+            "--recurse-submodules",
+            url,
+            &target.to_string_lossy(),
+        ]
+        .map(String::from)
+        .into();
+        self.run_streamed_command(
+            handle,
+            op,
+            &clone,
+            None,
+            &redactor,
+            Duration::from_secs(30 * 60),
+        )
+        .await?;
+
+        // Compose interpolates `.env` too, so the copy is not Laravel-only.
+        let env_path = target.join(".env");
+        if !env_path.exists() && target.join(".env.example").is_file() {
+            let result = std::fs::copy(target.join(".env.example"), &env_path)
+                .map(|_| ())
+                .map_err(|e| ErrorInfo::Internal { message: format!("cannot create .env: {e}") });
+            self.record_file_write(
+                &format!("Clone {name}"),
+                None,
+                &env_path.to_string_lossy(),
+                vec!["created .env as a copy of .env.example".into()],
+                result.as_ref().err().map(|e| e.to_string()),
+            );
+            result?;
+            emit("created .env from .env.example".into());
+        }
+
+        // The rest of the bootstrap is Laravel-shaped and skipped wholesale
+        // otherwise — a cloned plain compose project needs none of it.
+        if target.join("composer.json").is_file() {
+            let (uid, gid) = crate::diagnostics::uid_gid();
+            if !target.join("vendor").is_dir() {
+                emit("composer install, containerized — first run pulls the image".into());
+                let argv = crate::diagnostics::composer_install_argv(&target, uid, gid);
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&target),
+                    &redactor,
+                    Duration::from_secs(30 * 60),
+                )
+                .await?;
+            }
+            let needs_key = env_path.is_file()
+                && mast_compose::parse_env_file(&env_path)
+                    .get("APP_KEY")
+                    .is_none_or(|key| key.trim().is_empty());
+            if needs_key && target.join("artisan").is_file() {
+                emit("generating the app key".into());
+                let argv = crate::diagnostics::artisan_key_generate_argv(&target, uid, gid);
+                self.run_streamed_command(
+                    handle,
+                    op,
+                    &argv,
+                    Some(&target),
+                    &redactor,
+                    Duration::from_secs(5 * 60),
+                )
+                .await?;
+            }
+        }
+
+        self.import_project_at(target).await?;
+        emit(format!(
+            "{name} cloned and imported — anything still missing (Sail itself, node modules) \
+             shows up in Diagnostics with a one-click fix"
+        ));
+        Ok(())
+    }
+}
+
+/// Where a new project may land: an existing parent directory, a name that
+/// is a safe compose project name, a path nothing occupies yet. Shared by
+/// the create and clone wizards so the two cannot drift.
+fn new_project_target(parent: &str, name: &str) -> Result<PathBuf, ErrorInfo> {
+    let valid_name = !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !valid_name {
+        return Err(ErrorInfo::InvalidInput {
+            message: "project name must be lowercase letters, digits, - or _".into(),
+        });
+    }
+    let parent_dir = PathBuf::from(parent);
+    if !parent_dir.is_dir() {
+        return Err(ErrorInfo::InvalidInput { message: format!("{parent} is not a directory") });
+    }
+    let target = parent_dir.join(name);
+    if target.exists() {
+        return Err(ErrorInfo::InvalidInput {
+            message: format!("{} already exists", target.display()),
+        });
+    }
+    Ok(target)
+}
+
+/// Why a clone URL is refused, or None when it can run. Effect history
+/// records every argv verbatim and forever, so an http(s) URL carrying
+/// credentials must never reach `git clone`. SSH forms keep their user part
+/// — `git@github.com:…` names an account, not a secret.
+fn clone_url_problem(url: &str) -> Option<String> {
+    if url.is_empty() || url.chars().any(char::is_whitespace) {
+        return Some("that does not look like a git URL".into());
+    }
+    let http_host = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next());
+    if http_host.is_some_and(|host| host.contains('@')) {
+        return Some(
+            "credentials embedded in the URL would be recorded in effect history — clone over \
+             SSH or set up a git credential helper instead"
+                .into(),
+        );
+    }
+    None
 }
 
 pub(crate) fn app_service_of(dir: &Path) -> String {
@@ -1623,5 +1824,20 @@ mod tests {
         assert_eq!(&argv[exec_at..], ["exec", "-T", "app", "npm", "run", "dev"]);
 
         assert!(sail_fallback_argv(&inv, "app", &[]).is_none());
+    }
+
+    /// Effect history records argv verbatim, forever — an http(s) token in
+    /// the URL must be refused, while SSH user parts (an account name, not a
+    /// secret) and local paths pass.
+    #[test]
+    fn clone_urls_with_embedded_credentials_are_refused() {
+        let refusal = clone_url_problem("https://x-token:ghp_abc@github.com/acme/shop.git");
+        assert!(refusal.unwrap().contains("credential"));
+        assert!(clone_url_problem("").is_some());
+        assert!(clone_url_problem("https://github .com/x").is_some());
+        assert!(clone_url_problem("git@github.com:acme/shop.git").is_none());
+        assert!(clone_url_problem("https://github.com/acme/shop.git").is_none());
+        assert!(clone_url_problem("ssh://git@host/acme/shop.git").is_none());
+        assert!(clone_url_problem("/home/dev/bare-repo").is_none());
     }
 }

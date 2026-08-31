@@ -229,10 +229,12 @@ async fn reconcile(engine: &Engine) {
     // Content hash of the compose files at resolution time — the model must
     // refresh on in-place edits, which change no part of the invocation.
     let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
+    // The committed mast.yml's contribution (commands + its own warnings).
+    let mut manifests: HashMap<String, crate::manifest::Manifest> = HashMap::new();
     for (id, dir) in &project_dirs {
         let env = process_env.clone();
         let dir = dir.clone();
-        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php) =
+        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php, manifest) =
             tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
@@ -284,6 +286,7 @@ async fn reconcile(engine: &Engine) {
                     (detected, app_service),
                     mast_laravel::app_url(&env),
                     crate::php::php_info(&dir),
+                    crate::manifest::read(&dir),
                 )
             })
             .await
@@ -298,6 +301,7 @@ async fn reconcile(engine: &Engine) {
                     (Vec::new(), String::new()),
                     None,
                     None,
+                    crate::manifest::Manifest::default(),
                 )
             });
         resolutions.insert(id.clone(), resolved);
@@ -309,6 +313,7 @@ async fn reconcile(engine: &Engine) {
         process_infos.insert(id.clone(), procs);
         app_urls.insert(id.clone(), app_url);
         php_infos.insert(id.clone(), php);
+        manifests.insert(id.clone(), manifest);
     }
 
     // Refresh resolved models where the invocation OR the file content
@@ -476,6 +481,20 @@ async fn reconcile(engine: &Engine) {
             }
             if let Some(notice) = crash_notices.get(&id) {
                 summary.warnings.push(notice.clone());
+            }
+            if let Some(manifest) = manifests.get(&id) {
+                entry.manifest = manifest.clone();
+            }
+            summary.commands = crate::manifest::merged(
+                &entry.manifest.commands,
+                &crate::commands_to_contract(&entry.record),
+            );
+            summary.warnings.extend(entry.manifest.warnings.iter().cloned());
+            // Saved commands were validated when saved, so a merged view that
+            // cannot run implicates the manifest — someone else's commit, and
+            // therefore a warning rather than a project that refuses to load.
+            if let Err(message) = crate::commands::check_order(&summary.commands) {
+                summary.warnings.push(format!("mast.yml: {message}"));
             }
             if let Some((branch, dirty)) = git_infos.get(&id) {
                 summary.git_branch = branch.clone();
@@ -747,6 +766,7 @@ fn build_services(
                 ui_url,
                 db_port,
                 orphaned: false,
+                data_volumes: declared.volumes.clone(),
             });
         }
     }
@@ -770,6 +790,7 @@ fn build_services(
                 // Without one (resolution failed) nothing can be said about
                 // membership, so it stays a plain service.
                 orphaned: model.is_some(),
+                data_volumes: Vec::new(),
             });
         }
     }

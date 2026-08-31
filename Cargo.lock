@@ -2444,6 +2444,7 @@ dependencies = [
  "mast-daemon",
  "mast-engine",
  "mast-project",
+ "serde_json",
  "tokio",
 ]
 
@@ -2589,6 +2590,7 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
+ "glob",
  "libc",
  "mast-compose",
  "mast-contract",
@@ -2601,6 +2603,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rusqlite",
+ "saphyr",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

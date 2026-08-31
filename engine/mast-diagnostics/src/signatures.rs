@@ -8,7 +8,10 @@
 
 pub struct ErrorSignature {
     pub id: &'static str,
-    /// Any of these substrings in an output line marks the signature.
+    /// Any of these substrings in an output line marks the signature. A
+    /// needle may contain one `*`, matching any run of characters between
+    /// its halves — for the tool output that embeds a varying number in the
+    /// middle of an otherwise exact sentence ("Port 5173 is already in use").
     pub needles: &'static [&'static str],
     /// What actually went wrong, in the user's terms.
     pub explanation: &'static str,
@@ -101,6 +104,22 @@ pub const SIGNATURES: &[ErrorSignature] = &[
                       be used to initialize the container",
         advice: "set DB_USERNAME to a non-root name in .env (root exists anyway)",
         repair: None,
+    },
+    // Must precede "port-taken": a Node `listen EADDRINUSE: address already
+    // in use` line contains that signature's needle too, and the remedies
+    // differ — this conflict is inside the container, where moving the
+    // project's HOST ports cannot reach.
+    ErrorSignature {
+        id: "dev-port-held",
+        needles: &["Port * is already in use", "EADDRINUSE"],
+        explanation: "the port this dev server needs is already held in its own network \
+                      namespace — for a containerized dev command, almost always by a \
+                      previous copy of the same command still running: cancelling it only \
+                      stops the host-side client, and the processes it started inside the \
+                      container live on",
+        advice: "stop the leftover dev-server processes, then start the command once — a \
+                 stacked second copy also duplicates every worker pane it manages",
+        repair: Some(crate::REPAIR_STOP_STALE_DEV),
     },
     ErrorSignature {
         id: "port-taken",
@@ -257,7 +276,19 @@ pub const SIGNATURES: &[ErrorSignature] = &[
 pub fn classify_line(line: &str) -> Option<&'static ErrorSignature> {
     SIGNATURES
         .iter()
-        .find(|sig| sig.needles.iter().any(|needle| line.contains(needle)))
+        .find(|sig| sig.needles.iter().any(|needle| needle_matches(line, needle)))
+}
+
+/// Plain substring containment, except that one `*` in the needle matches
+/// any run of characters between its halves. Every occurrence of the prefix
+/// is tried, so text before the real match cannot hide it.
+fn needle_matches(line: &str, needle: &str) -> bool {
+    match needle.split_once('*') {
+        None => line.contains(needle),
+        Some((prefix, suffix)) => line
+            .match_indices(prefix)
+            .any(|(at, _)| line[at + prefix.len()..].contains(suffix)),
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +306,13 @@ mod tests {
             ("[ERROR] [Entrypoint]: MYSQL_USER=\"root\", MYSQL_PASSWORD cannot be used", "mysql-root-user"),
             ("Error starting userland proxy: listen tcp4 0.0.0.0:80: bind: address already in use", "port-taken"),
             ("Bind for 0.0.0.0:3306 failed: port is already allocated", "port-taken"),
+            // Vite with laravel-vite-plugin's strictPort, verbatim from a
+            // crash-looping `vp dev` whose port a leftover stack still held.
+            ("Error: Port 5178 is already in use", "dev-port-held"),
+            // The Node shape of the same conflict: EADDRINUSE outranks
+            // port-taken's "address already in use", because this bind
+            // failed inside the container, not at the docker port publish.
+            ("Error: listen EADDRINUSE: address already in use :::5178", "dev-port-held"),
             ("write /var/lib/docker/tmp: no space left on device", "disk-full"),
             ("network mast-shared declared as external, but could not be found", "external-network-missing"),
             ("Error response from daemon: failed to set up container networking: network 8b642960cbae7f54c2fb658dfb37a600da5364f2f2fa45038538c38c7cd0fed3 not found", "stale-container-network"),
@@ -308,6 +346,24 @@ mod tests {
         }
     }
 
+    /// The wildcard needle is why the daemon's container-NAME conflict — a
+    /// real failure with a different remedy — does not read as a port
+    /// conflict: "is already in use" alone would have matched it.
+    #[test]
+    fn a_container_name_conflict_is_not_a_dev_port_conflict() {
+        let line = "Error response from daemon: Conflict. The container name \"/mysql\" \
+                    is already in use by container \"3fae2a...\". You have to remove (or \
+                    rename) that container to be able to reuse that name.";
+        assert!(classify_line(line).is_none(), "mislabeled: {line}");
+        // And the halves only match in order — a suffix seen before the
+        // prefix is not the sentence the needle spells.
+        assert!(!needle_matches("is already in use — Port", "Port * is already in use"));
+        assert!(needle_matches(
+            "Ports ok; retrying. Error: Port 5178 is already in use",
+            "Port * is already in use"
+        ));
+    }
+
     #[test]
     fn repair_args_extract_from_the_matched_line() {
         let net = classify_line("network mast-shared declared as external, but could not be found")
@@ -328,6 +384,12 @@ mod tests {
         let port = classify_line("bind: address already in use").unwrap();
         assert_eq!(port.repair, Some(crate::REPAIR_REASSIGN_PORTS));
         assert_eq!(extract_repair_arg(port, "bind: address already in use"), None);
+
+        // The in-container twin needs no arg: the repair's target is the
+        // project's app service, not anything named on the line.
+        let dev = classify_line("Error: Port 5178 is already in use").unwrap();
+        assert_eq!(dev.repair, Some(crate::REPAIR_STOP_STALE_DEV));
+        assert_eq!(extract_repair_arg(dev, "Error: Port 5178 is already in use"), None);
 
         // The fresh-project stalls map to their containerized installs.
         let vendor = classify_line(

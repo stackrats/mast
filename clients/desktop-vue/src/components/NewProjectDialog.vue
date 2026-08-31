@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { FolderOpen, Sparkles } from "lucide-vue-next";
+import { computed, ref, watch } from "vue";
+import { FolderOpen, GitBranch, Sparkles } from "lucide-vue-next";
 
 import { pickDirectory } from "../lib/transport";
 import { createKey, useEngineStore } from "../stores/engine";
@@ -14,10 +14,16 @@ import Tooltip from "./ui/Tooltip.vue";
 const open = defineModel<boolean>("open", { default: false });
 const store = useEngineStore();
 
+// Two ways in, one dialog: scaffold something new, or clone what the team
+// already has. Both end the same way — a project in the sidebar.
+const mode = ref<"create" | "clone">("create");
 const name = ref("");
 const parent = ref("");
 const php = ref("85");
 const selected = ref<Set<string>>(new Set(["mysql", "redis", "mailpit"]));
+const gitUrl = ref("");
+/** True once the user edits the name by hand; the URL stops driving it. */
+const namedManually = ref(false);
 
 // Sail's own service list (InteractsWithDockerComposeServices).
 const SERVICES = [
@@ -47,7 +53,31 @@ const usesSqlite = computed(() => !RELATIONAL.some((db) => selected.value.has(db
 
 const parentChoices = computed(() => store.watchedDirectories);
 const nameValid = computed(() => /^[a-z0-9][a-z0-9-_]*$/.test(name.value));
-const canCreate = computed(() => nameValid.value && parent.value.trim() !== "");
+const canSubmit = computed(
+  () =>
+    nameValid.value &&
+    parent.value.trim() !== "" &&
+    (mode.value === "create" || gitUrl.value.trim() !== ""),
+);
+
+/** The repo's own name, made safe for a project directory — what the name
+ * field wants to be until the user says otherwise. */
+function nameFromUrl(url: string): string {
+  const tail = url
+    .trim()
+    .replace(/\.git\/?$/, "")
+    .split(/[/:]/)
+    .filter(Boolean)
+    .pop();
+  return (tail ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]/g, "-")
+    .replace(/^[-_]+/, "");
+}
+
+watch(gitUrl, (url) => {
+  if (!namedManually.value) name.value = nameFromUrl(url);
+});
 
 /** Fill the parent from a native picker; the watched-directory chips stay as shortcuts. */
 async function browseParent() {
@@ -62,41 +92,71 @@ function toggle(service: string) {
   selected.value = next;
 }
 
-/// Scaffolding pulls images and a whole dependency tree, so it runs as a
-/// background operation: the dialog closes immediately and progress shows up
-/// in the logs panel, like every other long-running verb.
-function create() {
+/// Scaffolding and cloning both pull images or dependency trees, so they run
+/// as background operations: the dialog closes immediately and progress
+/// shows up in the logs panel, like every other long-running verb.
+function submit() {
   const projectName = name.value.trim();
-  void store.runLifecycle(createKey(projectName), `create ${projectName}`, {
-    type: "createProject",
-    parent: parent.value.trim(),
-    name: projectName,
-    php: php.value,
-    services: [...selected.value],
-  });
+  if (mode.value === "create") {
+    void store.runLifecycle(createKey(projectName), `create ${projectName}`, {
+      type: "createProject",
+      parent: parent.value.trim(),
+      name: projectName,
+      php: php.value,
+      services: [...selected.value],
+    });
+  } else {
+    void store.runLifecycle(createKey(projectName), `clone ${projectName}`, {
+      type: "cloneProject",
+      url: gitUrl.value.trim(),
+      parent: parent.value.trim(),
+      name: projectName,
+    });
+  }
   open.value = false;
   name.value = "";
+  gitUrl.value = "";
+  namedManually.value = false;
 }
 </script>
 
 <template>
-  <Modal v-model:open="open" title="New Laravel project" wide>
+  <Modal v-model:open="open" title="Add a project" wide>
     <div class="space-y-3">
-      <p class="flex items-start gap-2 text-xs text-slate-500 dark:text-slate-400">
-        <Sparkles class="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+      <div class="flex gap-1.5">
+        <Chip :active="mode === 'create'" @click="mode = 'create'">
+          <Sparkles class="h-3 w-3" /> Create new
+        </Chip>
+        <Chip :active="mode === 'clone'" @click="mode = 'clone'">
+          <GitBranch class="h-3 w-3" /> From Git
+        </Chip>
+      </div>
+
+      <p v-if="mode === 'create'" class="text-xs text-slate-500 dark:text-slate-400">
         Runs the documented Sail install — composer create-project, then artisan sail:install — in
         the official composer container, and imports the result. No local PHP needed.
       </p>
+      <p v-else class="text-xs text-slate-500 dark:text-slate-400">
+        Clones the repository and bootstraps whatever a fresh clone is missing — containerized
+        composer install, <span class="font-mono">.env</span> from
+        <span class="font-mono">.env.example</span>, an app key — then imports it. Committed
+        <span class="font-mono">mast.yml</span> commands arrive with it.
+      </p>
+
+      <label v-if="mode === 'clone'" class="block text-xs text-slate-600 dark:text-slate-300">
+        Repository URL
+        <Input v-model="gitUrl" placeholder="git@github.com:acme/shop.git" mono class="mt-1" />
+      </label>
 
       <div class="grid grid-cols-2 gap-2">
         <label class="text-xs text-slate-600 dark:text-slate-300">
           Project name
-          <Input v-model="name" placeholder="my-app" class="mt-1" />
+          <Input v-model="name" placeholder="my-app" class="mt-1" @input="namedManually = true" />
           <span v-if="name && !nameValid" class="text-red-600">
             lowercase letters, digits, - and _ only
           </span>
         </label>
-        <label class="text-xs text-slate-600 dark:text-slate-300">
+        <label v-if="mode === 'create'" class="text-xs text-slate-600 dark:text-slate-300">
           PHP
           <Select
             v-model="php"
@@ -107,7 +167,7 @@ function create() {
       </div>
 
       <div class="text-xs text-slate-600 dark:text-slate-300">
-        Create inside
+        {{ mode === "create" ? "Create inside" : "Clone inside" }}
         <div class="mt-1 flex gap-2">
           <Input v-model="parent" placeholder="/home/you/projects" />
           <Tooltip text="Choose a directory.">
@@ -129,7 +189,7 @@ function create() {
         </span>
       </div>
 
-      <div class="text-xs text-slate-600 dark:text-slate-300">
+      <div v-if="mode === 'create'" class="text-xs text-slate-600 dark:text-slate-300">
         Services
         <div class="mt-1 flex flex-wrap gap-1.5">
           <Chip
@@ -154,7 +214,9 @@ function create() {
 
       <div class="flex justify-end gap-2">
         <Button variant="outline" @click="open = false">Close</Button>
-        <Button :disabled="!canCreate || store.readOnly" @click="create">Create project</Button>
+        <Button :disabled="!canSubmit || store.readOnly" @click="submit">
+          {{ mode === "create" ? "Create project" : "Clone project" }}
+        </Button>
       </div>
     </div>
   </Modal>

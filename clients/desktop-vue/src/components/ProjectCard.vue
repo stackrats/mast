@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import {
+  Archive,
   Camera,
   ChartColumn,
   Check,
   ChevronDown,
+  CircleStop,
   Copy,
   Cpu,
   Database,
@@ -23,7 +25,7 @@ import {
   RotateCw,
   ScrollText,
   Share2,
-  Square,
+  SquareCode,
   SquareTerminal,
   Stethoscope,
   Trash2,
@@ -57,7 +59,9 @@ import { formatElapsed, useElapsed } from "../lib/elapsed";
 import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
 import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
+import DataSnapshotsDialog from "./DataSnapshotsDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
+import AnsiText from "./ui/AnsiText.vue";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
 import Checkbox from "./ui/Checkbox.vue";
@@ -85,6 +89,15 @@ const opRunning = computed(() => op.value != null && op.value.terminal === null)
  * itself will not thank you for a `stop` landing mid-`up`. Folded into the
  * same guard as read-only so every control asks the question once. */
 const locked = computed(() => store.readOnly || opRunning.value);
+
+/** Tinker execs into the app container, so it needs one to exist. */
+const tinkerReady = computed(() => project.status === "running" || project.status === "degraded");
+
+/** A trace named a file; open it at that line. The engine re-checks that the
+ * path stays inside the project. */
+function openTraceFile(file: string, line: number | null) {
+  void store.run({ type: "openProjectFile", id: project.id, file, line });
+}
 
 const elapsed = useElapsed(
   computed(() => (opRunning.value ? (op.value?.startedAt ?? null) : null)),
@@ -357,6 +370,14 @@ function toggleAppLogRow(i: number) {
 // from .env — everything a GUI client asks for, without grepping compose
 // files. Fetched on open so it is never stale. ---
 const connService = ref<ServiceState | null>(null);
+/** The service whose data-snapshots dialog is open, or null. */
+const snapshotsService = ref<ServiceState | null>(null);
+const snapshotsOpen = computed({
+  get: () => snapshotsService.value != null,
+  set: (value: boolean) => {
+    if (!value) snapshotsService.value = null;
+  },
+});
 const connOpen = computed({
   get: () => connService.value != null,
   set: (open: boolean) => {
@@ -474,6 +495,8 @@ const newAuto = ref(false);
 const newCwd = ref("");
 const newAfter = ref("");
 const newReadyWhen = ref("");
+const newAutoRestart = ref(false);
+const newRestartGlobs = ref("");
 
 function openCommandDialog(cmd?: ProjectCommand) {
   editingCommand.value = cmd?.name ?? null;
@@ -483,7 +506,17 @@ function openCommandDialog(cmd?: ProjectCommand) {
   newCwd.value = cmd?.cwd ?? "";
   newAfter.value = cmd?.after ?? "";
   newReadyWhen.value = cmd?.readyWhen ?? "";
+  newAutoRestart.value = cmd?.autoRestart ?? false;
+  newRestartGlobs.value = (cmd?.restartWhenChanged ?? []).join(" ");
   commandDialogOpen.value = true;
+}
+
+// --- the committed manifest (mast.yml): shared commands ride the repo ---
+const hasManifestCommands = computed(() => commands.value.some((c) => c.fromManifest));
+const exportOpen = ref(false);
+async function exportManifest() {
+  await store.run({ type: "exportProjectManifest", id: project.id });
+  if (!store.error) exportOpen.value = false;
 }
 
 /** Waiting on a command that never starts is the one way to configure this
@@ -545,6 +578,9 @@ async function saveCommandForm() {
     cwd: newCwd.value.trim() || null,
     after: (newAuto.value && newAfter.value.trim()) || null,
     readyWhen: newReadyWhen.value.trim() || null,
+    autoRestart: newAutoRestart.value,
+    restartWhenChanged: newRestartGlobs.value.trim().split(/\s+/).filter(Boolean),
+    fromManifest: false,
   };
   const original = editingCommand.value;
   // Edited in place rather than removed and appended: the chip row is in list
@@ -669,11 +705,7 @@ async function clearAppLog() {
           </Tooltip>
           <Tooltip
             v-if="project.gitBranch"
-            :text="
-              project.gitDirty
-                ? 'Current git branch — the amber dot means uncommitted changes.'
-                : 'Current git branch — working tree is clean.'
-            "
+            :text="project.gitDirty ? 'Uncommitted changes' : 'Working tree clean'"
           >
             <!-- The one chip allowed to shrink: long branch names ellipsize
                  instead of being clipped by the row's overflow-hidden. -->
@@ -708,8 +740,8 @@ async function clearAppLog() {
             <Button variant="outline" size="sm" @click="lifecycle('restart', 'restartProject')">
               <RotateCw class="h-3.5 w-3.5" /> Restart
             </Button>
-            <Button variant="destructive" size="sm" @click="lifecycle('stop', 'stopProject')">
-              <Square class="h-3.5 w-3.5" /> Stop
+            <Button variant="outline" size="sm" @click="lifecycle('stop', 'stopProject')">
+              <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
             </Button>
           </template>
           <Tooltip
@@ -745,6 +777,25 @@ async function clearAppLog() {
           @click="store.run({ type: 'openTerminal', id: project.id })"
         >
           <SquareTerminal class="h-3.5 w-3.5" /> Terminal
+        </Button>
+      </Tooltip>
+      <!-- The REPL one click away, nothing needed on the host. Only for
+           projects with an app container to exec into. -->
+      <Tooltip
+        v-if="project.isSail"
+        :text="
+          tinkerReady
+            ? 'Open a terminal running artisan tinker in the app container.'
+            : 'artisan tinker needs the app container — start the project first.'
+        "
+      >
+        <Button
+          variant="ghost"
+          size="sm"
+          :disabled="!tinkerReady"
+          @click="store.run({ type: 'openTinker', id: project.id })"
+        >
+          <SquareCode class="h-3.5 w-3.5" /> Tinker
         </Button>
       </Tooltip>
       <Tooltip text="Open the project in your editor (configure in Settings).">
@@ -938,8 +989,15 @@ async function clearAppLog() {
               >
                 <Database class="h-3.5 w-3.5 text-slate-400" /> Connection info
               </DropdownMenuItem>
+              <DropdownMenuItem
+                v-if="service.dataVolumes?.length"
+                :class="menuItemClass"
+                @select="snapshotsService = service"
+              >
+                <Archive class="h-3.5 w-3.5 text-slate-400" /> Data snapshots
+              </DropdownMenuItem>
               <DropdownMenuSeparator
-                v-if="service.uiUrl || service.dbPort != null"
+                v-if="service.uiUrl || service.dbPort != null || service.dataVolumes?.length"
                 :class="menuSeparatorClass"
               />
               <DropdownMenuItem
@@ -987,7 +1045,7 @@ async function clearAppLog() {
                   :disabled="locked"
                   @select="serviceVerb(service.name, 'stop', 'stopService')"
                 >
-                  <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
+                  <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
                 </DropdownMenuItem>
               </template>
               <DropdownMenuItem
@@ -1130,7 +1188,7 @@ async function clearAppLog() {
                 :disabled="locked"
                 @select="processVerb(proc.id, proc.title, 'stopProcess')"
               >
-                <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
+                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenuPortal>
@@ -1143,7 +1201,7 @@ async function clearAppLog() {
       <div class="flex items-center gap-1.5">
         <p :class="rowLabelClass">Commands</p>
         <Hint
-          text="Your own commands, run on your machine in the project directory — e.g. `sail npm run dev` or `sail artisan tinker`. `auto` runs a command whenever the project comes up. Output streams into the panel below while it runs."
+          text="Your own commands, run on your machine in the project directory — e.g. `sail npm run dev` or `sail artisan tinker`. `auto` runs a command whenever the project comes up. Commands from a committed mast.yml appear here too, marked `shared` — those are edited in the file, and a saved command of the same name overrides its shared twin. Output streams into the panel below while it runs."
         />
       </div>
       <div class="mt-1.5 flex flex-wrap gap-2">
@@ -1154,11 +1212,17 @@ async function clearAppLog() {
               :tip="
                 cmd.command +
                 (cmd.cwd ? ` · in ${cmd.cwd}` : '') +
-                (cmd.autoStart ? ' · runs automatically on start' : '')
+                (cmd.autoStart ? ' · runs automatically on start' : '') +
+                (cmd.autoRestart ? ' · restarts if it dies' : '') +
+                (cmd.restartWhenChanged?.length
+                  ? ` · restarts when ${cmd.restartWhenChanged.join(' ')} change`
+                  : '') +
+                (cmd.fromManifest ? ' · shared via mast.yml' : '')
               "
             >
               {{ cmd.name }}
               <span v-if="cmd.autoStart" class="text-[10px] text-slate-400">auto</span>
+              <span v-if="cmd.fromManifest" class="text-[10px] text-slate-400">shared</span>
               <ChevronDown class="h-3 w-3 text-slate-400" />
             </Chip>
           </DropdownMenuTrigger>
@@ -1177,6 +1241,10 @@ async function clearAppLog() {
                   <template v-if="cmd.autoStart">
                     · auto<template v-if="cmd.after">, after {{ cmd.after }}</template>
                   </template>
+                  <template v-if="cmd.autoRestart"> · restarts if it dies</template>
+                  <template v-if="cmd.restartWhenChanged?.length">
+                    · restarts when {{ cmd.restartWhenChanged.join(" ") }} change
+                  </template>
                 </p>
               </div>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
@@ -1189,49 +1257,100 @@ async function clearAppLog() {
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Run
               </DropdownMenuItem>
               <DropdownMenuItem v-else :class="menuItemClass" @select="stopCommand(cmd)">
-                <Square class="h-3.5 w-3.5 text-slate-400" /> Stop
+                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
               </DropdownMenuItem>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
-              <!-- Not while it runs: the live process would keep the old line
-                   either way, and a rename would strand its output under a
-                   key nothing is listening to any more. -->
+              <!-- A shared command's definition lives in the repo's mast.yml;
+                   the file is where it is edited, and a saved command of the
+                   same name is how one person overrides it locally. -->
               <DropdownMenuItem
+                v-if="cmd.fromManifest"
                 :class="menuItemClass"
-                :disabled="locked || commandRunning(cmd.name)"
-                @select="openCommandDialog(cmd)"
+                @select="store.run({ type: 'openProjectFile', id: project.id, file: 'mast.yml' })"
               >
-                <Pencil class="h-3.5 w-3.5 text-slate-400" /> Edit
+                <Pencil class="h-3.5 w-3.5 text-slate-400" /> Edit in mast.yml
               </DropdownMenuItem>
-              <DropdownMenuItem
-                :class="menuItemClass"
-                :disabled="locked"
-                @select="
-                  saveCommands(
-                    commands.map((c) =>
-                      c.name === cmd.name ? { ...c, autoStart: !c.autoStart } : c,
-                    ),
-                  )
-                "
-              >
-                {{ cmd.autoStart ? "Disable auto-start" : "Enable auto-start" }}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                :class="menuItemClass"
-                :disabled="locked"
-                @select="saveCommands(commands.filter((c) => c.name !== cmd.name))"
-              >
-                <Trash2 class="h-3.5 w-3.5 text-slate-400" /> Delete
-              </DropdownMenuItem>
+              <template v-else>
+                <!-- Not while it runs: the live process would keep the old line
+                     either way, and a rename would strand its output under a
+                     key nothing is listening to any more. -->
+                <DropdownMenuItem
+                  :class="menuItemClass"
+                  :disabled="locked || commandRunning(cmd.name)"
+                  @select="openCommandDialog(cmd)"
+                >
+                  <Pencil class="h-3.5 w-3.5 text-slate-400" /> Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  :class="menuItemClass"
+                  :disabled="locked"
+                  @select="
+                    saveCommands(
+                      commands.map((c) =>
+                        c.name === cmd.name ? { ...c, autoStart: !c.autoStart } : c,
+                      ),
+                    )
+                  "
+                >
+                  {{ cmd.autoStart ? "Disable auto-start" : "Enable auto-start" }}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  :class="menuItemClass"
+                  :disabled="locked"
+                  @select="saveCommands(commands.filter((c) => c.name !== cmd.name))"
+                >
+                  <Trash2 class="h-3.5 w-3.5 text-slate-400" /> Delete
+                </DropdownMenuItem>
+              </template>
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>
         <Chip dashed :disabled="locked" @click="openCommandDialog()">
           <Plus class="h-3 w-3" /> Add
         </Chip>
+        <!-- Only while everything is still machine-local: once a mast.yml
+             exists, the file itself is where sharing happens. -->
+        <Chip
+          v-if="commands.length > 0 && !hasManifestCommands"
+          dashed
+          :disabled="locked"
+          tip="Move these commands into a mast.yml committed with the repo, so teammates get them on import."
+          @click="exportOpen = true"
+        >
+          <Share2 class="h-3 w-3" /> Share
+        </Chip>
       </div>
     </div>
 
+    <Modal v-model:open="exportOpen" title="Share commands via mast.yml">
+      <div class="space-y-3">
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          Writes this project's {{ commands.length }} saved command{{
+            commands.length === 1 ? "" : "s"
+          }}
+          to a new <span class="font-mono">mast.yml</span> in the project root and removes them from
+          this machine's app data — from then on the file is their home. Commit it, and everyone who
+          imports the project gets the same commands.
+        </p>
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          A command you save later under the same name overrides its shared twin, locally only.
+        </p>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="exportOpen = false">Cancel</Button>
+          <Button :disabled="locked" @click="exportManifest">
+            <Share2 class="h-3.5 w-3.5" /> Write mast.yml
+          </Button>
+        </div>
+      </div>
+    </Modal>
+
     <CatalogDialog v-model:open="catalogOpen" :project="project.id" />
+
+    <DataSnapshotsDialog
+      v-model:open="snapshotsOpen"
+      :project="project"
+      :service="snapshotsService"
+    />
 
     <Modal v-model:open="shareOpen" title="Share publicly" wide>
       <div class="space-y-3">
@@ -1348,8 +1467,8 @@ async function clearAppLog() {
             Starting the tunnel — the URL appears here as soon as expose reports it…
           </p>
           <div class="flex justify-end">
-            <Button variant="destructive" size="sm" @click="stopShare">
-              <Square class="h-3.5 w-3.5" /> Stop sharing
+            <Button variant="outline" size="sm" @click="stopShare">
+              <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop sharing
             </Button>
           </div>
         </template>
@@ -1474,7 +1593,11 @@ async function clearAppLog() {
             <pre
               v-if="entry.detail && appLogExpanded.has(i)"
               class="overflow-x-auto border-t border-slate-200 bg-slate-50 p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-slate-600 dark:border-slate-800 dark:bg-neutral-900 dark:text-slate-300"
-              >{{ `${entry.message}\n\n${entry.detail}` }}</pre>
+            ><AnsiText
+                :text="`${entry.message}\n\n${entry.detail}`"
+                file-links
+                @open-file="openTraceFile"
+              /></pre>
           </div>
         </div>
         <p v-if="appLog?.truncated" class="text-xs text-slate-400">
@@ -1789,6 +1912,19 @@ async function clearAppLog() {
             </Tooltip>
           </p>
         </div>
+        <div v-if="connUri" class="mt-3">
+          <Tooltip
+            text="Hands the URL to whatever database client registered this scheme with your desktop."
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              @click="store.run({ type: 'openDbUrl', url: connUri })"
+            >
+              <Database class="h-3.5 w-3.5" /> Open in database client
+            </Button>
+          </Tooltip>
+        </div>
         <p class="mt-3 text-xs text-slate-400">
           These are for programs on this machine — TablePlus, DBeaver, artisan run outside Sail.
           Inside the containers the app keeps using the service hostname; don't point
@@ -1884,6 +2020,20 @@ async function clearAppLog() {
             a guess — a good one for a server that prints a banner and quietens down.
           </p>
         </template>
+        <Checkbox v-model="newAutoRestart" label="Restart it if it dies" />
+        <p v-if="newAutoRestart" class="text-xs text-slate-400">
+          Any exit you didn't ask for relaunches it — what a queue worker or dev server wants. Rapid
+          exits stop the loop instead of hammering the same failure.
+        </p>
+        <label class="block text-xs text-slate-600 dark:text-slate-300">
+          Restart when files change <span class="text-slate-400">(optional)</span>
+          <Input v-model="newRestartGlobs" placeholder="app/** config/**" mono class="mt-1" />
+        </label>
+        <p v-if="newRestartGlobs.trim()" class="text-xs text-slate-400">
+          Space-separated glob patterns, relative to the working directory. A matching file change
+          stops and relaunches the running command — a queue worker never sees new code until
+          relaunched.
+        </p>
         <p v-if="commandFormError" class="text-xs text-amber-700 dark:text-amber-300">
           {{ commandFormError }}
         </p>

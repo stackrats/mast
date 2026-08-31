@@ -99,6 +99,30 @@ export function saveSidebarWidth(width: number): void {
   local?.setItem(SIDEBAR_KEY, String(width));
 }
 
+// Sidebar rows folded shut, keyed "group:workspaces" / "group:projects" /
+// "ws:<id>". Only `true` entries are kept — everything starts open, and a
+// removed workspace's stale key costs nothing.
+const SIDEBAR_COLLAPSED_KEY = "mast.sidebarCollapsed";
+
+export function loadSidebarCollapsed(): Record<string, boolean> {
+  try {
+    const raw = JSON.parse(local?.getItem(SIDEBAR_COLLAPSED_KEY) ?? "{}");
+    if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return {};
+    return Object.fromEntries(
+      Object.entries(raw).filter(([, folded]) => folded === true),
+    ) as Record<string, boolean>;
+  } catch {
+    return {};
+  }
+}
+
+export function saveSidebarCollapsed(collapsed: Record<string, boolean>): void {
+  local?.setItem(
+    SIDEBAR_COLLAPSED_KEY,
+    JSON.stringify(Object.fromEntries(Object.entries(collapsed).filter(([, f]) => f))),
+  );
+}
+
 export const LOGS_MIN_HEIGHT = 96;
 export const LOGS_MAX_HEIGHT = 800;
 

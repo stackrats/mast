@@ -124,6 +124,27 @@ pub struct ServiceState {
     /// straight to the docker CLI, and a whole-project Rebuild reaps it.
     #[serde(default)]
     pub orphaned: bool,
+    /// Named volumes this service mounts (compose source names, bind mounts
+    /// excluded) — non-empty is what makes the data-snapshot verbs worth
+    /// offering on its chip.
+    #[serde(default)]
+    pub data_volumes: Vec<String>,
+}
+
+/// One point-in-time copy of a service's named volumes
+/// ([`Action::SnapshotServiceData`]). Docker itself is the store: each copy
+/// is a labeled volume, so snapshots survive an app-data wipe and need no
+/// database of their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeSnapshot {
+    /// Groups the per-volume copies of one snapshot action.
+    pub group: String,
+    pub project: ProjectId,
+    pub service: String,
+    pub at_unix_ms: u64,
+    /// Compose source names of the volumes captured (e.g. `sail-mysql`).
+    pub volumes: Vec<String>,
 }
 
 /// A Laravel app process (Reverb, Horizon, queue worker, scheduler): a
@@ -190,6 +211,23 @@ pub struct ProjectCommand {
     /// is still working.
     #[serde(default)]
     pub ready_when: Option<String>,
+    /// Relaunch after ANY exit that was not asked for — a dev server dying
+    /// is something to recover from, not report. Rapid exits stop the loop
+    /// (a command that cannot stay up needs a person), and the operation
+    /// then fails with the last exit in hand.
+    #[serde(default)]
+    pub auto_restart: bool,
+    /// Glob patterns, relative to the command's working directory, whose
+    /// file changes restart the running command — a queue worker never sees
+    /// new code until relaunched. Empty = never restart on file changes.
+    #[serde(default)]
+    pub restart_when_changed: Vec<String>,
+    /// Defined by the project's committed `mast.yml` rather than saved in
+    /// app data. Shown read-only (edit the file), skipped when persisting
+    /// [`Action::SetProjectCommands`], and shadowed by a saved command of
+    /// the same name — a local override beats the shared default.
+    #[serde(default)]
+    pub from_manifest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -290,6 +328,11 @@ pub struct IntegrationSettings {
     pub terminal: Option<String>,
     /// Editor binary (e.g. "code", "zed").
     pub editor: Option<String>,
+    /// Browser binary (e.g. "vivaldi", "firefox"); on macOS also an app
+    /// bundle ("Vivaldi.app"). `None` = the desktop's default browser.
+    /// Absent in settings written before this existed.
+    #[serde(default)]
+    pub browser: Option<String>,
     /// Move a published host port into `.env` when something else already
     /// holds it, instead of letting `up` fail on the bind. Defaults on.
     #[serde(default = "yes")]
@@ -302,7 +345,7 @@ fn yes() -> bool {
 
 impl Default for IntegrationSettings {
     fn default() -> Self {
-        Self { terminal: None, editor: None, auto_port_remap: true }
+        Self { terminal: None, editor: None, browser: None, auto_port_remap: true }
     }
 }
 
@@ -1053,8 +1096,15 @@ pub enum Action {
     RevealPath { path: String },
     /// Open one file inside a project in the configured editor — the
     /// vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
-    /// dialog. `file` is project-relative and may not escape the project.
-    OpenProjectFile { id: ProjectId, file: String },
+    /// dialog, or a file named by a log entry. `file` is project-relative
+    /// and may not escape the project. `line` jumps there when the editor
+    /// has a syntax for it (absent otherwise — older clients never send it).
+    OpenProjectFile {
+        id: ProjectId,
+        file: String,
+        #[serde(default)]
+        line: Option<u32>,
+    },
     /// New-project wizard (M7): the documented Sail install — composer
     /// create-project, `composer require laravel/sail --dev`, then `php artisan
     /// sail:install --php=…` — each run in the official composer image inside
@@ -1077,6 +1127,37 @@ pub enum Action {
     CaptureServiceLogs { id: ProjectId, service: String },
     /// Delete every stored log capture.
     ClearLogCaptures,
+    /// Move the project's saved commands into a committed `mast.yml` at the
+    /// project root, so the setup travels with the repo instead of living on
+    /// one machine. Refuses when the file already exists — Mast writes the
+    /// first draft, people maintain it.
+    ExportProjectManifest { id: ProjectId },
+    /// Open a terminal running `php artisan tinker` inside the app
+    /// container — the REPL one click from the project, needing nothing on
+    /// the host.
+    OpenTinker { id: ProjectId },
+    /// Hand a database connection URL to the desktop, which dispatches on
+    /// scheme to whatever client registered it. Only database schemes are
+    /// accepted; http(s) has [`Action::OpenUrl`].
+    OpenDbUrl { url: String },
+    /// Copy a service's named volumes into labeled snapshot volumes, cold:
+    /// the container is stopped for the copy and restarted after if it was
+    /// running. The insurance to buy BEFORE a risky migration — or before
+    /// [`Action::RestoreServiceData`] overwrites what is there now.
+    SnapshotServiceData { id: ProjectId, service: String },
+    /// Overwrite the service's current volume data with a snapshot's, cold
+    /// (stop, wipe, copy back, restart). DESTRUCTIVE of the current data —
+    /// clients must confirm, and should offer a fresh snapshot first.
+    RestoreServiceData { id: ProjectId, group: String },
+    /// Delete one snapshot's volumes permanently.
+    RemoveServiceDataSnapshot { group: String },
+    /// Clone a git repository into `parent/name`, bootstrap what a fresh
+    /// clone always lacks (containerized `composer install`, `.env` from
+    /// `.env.example`, an app key — each only when missing), and import the
+    /// result: the team-onboarding mirror of [`Action::CreateProject`].
+    /// Refuses http(s) URLs with embedded credentials — effect history
+    /// records every argv verbatim, and a token must never land there.
+    CloneProject { url: String, parent: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1210,6 +1291,7 @@ mod tests {
             ui_url: None,
             db_port: None,
             orphaned: false,
+            data_volumes: vec!["sail-mysql".into()],
         }
     }
 
@@ -1231,6 +1313,9 @@ mod tests {
                 cwd: None,
                 after: None,
                 ready_when: None,
+                auto_restart: false,
+                restart_when_changed: Vec::new(),
+                from_manifest: true,
             }],
             processes: vec![ProcessState {
                 id: "horizon".into(),
@@ -1271,6 +1356,7 @@ mod tests {
         roundtrip(&IntegrationSettings {
             terminal: Some("kitty".into()),
             editor: None,
+            browser: Some("vivaldi".into()),
             auto_port_remap: true,
         });
         roundtrip(&SnapshotReport {
@@ -1360,6 +1446,7 @@ mod tests {
                 integrations: IntegrationSettings {
                     terminal: None,
                     editor: Some("code".into()),
+                    browser: None,
                     auto_port_remap: false,
                 },
             },
@@ -1387,6 +1474,7 @@ mod tests {
                 integrations: IntegrationSettings {
                     terminal: Some("kitty".into()),
                     editor: None,
+                    browser: None,
                     auto_port_remap: true,
                 },
             },
@@ -1451,15 +1539,41 @@ mod tests {
                     cwd: None,
                     after: Some("api".into()),
                     ready_when: Some("Server running on".into()),
+                    auto_restart: true,
+                    restart_when_changed: vec!["app/**".into(), "config/**".into()],
+                    from_manifest: false,
                 }],
             },
             Action::RunProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },
             Action::RefreshNow,
             Action::CaptureServiceLogs { id: ProjectId("p1".into()), service: "queue".into() },
             Action::ClearLogCaptures,
+            Action::ExportProjectManifest { id: ProjectId("p1".into()) },
+            Action::OpenProjectFile {
+                id: ProjectId("p1".into()),
+                file: "app/Jobs/Ship.php".into(),
+                line: Some(42),
+            },
+            Action::OpenTinker { id: ProjectId("p1".into()) },
+            Action::OpenDbUrl { url: "mysql://sail:password@127.0.0.1:3306/laravel".into() },
+            Action::SnapshotServiceData { id: ProjectId("p1".into()), service: "mysql".into() },
+            Action::RestoreServiceData { id: ProjectId("p1".into()), group: "1a2b3c".into() },
+            Action::RemoveServiceDataSnapshot { group: "1a2b3c".into() },
+            Action::CloneProject {
+                url: "git@github.com:acme/shop.git".into(),
+                parent: "/home/dev/code".into(),
+                name: "shop".into(),
+            },
         ] {
             roundtrip(&action);
         }
+        roundtrip(&VolumeSnapshot {
+            group: "1a2b3c".into(),
+            project: ProjectId("p1".into()),
+            service: "mysql".into(),
+            at_unix_ms: 1_700_000_000_000,
+            volumes: vec!["sail-mysql".into()],
+        });
         roundtrip(&UsageSample {
             at_unix_ms: 1_700_000_000_000,
             host_cores: 8,

@@ -343,6 +343,14 @@ pub fn container_shell_command(container_id: &str) -> Vec<String> {
     .to_vec()
 }
 
+/// The REPL, straight into the app container — nothing on the host needs a
+/// PHP. Same terminal vehicle as [`container_shell_command`].
+pub fn container_tinker_command(container_id: &str) -> Vec<String> {
+    ["docker", "exec", "-it", container_id, "php", "artisan", "tinker"]
+        .map(String::from)
+        .to_vec()
+}
+
 pub fn open_terminal(
     configured: Option<&str>,
     cwd: &Path,
@@ -360,16 +368,56 @@ pub fn open_terminal(
     spawn_detached(&argv, Some(cwd), true).map_err(|e| e.to_string())
 }
 
-pub fn open_editor(configured: Option<&str>, path: &Path) -> Result<(), String> {
+/// The `file:line` argv for editors whose jump syntax is known — the goto
+/// flag differs per editor, and an unknown editor gets the plain path
+/// rather than a guessed flag it might treat as a file name.
+pub fn editor_argv(editor: &str, path: &Path, line: Option<u32>) -> Vec<String> {
+    let stem = Path::new(editor)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match (line, stem.as_str()) {
+        (Some(line), "code" | "codium" | "code-insiders") => {
+            vec![editor.into(), "-g".into(), format!("{}:{line}", argv_path(path))]
+        }
+        (Some(line), "zed" | "subl" | "sublime_text") => {
+            vec![editor.into(), format!("{}:{line}", argv_path(path))]
+        }
+        _ => vec![editor.into(), argv_path(path)],
+    }
+}
+
+pub fn open_editor(configured: Option<&str>, path: &Path, line: Option<u32>) -> Result<(), String> {
     let argv = match pick(configured, &EDITOR_CANDIDATES) {
         Some(editor) if is_app_bundle(&editor) => {
+            // `open -a` hands over a path and nothing else; the line is lost.
             vec![OPENER.into(), "-a".into(), editor, argv_path(path)]
         }
-        Some(editor) => vec![editor, argv_path(path)],
+        Some(editor) => editor_argv(&editor, path, line),
         // Last resort: let the desktop decide.
         None => vec![OPENER.into(), argv_path(path)],
     };
     spawn_detached(&argv, None, false).map_err(|e| e.to_string())
+}
+
+/// Database schemes the desktop may dispatch on — whatever client the user
+/// installed registered itself for these. The allowlist IS the safety
+/// story, exactly as the http(s) check is for the browser path.
+const DB_URL_SCHEMES: [&str; 6] =
+    ["mysql://", "postgresql://", "postgres://", "mariadb://", "redis://", "mongodb://"];
+
+/// Hand a database URL to the desktop's scheme dispatch. No probe list and
+/// no browser override: only the OS knows which client claimed the scheme,
+/// and a browser is exactly the wrong place for credentials to land.
+pub fn open_db_url(url: &str) -> Result<(), String> {
+    let scheme_ok = DB_URL_SCHEMES
+        .iter()
+        .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s));
+    if !scheme_ok {
+        // Name only the scheme — everything after it can carry credentials.
+        return Err(format!("not a database address: {}", url.split(':').next().unwrap_or(url)));
+    }
+    spawn_detached(&[OPENER.into(), url.to_string()], None, false).map_err(|e| e.to_string())
 }
 
 /// The target is a project directory, and both openers show a directory in
@@ -384,17 +432,38 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     spawn_detached(&[OPENER.into(), argv_path(path)], None, false).map_err(|e| e.to_string())
 }
 
-/// Hand a URL to the desktop's default browser. The scheme is re-checked
-/// here (it was already checked when the URL was derived from `.env`) — the
-/// opener dispatches on scheme, so that check is the whole safety story.
-pub fn open_in_browser(url: &str) -> Result<(), String> {
+/// Build the argv that opens `url` in `browser`. Every browser binary takes
+/// a URL as its lone argument, so no per-browser flag table is needed; a
+/// macOS `.app` bundle goes through `open -a`, which hands the URL on.
+pub fn browser_argv(browser: &str, url: &str) -> Vec<String> {
+    let base = Path::new(browser)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| browser.to_string());
+    if is_app_bundle(&base) {
+        return vec![OPENER.into(), "-a".into(), browser.to_string(), url.to_string()];
+    }
+    vec![browser.to_string(), url.to_string()]
+}
+
+/// Hand a URL to the configured browser, or the desktop's default when none
+/// is set (there is no probe list — unconfigured means "whatever the user
+/// made their system default", which only the opener knows). The scheme is
+/// re-checked here (it was already checked when the URL was derived from
+/// `.env`) — the opener dispatches on scheme, so that check is the whole
+/// safety story.
+pub fn open_in_browser(configured: Option<&str>, url: &str) -> Result<(), String> {
     let scheme_ok = ["http://", "https://"]
         .iter()
         .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s));
     if !scheme_ok {
         return Err(format!("not an http(s) address: {url}"));
     }
-    spawn_detached(&[OPENER.into(), url.to_string()], None, false).map_err(|e| e.to_string())
+    let argv = match pick(configured, &[]) {
+        Some(browser) => browser_argv(&browser, url),
+        None => vec![OPENER.into(), url.to_string()],
+    };
+    spawn_detached(&argv, None, false).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -482,9 +551,68 @@ mod tests {
 
     #[test]
     fn browser_refuses_non_http_schemes() {
-        assert!(open_in_browser("file:///etc/passwd").is_err());
-        assert!(open_in_browser("javascript:alert(1)").is_err());
-        assert!(open_in_browser("http://").is_err());
+        assert!(open_in_browser(None, "file:///etc/passwd").is_err());
+        assert!(open_in_browser(Some("vivaldi"), "javascript:alert(1)").is_err());
+        assert!(open_in_browser(None, "http://").is_err());
+    }
+
+    /// The DB opener and the browser opener partition the scheme space —
+    /// neither accepts the other's, so credentials never reach a browser
+    /// and web URLs never reach a database client.
+    #[test]
+    fn db_urls_are_scheme_gated() {
+        assert!(open_db_url("http://localhost").is_err());
+        assert!(open_db_url("file:///etc/passwd").is_err());
+        assert!(open_db_url("mysql://").is_err());
+        let refused = open_db_url("javascript:alert(1)").unwrap_err();
+        // The scheme is named, the credentials in the URL are not echoed.
+        assert!(refused.contains("javascript"), "{refused}");
+        assert!(!refused.contains("alert"), "{refused}");
+    }
+
+    #[test]
+    fn editor_line_jumps_use_each_editors_own_syntax() {
+        let file = Path::new("/code/app/Jobs/Ship.php");
+        assert_eq!(
+            editor_argv("code", file, Some(42)),
+            vec!["code", "-g", "/code/app/Jobs/Ship.php:42"]
+        );
+        assert_eq!(
+            editor_argv("zed", file, Some(7)),
+            vec!["zed", "/code/app/Jobs/Ship.php:7"]
+        );
+        // Windows ships the same editor as code.cmd; the stem decides.
+        assert_eq!(editor_argv("code.cmd", file, Some(3))[1], "-g");
+        // No line, or an editor whose flag is unknown: the plain path — a
+        // guessed flag could be taken for a file name.
+        assert_eq!(editor_argv("code", file, None), vec!["code", "/code/app/Jobs/Ship.php"]);
+        assert_eq!(
+            editor_argv("nano", file, Some(9)),
+            vec!["nano", "/code/app/Jobs/Ship.php"]
+        );
+    }
+
+    #[test]
+    fn tinker_runs_artisan_in_the_container() {
+        let argv = container_tinker_command("cafe123");
+        assert_eq!(argv[..4], ["docker", "exec", "-it", "cafe123"].map(String::from));
+        assert!(argv.ends_with(&["php".into(), "artisan".into(), "tinker".into()]));
+    }
+
+    #[test]
+    fn browser_argv_conventions() {
+        assert_eq!(
+            browser_argv("vivaldi", "http://localhost:8080"),
+            vec!["vivaldi", "http://localhost:8080"]
+        );
+        assert_eq!(
+            browser_argv("/opt/vivaldi/vivaldi", "http://x.test"),
+            vec!["/opt/vivaldi/vivaldi", "http://x.test"]
+        );
+        assert_eq!(
+            browser_argv("Vivaldi.app", "http://x.test"),
+            [OPENER, "-a", "Vivaldi.app", "http://x.test"].map(String::from)
+        );
     }
 
     #[test]
