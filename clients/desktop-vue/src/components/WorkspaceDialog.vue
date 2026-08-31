@@ -89,22 +89,37 @@ async function save() {
     <div class="space-y-3">
       <Input v-model="name" placeholder="workspace name" />
 
-      <div class="max-h-72 space-y-1.5 overflow-y-auto">
+      <!-- Rows, not boxes. The old border was there to group a member with
+           its "waits for" checkboxes, but it drew the same box around every
+           unselected row — where it groups nothing and merely looks like a
+           hit target that was not one. A selected row tints instead, which
+           groups its dependencies AND says which rows are in. -->
+      <div class="max-h-72 overflow-y-auto">
         <div
           v-for="project in store.projects"
           :key="project.id"
-          class="rounded-md border border-slate-100 p-2 dark:border-slate-800"
+          class="rounded-md transition-colors"
+          :class="
+            selected.has(project.id)
+              ? 'bg-slate-100 dark:bg-slate-800/60'
+              : 'hover:bg-slate-50 dark:hover:bg-slate-800/30'
+          "
         >
+          <!-- Full-width label: the whole line toggles, including the empty
+               space beside the name. -->
           <Checkbox
+            block
             :model-value="selected.has(project.id)"
-            class="text-sm!"
+            class="p-2 text-sm!"
             @update:model-value="toggleMember(project.id)"
           >
             <span class="font-medium text-slate-800 dark:text-slate-200">{{ project.name }}</span>
           </Checkbox>
+          <!-- Outside the label above, or clicking a dependency would toggle
+               the member it belongs to. -->
           <div
             v-if="selected.has(project.id) && selected.size > 1"
-            class="mt-1.5 ml-6 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 dark:text-slate-300"
+            class="flex flex-wrap items-center gap-x-3 gap-y-1 px-2 pb-2 pl-8 text-xs text-slate-600 dark:text-slate-300"
           >
             <span class="text-slate-400">waits for:</span>
             <Checkbox
