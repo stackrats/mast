@@ -144,7 +144,7 @@ function isCollapsed(key: string): boolean {
       <SidebarGroup>
         <SidebarGroupLabel>
           <button
-            class="flex h-6 w-full items-center gap-1 rounded-md px-2 pr-6 text-left outline-none hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+            class="flex h-6 w-full items-center gap-1 rounded-md px-2 pr-6 text-left hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-300"
             @click="toggleCollapsed('group:workspaces')"
           >
             <ChevronRight
@@ -235,7 +235,7 @@ function isCollapsed(key: string): boolean {
       <SidebarGroup v-if="store.projects.length">
         <SidebarGroupLabel>
           <button
-            class="flex h-6 w-full items-center gap-1 rounded-md px-2 pr-6 text-left outline-none hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+            class="flex h-6 w-full items-center gap-1 rounded-md px-2 pr-6 text-left hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-300"
             @click="toggleCollapsed('group:projects')"
           >
             <ChevronRight
