@@ -10,6 +10,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { comboLabel } from "../lib/shortcuts";
 import { useEngineStore } from "../stores/engine";
+import MastMark from "./ui/MastMark.vue";
 import Tooltip from "./ui/Tooltip.vue";
 
 const emit = defineEmits<{
@@ -22,19 +23,6 @@ const emit = defineEmits<{
   openShortcuts: [];
 }>();
 const store = useEngineStore();
-
-// The CLI's banner (clients/mast-cli/src/main.rs), so the desktop and the
-// terminal introduce the app with the same wordmark. Six rows of block glyphs
-// only read as letters when the rows touch exactly — hence `leading-none` and
-// a line-height tied to the font size below.
-const BANNER = [
-  " ██╗██╗        ███╗   ███╗  █████╗  ███████╗ ████████╗",
-  " ██║█████╗     ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝",
-  " ██║████████╗  ██╔████╔██║ ███████║ ███████╗    ██║",
-  " ██║█████╔═╝   ██║╚██╔╝██║ ██╔══██║ ╚════██║    ██║",
-  " ██║██╔═╝      ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║",
-  " ╚═╝╚═╝        ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝",
-].join("\n");
 
 type MenuId = "app" | "workspace" | "view";
 
@@ -108,16 +96,16 @@ async function closeToTray() {
     role="menubar"
     class="flex items-center gap-0.5 border-b border-slate-200 bg-white px-2 py-1 dark:border-slate-800 dark:bg-slate-950"
   >
-    <!-- v-text, not interpolation: inside `white-space: pre` the template's own
-         indentation would become part of the art. -->
-    <!-- role="img" + aria-label so it is announced as "Mast" rather than read
-         out as box-drawing characters. -->
-    <pre
-      class="mr-2 px-1 font-mono text-[3px] leading-none text-slate-900 select-none dark:text-slate-100"
+    <!-- The mark as vectors, from the same source the app icons are rendered
+         from, so the two finally agree at every size. -->
+    <span
+      class="mr-2 flex shrink-0 items-center gap-1.5 px-1 text-slate-900 select-none dark:text-slate-100"
       role="img"
       aria-label="Mast"
-      v-text="BANNER"
-    />
+    >
+      <MastMark class="h-4 w-auto" />
+      <span class="text-[11px] leading-none font-semibold tracking-[0.18em]">MAST</span>
+    </span>
 
     <div v-for="menu in MENUS" :key="menu.id" class="relative">
       <button
