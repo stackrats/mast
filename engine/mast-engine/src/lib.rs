@@ -242,6 +242,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         services: Vec::new(),
         resolution_error: None,
         warnings: Vec::new(),
+        rank: record.rank,
         commands: commands_to_contract(record),
         processes: Vec::new(),
         git_branch: None,
@@ -421,7 +422,14 @@ impl Engine {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             discovered: st.discovered.clone(),
-            projects: st.projects.values().map(|e| e.summary.clone()).collect(),
+            projects: {
+                let mut projects: Vec<ProjectSummary> =
+                    st.projects.values().map(|e| e.summary.clone()).collect();
+                // Dragged rank first, name as the tiebreak — which keeps the
+                // pre-ordering world (every rank 0) exactly alphabetical.
+                projects.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.name.cmp(&b.name)));
+                projects
+            },
             workspaces: workspace_summaries(&st),
         }
     }
@@ -966,6 +974,27 @@ impl Engine {
                 let h = handle.clone();
                 self.spawn_operation(id, handle, async move {
                     engine.clone_project(&h, id, &url, &parent, &name).await
+                });
+            }
+            Action::ReorderProjects { ids } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move { engine.reorder_projects(&ids) });
+            }
+            Action::ReorderWorkspaces { ids } => {
+                let engine = self.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.mutate_workspaces(|records| {
+                        let pos: std::collections::HashMap<&str, usize> = ids
+                            .iter()
+                            .enumerate()
+                            .map(|(i, w)| (w.0.as_str(), i))
+                            .collect();
+                        // Stable sort: named workspaces take the dragged
+                        // order, unnamed keep their relative order after.
+                        records.sort_by_key(|r| {
+                            pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX)
+                        });
+                    })
                 });
             }
             Action::StartProcess { id: project, process } => {

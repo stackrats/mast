@@ -1604,6 +1604,29 @@ impl crate::Engine {
     }
 }
 
+impl Engine {
+    /// Persist a dragged ordering: rank = index in `ids`. Projects the list
+    /// does not name keep their old rank, so a stale client cannot shuffle
+    /// what it never saw.
+    pub(crate) fn reorder_projects(&self, ids: &[ProjectId]) -> Result<(), ErrorInfo> {
+        let all = self.with_state(|st, events| {
+            let rank_of: std::collections::HashMap<&str, u32> =
+                ids.iter().enumerate().map(|(i, id)| (id.0.as_str(), i as u32)).collect();
+            for entry in st.projects.values_mut() {
+                if let Some(&rank) = rank_of.get(entry.record.id.as_str())
+                    && entry.record.rank != rank
+                {
+                    entry.record.rank = rank;
+                    entry.summary.rank = rank;
+                    events.push(PatchEvent::ProjectUpdated { project: entry.summary.clone() });
+                }
+            }
+            st.projects.values().map(|e| e.record.clone()).collect::<Vec<_>>()
+        });
+        self.inner.deps.store.save_projects(&all).map_err(internal_err)
+    }
+}
+
 /// Where a new project may land: an existing parent directory, a name that
 /// is a safe compose project name, a path nothing occupies yet. Shared by
 /// the create and clone wizards so the two cannot drift.
