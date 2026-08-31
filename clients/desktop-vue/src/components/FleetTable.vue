@@ -10,6 +10,7 @@ import { computed } from "vue";
 import { CircleStop, Moon } from "lucide-vue-next";
 
 import type { ProjectId } from "../bindings";
+import { keyLabel } from "../lib/shortcuts";
 import { statusDot } from "../lib/status";
 import { fleetRows, formatBytes, formatCores, QUIET_CORES_PER_CONTAINER } from "../lib/usage";
 import { useEngineStore } from "../stores/engine";
@@ -95,7 +96,7 @@ const cellClass = "px-3 py-2 text-sm";
     >
       Nothing running. Start a project from the sidebar, or press
       <kbd class="rounded border border-slate-300 px-1 font-mono text-xs dark:border-slate-600">
-        Ctrl</kbd
+        {{ keyLabel("mod") }}</kbd
       >+<kbd class="rounded border border-slate-300 px-1 font-mono text-xs dark:border-slate-600">
         K</kbd
       >.
