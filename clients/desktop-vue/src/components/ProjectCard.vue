@@ -1993,7 +1993,7 @@ async function clearAppLog() {
           <span class="font-mono">../frontend</span> + <span class="font-mono">npm run dev</span>.
           <span class="font-mono">sail</span> commands only work from the project root.
         </p>
-        <Checkbox v-model="newAuto" label="Run automatically when the project starts" />
+        <Checkbox block v-model="newAuto" label="Run automatically when the project starts" />
         <template v-if="newAuto">
           <label class="block text-xs text-slate-600 dark:text-slate-300">
             Start it
@@ -2020,7 +2020,7 @@ async function clearAppLog() {
             a guess — a good one for a server that prints a banner and quietens down.
           </p>
         </template>
-        <Checkbox v-model="newAutoRestart" label="Restart it if it dies" />
+        <Checkbox block v-model="newAutoRestart" label="Restart it if it dies" />
         <p v-if="newAutoRestart" class="text-xs text-slate-400">
           Any exit you didn't ask for relaunches it — what a queue worker or dev server wants. Rapid
           exits stop the loop instead of hammering the same failure.
