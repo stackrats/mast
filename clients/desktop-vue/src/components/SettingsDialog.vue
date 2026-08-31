@@ -211,6 +211,7 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
       <section class="space-y-2">
         <h4 :class="headingClass">Startup</h4>
         <Checkbox
+          row
           :model-value="autostart"
           label="Launch Mast when you log in (starts minimized in the tray)"
           @update:model-value="setAutostart"
@@ -224,16 +225,19 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
         </p>
         <div class="flex flex-col gap-1.5">
           <Checkbox
+            row
             :model-value="notifications.health"
             label="Project health — a project turns unhealthy or recovers"
             @update:model-value="(v) => setNotification('health', v)"
           />
           <Checkbox
+            row
             :model-value="notifications.docker"
             label="Docker — connection lost or restored"
             @update:model-value="(v) => setNotification('docker', v)"
           />
           <Checkbox
+            row
             :model-value="notifications.operations"
             label="Operations — a start/stop/command fails"
             @update:model-value="(v) => setNotification('operations', v)"
@@ -244,6 +248,7 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
       <section class="space-y-2">
         <h4 :class="headingClass">Starting projects</h4>
         <Checkbox
+          row
           :model-value="autoPortRemap"
           label="Move a host port when something else already has it"
           @update:model-value="setAutoPortRemap"

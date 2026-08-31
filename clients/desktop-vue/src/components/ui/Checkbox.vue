@@ -2,13 +2,17 @@
 import { Check } from "lucide-vue-next";
 
 const model = defineModel<boolean>({ default: false });
-const { block = false } = defineProps<{
+const { block = false, row = false } = defineProps<{
   disabled?: boolean;
   label?: string;
-  /** Fill the line rather than hugging the text, so the whole width of a
-   * list row toggles — a box drawn around a row promises that, and a
-   * promise the empty space to the right does not keep reads as broken. */
+  /** Fill the line rather than hugging the text, so the whole width toggles.
+   * The rule: a checkbox that owns its line owns the whole line — the empty
+   * space beside a label looks like part of the target because it is one.
+   * Leave it off only for a checkbox sharing its line with other controls. */
   block?: boolean;
+  /** `block` plus the padding and hover of a list row — for stacks of
+   * sibling toggles, where hover also tracks which line you are on. */
+  row?: boolean;
 }>();
 </script>
 
@@ -17,7 +21,16 @@ const { block = false } = defineProps<{
        baseline must not change on tick, or the whole label nudges. -->
   <label
     class="cursor-pointer items-start gap-2 align-top text-xs leading-4 text-slate-600 select-none dark:text-slate-300"
-    :class="[block ? 'flex w-full' : 'inline-flex', { 'cursor-not-allowed opacity-50': disabled }]"
+    :class="[
+      block ? 'flex w-full' : row ? 'flex' : 'inline-flex',
+      // `-mx-2` bleeds the hover area into the surrounding padding so the
+      // tick still lines up with the section heading above it — an indented
+      // row would trade one misalignment for another.
+      row
+        ? '-mx-2 rounded-md px-2 py-1.5 transition-colors hover:bg-slate-100 dark:hover:bg-slate-800/60'
+        : '',
+      { 'cursor-not-allowed opacity-50': disabled },
+    ]"
   >
     <input v-model="model" type="checkbox" class="peer sr-only" :disabled="disabled" />
     <span
