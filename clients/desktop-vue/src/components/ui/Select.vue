@@ -23,6 +23,12 @@ const { size = "default" } = defineProps<{
   size?: "default" | "sm";
 }>();
 
+// SelectRoot renders no element, so fallthrough attrs used to vanish
+// silently — a caller's `class="mt-1"` applied to the Input beside this
+// but not here, and every Select under a label sat 4px higher than its
+// neighbors. Land them on the trigger, the element a caller means.
+defineOptions({ inheritAttrs: false });
+
 // Sizes mirror Button's, so a Select in a row with buttons sits flush with
 // them: `default` pairs with Button `default`, `sm` with Button `sm`.
 const trigger = cva(
@@ -40,7 +46,10 @@ const trigger = cva(
 
 <template>
   <SelectRoot v-model="model" :disabled="disabled">
-    <SelectTrigger :class="cn(trigger({ size }))">
+    <SelectTrigger
+      v-bind="{ ...$attrs, class: undefined }"
+      :class="cn(trigger({ size }), ($attrs.class ?? '') as string)"
+    >
       <SelectValue class="truncate" :placeholder="placeholder ?? ''" />
       <ChevronDown
         class="shrink-0 text-slate-400"
