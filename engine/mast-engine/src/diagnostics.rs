@@ -22,7 +22,7 @@ use mast_diagnostics::{
     REPAIR_TRUST_PROXY_CA,
     REPAIR_ADD_HOST_GATEWAY, REPAIR_MIGRATE_MAILPIT, REPAIR_NORMALIZE_ENV_EOL, REPAIR_REMOVE_HOT,
     REPAIR_SAIL_INSTALL, REPAIR_SET_PROJECT_NAME, REPAIR_SET_WWWUSER, REPAIR_STORAGE_LINK,
-    REPAIR_PHP_AS_ROOT, REPAIR_STORAGE_WRITABLE,
+    REPAIR_PHP_AS_ROOT, REPAIR_STOP_STALE_DEV, REPAIR_STORAGE_WRITABLE,
 };
 use mast_docker::run_command;
 
@@ -92,6 +92,14 @@ fn composer_run(dir: &Path, uid: u32, gid: u32, entrypoint: Option<&str>) -> Vec
 pub(crate) fn composer_install_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
     let mut argv = composer_run(dir, uid, gid, None);
     argv.extend(["install", "--ignore-platform-reqs"].map(String::from));
+    argv
+}
+
+/// Containerized `php artisan key:generate` — a cloned `.env.example` ships
+/// with APP_KEY empty, and every request 500s until one exists.
+pub(crate) fn artisan_key_generate_argv(dir: &Path, uid: u32, gid: u32) -> Vec<String> {
+    let mut argv = composer_run(dir, uid, gid, Some("php"));
+    argv.extend(["artisan", "key:generate", "--force", "--no-interaction"].map(String::from));
     argv
 }
 
@@ -617,6 +625,29 @@ pub(crate) fn dev_server_listening(hot: &mast_laravel::vite::HotFile) -> Option<
             .iter()
             .any(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(250)).is_ok()),
     )
+}
+
+/// Collapse repeated cmdlines into counted lines ("3 × node …/cli.js …"),
+/// each trimmed to a display width. Stacked copies of one dev script are the
+/// normal shape of the leftover-dev-server failure, and nine identical
+/// 300-character lines say less than one counted one.
+fn grouped_cmdlines(lines: &[String]) -> Vec<String> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for line in lines {
+        let display: String = if line.chars().count() > 120 {
+            line.chars().take(119).chain(['…']).collect()
+        } else {
+            line.clone()
+        };
+        match groups.iter_mut().find(|(seen, _)| *seen == display) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((display, 1)),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(line, count)| if count > 1 { format!("{count} × {line}") } else { line })
+        .collect()
 }
 
 /// The containerized chown for [`REPAIR_CHOWN_STORAGE`]: mounts the project
@@ -1533,6 +1564,50 @@ impl Engine {
                     no_op: false,
                 })
             }
+            REPAIR_STOP_STALE_DEV => {
+                let project = self.require_project(project)?;
+                let (invocation, dir, redactor) = self.process_context(project)?;
+                let service = crate::project_ops::app_service_of(&dir);
+                let tail: Vec<String> = ["sh", "-c", mast_laravel::processes::scan_script()]
+                    .map(String::from)
+                    .to_vec();
+                let argv = crate::project_ops::compose_exec_argv(&invocation, &service, &tail);
+                let scanned = run_command(&argv, Some(&dir), &[], PROBE_TIMEOUT, PROBE_CAP).await;
+                let (summary, no_op) = match scanned {
+                    Ok(out) if out.success() => {
+                        let matched = mast_laravel::processes::scan_matches(
+                            &out.stdout,
+                            mast_laravel::processes::DEV_STACK_PATTERNS,
+                        );
+                        if matched.is_empty() {
+                            (
+                                vec![
+                                    "no dev-server process is running in the app container — \
+                                     nothing to stop"
+                                        .into(),
+                                ],
+                                true,
+                            )
+                        } else {
+                            let mut lines: Vec<String> = grouped_cmdlines(&matched)
+                                .iter()
+                                .map(|line| format!("SIGTERM: {}", redactor.redact(line)))
+                                .collect();
+                            lines.push(format!(
+                                "in the \"{service}\" container — nothing else is touched"
+                            ));
+                            (lines, false)
+                        }
+                    }
+                    _ => (
+                        vec![format!(
+                            "the \"{service}\" container is not running — nothing to stop there"
+                        )],
+                        true,
+                    ),
+                };
+                Ok(RepairPlan { summary, repair: offer, file_preview: None, no_op })
+            }
             REPAIR_CREATE_NETWORK => {
                 let net = arg.ok_or_else(|| ErrorInfo::InvalidInput {
                     message: "create-network needs a network name".into(),
@@ -2407,6 +2482,86 @@ impl Engine {
                 } else {
                     Err(ErrorInfo::Internal { message: out.stderr.trim().to_string() })
                 }
+            }
+            REPAIR_STOP_STALE_DEV => {
+                let project = self.require_project(project)?;
+                let (invocation, dir, redactor) = self.process_context(project)?;
+                let service = crate::project_ops::app_service_of(&dir);
+                let exec = |script: String| {
+                    let tail: Vec<String> = vec!["sh".into(), "-c".into(), script];
+                    crate::project_ops::compose_exec_argv(&invocation, &service, &tail)
+                };
+                // Scan first: the operation log names exactly what is being
+                // stopped, and an empty container is a success, not a
+                // failure — the contract stopping a stopped process set.
+                let argv = exec(mast_laravel::processes::scan_script().to_string());
+                let out = run_command(&argv, Some(&dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !out.success() {
+                    return Err(ErrorInfo::InvalidInput {
+                        message: format!(
+                            "cannot look inside the app container — the project must be \
+                             running ({})",
+                            out.stderr.trim().lines().last().unwrap_or("exec failed")
+                        ),
+                    });
+                }
+                let matched = mast_laravel::processes::scan_matches(
+                    &out.stdout,
+                    mast_laravel::processes::DEV_STACK_PATTERNS,
+                );
+                if matched.is_empty() {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: "no dev-server process is running in the app container — \
+                                   nothing to stop"
+                                .into(),
+                            stderr: false,
+                        },
+                    );
+                    return Ok(());
+                }
+                for line in grouped_cmdlines(&matched) {
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: format!("stopping: {}", redactor.redact(&line)),
+                            stderr: false,
+                        },
+                    );
+                }
+                let argv = exec(mast_laravel::processes::kill_script_matching(
+                    mast_laravel::processes::DEV_STACK_PATTERNS,
+                ));
+                let out = run_command(&argv, Some(&dir), &[], PROBE_TIMEOUT, PROBE_CAP)
+                    .await
+                    .map_err(crate::internal_err)?;
+                if !out.success() {
+                    return Err(ErrorInfo::Internal {
+                        message: format!(
+                            "stop failed: {}",
+                            out.stderr.trim().lines().last().unwrap_or("exec failed")
+                        ),
+                    });
+                }
+                let count = match matched.len() {
+                    1 => "1 process".to_string(),
+                    n => format!("{n} processes"),
+                };
+                self.emit_op(
+                    handle,
+                    op,
+                    OperationEventKind::Output {
+                        line: format!("{count} signalled to stop (SIGTERM)"),
+                        stderr: false,
+                    },
+                );
+                self.hint();
+                Ok(())
             }
             REPAIR_PHP_AS_ROOT => {
                 let project = self.require_project(project)?;
@@ -3619,6 +3774,25 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three stacked copies of one dev script must read as one counted line,
+    /// and a cmdline longer than the display width is trimmed, not wrapped.
+    #[test]
+    fn stacked_dev_processes_group_into_counted_lines() {
+        let cli = "node /home/sail/.cache/pnpm/dlx/252c/node_modules/@laravel/multiplex/dist/cli.js".to_string();
+        let lines = vec![cli.clone(), "php artisan serve".to_string(), cli.clone(), cli];
+        assert_eq!(
+            grouped_cmdlines(&lines),
+            vec![
+                format!("3 × {}", lines[0]),
+                "php artisan serve".to_string(),
+            ]
+        );
+        let long = vec!["x".repeat(200)];
+        let grouped = grouped_cmdlines(&long);
+        assert_eq!(grouped[0].chars().count(), 120);
+        assert!(grouped[0].ends_with('…'));
+    }
 
     /// The field case that slipped past the original check: APP_URL pins a
     /// port while APP_PORT was never written — the app publishes sail's

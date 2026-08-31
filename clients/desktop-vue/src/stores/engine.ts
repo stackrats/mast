@@ -157,7 +157,12 @@ export const useEngineStore = defineStore("engine", {
     resyncs: 0,
     readOnly: false,
     docker: null as DockerStatus | null,
-    integrations: { terminal: null, editor: null, autoPortRemap: true } as IntegrationSettings,
+    integrations: {
+      terminal: null,
+      editor: null,
+      browser: null,
+      autoPortRemap: true,
+    } as IntegrationSettings,
     watchedDirectories: [] as string[],
     discovered: [] as DiscoveredProject[],
     projects: [] as ProjectSummary[],
@@ -188,6 +193,12 @@ export const useEngineStore = defineStore("engine", {
     selection: { kind: "home" } as Selection,
     busy: 0,
     error: null as string | null,
+    /** What happened to each project while the user was not looking at it —
+     * the dot that outlives a missed toast. A notification is gone the moment
+     * it is dismissed; the project that raised it keeps a marker until the
+     * user actually visits. Keyed by project id, newest last, capped small:
+     * the dot says "something happened here", the titles say what. */
+    attention: {} as Record<string, string[]>,
   }),
 
   getters: {
@@ -237,6 +248,12 @@ export const useEngineStore = defineStore("engine", {
         const op = state.operations[key];
         return op != null && op.terminal === null;
       };
+    },
+
+    /** Alert titles a project accumulated while unwatched, oldest first —
+     * empty for a project with nothing to catch up on. */
+    attentionFor(state) {
+      return (project: ProjectId): string[] => state.attention[project] ?? [];
     },
   },
 
@@ -289,8 +306,10 @@ export const useEngineStore = defineStore("engine", {
             const unhealthy = p.status === "degraded" || p.status === "failed";
             if (unhealthy && wasUnhealthy.get(p.id) === false) {
               void notify("health", `${p.name} is ${p.status}`, "A service went unhealthy.");
+              this.noteAttention(p.id, `went ${p.status}`);
             } else if (p.status === "running" && wasUnhealthy.get(p.id) === true) {
               void notify("health", `${p.name} recovered`, "All services healthy again.");
+              this.noteAttention(p.id, "recovered");
             }
             if (p.status !== "running" || wasRunning.get(p.id) !== false) continue;
             for (const cmd of (p.commands ?? []).filter((c) => c.autoStart)) {
@@ -550,6 +569,7 @@ export const useEngineStore = defineStore("engine", {
                   `${label} finished`,
                   `Took ${formatElapsed(Date.now() - op.startedAt)}.`,
                 );
+                this.noteAttention(this.projectOfOpKey(project), `${label} finished`);
               }
               break;
             case "fixAvailable": {
@@ -565,6 +585,7 @@ export const useEngineStore = defineStore("engine", {
               op.error = event.kind.error;
               this.pushActivity(`✗ ${label} failed: ${event.kind.error}`, true);
               void notify("operations", `${label} failed`, event.kind.error);
+              this.noteAttention(this.projectOfOpKey(project), `${label} failed`);
               break;
             default:
               break;
@@ -638,6 +659,36 @@ export const useEngineStore = defineStore("engine", {
         await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
       }
       return false;
+    },
+
+    /** The project behind an operations-map key — the key is either a
+     * project id or a `<project>:cmd:`/`:share`/`:domain` slot; workspace and
+     * `new:` keys belong to no project and come back null. */
+    projectOfOpKey(key: string): ProjectId | null {
+      return this.projects.find((p) => p.id === key || key.startsWith(`${p.id}:`))?.id ?? null;
+    },
+
+    /** Remember that something notification-worthy happened to a project the
+     * user was not looking at. Looking means: window visible AND that project
+     * selected — a toast fired at a visible but different pane is exactly the
+     * kind that gets missed. */
+    noteAttention(project: ProjectId | null, title: string) {
+      if (project === null) return;
+      // `document` is absent under the node test runner, where nobody is
+      // looking by definition.
+      const visible = typeof document !== "undefined" && !document.hidden;
+      const looking = visible && this.selection.kind === "project" && this.selection.id === project;
+      if (looking) return;
+      const titles = this.attention[project] ?? [];
+      titles.push(title);
+      // The dot says "something happened"; three titles are plenty of what.
+      this.attention[project] = titles.slice(-3);
+    },
+
+    /** Visiting the project is what clears its marker — not dismissing a
+     * toast, which may never have been seen. */
+    clearAttention(project: ProjectId) {
+      delete this.attention[project];
     },
 
     /** Drop a finished operation so its card stops being shown. */

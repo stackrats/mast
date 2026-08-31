@@ -1242,13 +1242,14 @@ async fn integrations_persist_and_launch_context_flows() {
     let engine = test_engine(tmp.path(), Arc::new(DeadConnector));
     run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
 
-    // Configure `true` as the terminal: exists everywhere, exits instantly.
+    // Configure `true` as every tool: exists everywhere, exits instantly.
     run_action(
         &engine,
         Action::SetIntegrations {
             integrations: mast_contract::IntegrationSettings {
                 terminal: Some("true".into()),
                 editor: Some("true".into()),
+                browser: Some("true".into()),
                 auto_port_remap: true,
             },
         },
@@ -1257,11 +1258,14 @@ async fn integrations_persist_and_launch_context_flows() {
     assert_eq!(engine.snapshot().integrations.terminal.as_deref(), Some("true"));
     // Persisted: a fresh store sees it.
     let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
-    assert_eq!(store.load_settings().unwrap().terminal.as_deref(), Some("true"));
+    let persisted = store.load_settings().unwrap();
+    assert_eq!(persisted.terminal.as_deref(), Some("true"));
+    assert_eq!(persisted.browser.as_deref(), Some("true"));
 
     let id = project_id(&engine);
     run_action(&engine, Action::OpenTerminal { id: id.clone() }).await;
     run_action(&engine, Action::OpenInEditor { id: id.clone() }).await;
+    run_action(&engine, Action::OpenUrl { url: "http://localhost:8080".into() }).await;
 
     // Shell into a service with no container → Failed with NotFound message.
     let op = engine
@@ -1573,12 +1577,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
         mast_contract::ProjectCommand {
             name: "touch".into(),
             command: "touch marker.txt".into(),
-            auto_start: true, cwd: None, after: None, ready_when: None,
+            auto_start: true, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
         },
         mast_contract::ProjectCommand {
             name: "dev".into(),
             command: "sail npm run dev".into(),
-            auto_start: false, cwd: None, after: None, ready_when: None,
+            auto_start: false, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
         },
     ];
     run_action(
@@ -1638,12 +1642,12 @@ async fn project_commands_persist_run_and_refuse_sail_without_vendor() {
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "true".into(),
-                    auto_start: false, cwd: None, after: None, ready_when: None,
+                    auto_start: false, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
                 },
                 mast_contract::ProjectCommand {
                     name: "x".into(),
                     command: "false".into(),
-                    auto_start: false, cwd: None, after: None, ready_when: None,
+                    auto_start: false, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
                 },
             ],
         })
@@ -1685,7 +1689,7 @@ async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
                     auto_start: false,
                     cwd: Some("../frontend".into()),
                     after: None,
-                    ready_when: None,
+                    ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
                 },
                 mast_contract::ProjectCommand {
                     name: "gone".into(),
@@ -1693,7 +1697,7 @@ async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
                     auto_start: false,
                     cwd: Some("../does-not-exist".into()),
                     after: None,
-                    ready_when: None,
+                    ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
                 },
                 mast_contract::ProjectCommand {
                     name: "dev".into(),
@@ -1701,7 +1705,7 @@ async fn command_cwd_targets_a_sibling_directory_and_sail_refuses_it() {
                     auto_start: false,
                     cwd: Some("../frontend".into()),
                     after: None,
-                    ready_when: None,
+                    ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
                 },
             ],
         },
@@ -2128,6 +2132,7 @@ async fn starting_a_project_moves_a_host_port_that_is_already_taken() {
             integrations: mast_contract::IntegrationSettings {
                 terminal: None,
                 editor: None,
+                browser: None,
                 auto_port_remap: false,
             },
         },
@@ -2175,7 +2180,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "build".into(),
                 command: "./fail-like-a-gpg-outage.sh".into(),
-                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_start: false, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
             }],
         },
     )
@@ -2230,7 +2235,7 @@ async fn failing_operations_explain_known_error_signatures() {
             commands: vec![mast_contract::ProjectCommand {
                 name: "clash".into(),
                 command: "./fail-like-a-port-clash.sh".into(),
-                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_start: false, cwd: None, after: None, ready_when: None, auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
             }],
         },
     )
@@ -2952,4 +2957,377 @@ async fn a_stale_app_url_is_found_and_repaired() {
     assert!(report.findings.iter().all(|f| f.check != "stale-app-url"));
     let plan = engine.repair_preview("fix-app-url", None, Some(&pid)).await.unwrap();
     assert!(plan.no_op);
+}
+
+// ---------- mast.yml: the committed command manifest ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manifest_commands_appear_run_shadow_and_never_persist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "manifested");
+    std::fs::write(
+        project.join("mast.yml"),
+        "commands:\n\
+         \x20 mark:\n\
+         \x20   command: touch from-manifest.txt\n\
+         \x20 vite:\n\
+         \x20   command: npm run dev\n\
+         \x20   auto_start: true\n",
+    )
+    .unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "manifest commands listed", |s| {
+        s.projects.first().is_some_and(|p| p.commands.iter().any(|c| c.from_manifest))
+    })
+    .await;
+    let pid = snap.projects[0].id.clone();
+    let vite = snap.projects[0].commands.iter().find(|c| c.name == "vite").unwrap();
+    assert!(vite.auto_start && vite.from_manifest);
+
+    // Manifest commands run like saved ones — same argv path, same cwd.
+    run_action(&engine, Action::RunProjectCommand { id: pid.clone(), name: "mark".into() }).await;
+    assert!(project.join("from-manifest.txt").is_file());
+
+    // Clients send the merged list back on save. The manifest entries in it
+    // must not be persisted as app-data copies, and a saved command of a
+    // manifest name shadows the shared one.
+    let mut sent = snap.projects[0].commands.clone();
+    sent.push(mast_contract::ProjectCommand {
+        name: "vite".into(),
+        command: "npm run dev -- --host".into(),
+        auto_start: false, cwd: None, after: None, ready_when: None,
+        auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+    });
+    run_action(&engine, Action::SetProjectCommands { id: pid.clone(), commands: sent }).await;
+    let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
+    let records = &store.load_projects().unwrap()[0].commands;
+    assert_eq!(records.len(), 1, "only the local override persists: {records:?}");
+    let snap = engine.snapshot();
+    let listed = &snap.projects[0].commands;
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let vite = listed.iter().find(|c| c.name == "vite").unwrap();
+    assert!(!vite.from_manifest, "the local vite shadows the manifest one");
+    assert_eq!(vite.command, "npm run dev -- --host");
+    assert!(listed.iter().any(|c| c.name == "mark" && c.from_manifest));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broken_manifest_warns_and_never_blocks_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "broken-manifest");
+    std::fs::write(
+        project.join("mast.yml"),
+        "commands:\n  web:\n    cmd: npm run dev\n",
+    )
+    .unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "manifest warning surfaced", |s| {
+        s.projects
+            .first()
+            .is_some_and(|p| p.warnings.iter().any(|w| w.contains("no `command:` line")))
+    })
+    .await;
+    // The mistake is named, the project loads, and nothing half-parsed runs.
+    assert!(snap.projects[0].commands.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_moves_saved_commands_into_the_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "exported");
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![
+                mast_contract::ProjectCommand {
+                    name: "mark".into(),
+                    command: "touch exported.txt".into(),
+                    auto_start: true, cwd: None, after: None, ready_when: None,
+                    auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+                },
+                mast_contract::ProjectCommand {
+                    name: "worker".into(),
+                    command: "sail artisan queue:work".into(),
+                    auto_start: false, cwd: None, after: None, ready_when: None,
+                    auto_restart: true,
+                    restart_when_changed: vec!["app/**".into()],
+                    from_manifest: false,
+                },
+            ],
+        },
+    )
+    .await;
+    run_action(&engine, Action::ExportProjectManifest { id: pid.clone() }).await;
+
+    // The file carries the commands; the app-data copies are gone; the
+    // summary now serves the same commands from the manifest.
+    let body = std::fs::read_to_string(project.join("mast.yml")).unwrap();
+    assert!(body.contains("mark:"), "{body}");
+    assert!(body.contains("auto_restart: true"), "{body}");
+    let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
+    assert!(store.load_projects().unwrap()[0].commands.is_empty());
+    let snap = engine.snapshot();
+    let worker = snap.projects[0].commands.iter().find(|c| c.name == "worker").unwrap();
+    assert!(worker.from_manifest && worker.auto_restart);
+    assert_eq!(worker.restart_when_changed, vec!["app/**"]);
+    run_action(&engine, Action::RunProjectCommand { id: pid.clone(), name: "mark".into() }).await;
+    assert!(project.join("exported.txt").is_file());
+
+    // A second export cannot clobber the file people now maintain by hand.
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "other".into(),
+                command: "true".into(),
+                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+            }],
+        },
+    )
+    .await;
+    let error = run_action_capture_failure(&engine, Action::ExportProjectManifest { id: pid })
+        .await
+        .expect("exporting over an existing manifest must refuse");
+    assert!(error.contains("already exists"), "{error}");
+}
+
+// ---------- auto-restart and restart-on-change supervision ----------
+// Shell-script vehicles (chmod +x, #!/bin/sh), so unix-only like the
+// signature tests above; the supervision logic itself is platform-neutral
+// and unit-tested in supervise.rs.
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_restart_relaunches_and_stop_ends_the_arrangement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "flappy");
+    std::fs::write(project.join("die.sh"), "#!/bin/sh\necho lived briefly\nexit 7\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("die.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "serve".into(),
+                command: "./die.sh".into(),
+                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_restart: true, restart_when_changed: Vec::new(), from_manifest: false,
+            }],
+        },
+    )
+    .await;
+
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "serve".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    // One operation, several lives: wait for the second restart notice, then
+    // Stop — cancel must end the whole arrangement, not one child.
+    let mut restarts = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while restarts < 2 {
+        let event = tokio::time::timeout_at(deadline, events.next())
+            .await
+            .expect("restarts within the deadline")
+            .expect("stream stays open while running");
+        if let OperationEventKind::Output { line, .. } = &event.kind
+            && line.contains("restarting in")
+        {
+            assert!(line.contains("status 7"), "{line}");
+            restarts += 1;
+        }
+    }
+    engine.cancel(id).unwrap();
+    let cancelled = loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("terminal event after cancel")
+        {
+            Some(event) if matches!(event.kind, OperationEventKind::Cancelled) => break true,
+            Some(event) if event.kind.is_terminal() => break false,
+            Some(_) => continue,
+            None => break false,
+        }
+    };
+    assert!(cancelled, "stop must read as Cancelled, not as a failure");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watched_file_change_restarts_the_running_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "watched");
+    std::fs::create_dir_all(project.join("app")).unwrap();
+    std::fs::write(project.join("serve.sh"), "#!/bin/sh\necho up and serving\nsleep 300\n")
+        .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("serve.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "serve".into(),
+                command: "./serve.sh".into(),
+                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_restart: false,
+                restart_when_changed: vec!["app/**".into()],
+                from_manifest: false,
+            }],
+        },
+    )
+    .await;
+
+    let id = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "serve".into() })
+        .unwrap();
+    let mut events = engine.operation_events(id).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    async fn next_line(
+        events: &mut BoxStream<'static, mast_contract::OperationEvent>,
+        deadline: tokio::time::Instant,
+    ) -> String {
+        loop {
+            let event = tokio::time::timeout_at(deadline, events.next())
+                .await
+                .expect("event within the deadline")
+                .expect("stream stays open");
+            if let OperationEventKind::Output { line, .. } = event.kind {
+                return line;
+            }
+            assert!(!event.kind.is_terminal(), "command must still be running");
+        }
+    }
+    // First life is up…
+    loop {
+        if next_line(&mut events, deadline).await.contains("up and serving") {
+            break;
+        }
+    }
+    // …then a change under app/ (and only under app/) restarts it.
+    std::fs::write(project.join("app").join("Job.php"), "<?php // v2\n").unwrap();
+    loop {
+        let line = next_line(&mut events, deadline).await;
+        if line.contains("changed — restarting") {
+            assert!(line.contains("Job.php"), "{line}");
+            break;
+        }
+    }
+    loop {
+        if next_line(&mut events, deadline).await.contains("up and serving") {
+            break;
+        }
+    }
+    engine.cancel(id).unwrap();
+}
+
+// ---------- clone wizard: git clone → bootstrap → import ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clone_project_imports_and_bootstraps_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The "upstream" repo a teammate would push: compose file + .env.example,
+    // no composer.json — so the whole bootstrap that needs docker is skipped
+    // and the test runs anywhere git does.
+    let source = tmp.path().join("upstream");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("compose.yaml"),
+        "services:\n  app:\n    image: alpine:latest\n",
+    )
+    .unwrap();
+    std::fs::write(source.join(".env.example"), "APP_PORT=8089\n").unwrap();
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out =
+            std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"], &source);
+    git(&["add", "-A"], &source);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"], &source);
+
+    let parent = tmp.path().join("code");
+    std::fs::create_dir_all(&parent).unwrap();
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+
+    run_action(
+        &engine,
+        Action::CloneProject {
+            url: source.to_string_lossy().into(),
+            parent: parent.to_string_lossy().into(),
+            name: "cloned".into(),
+        },
+    )
+    .await;
+    let snap = wait_until(&engine, "cloned project imported", |s| {
+        s.projects.iter().any(|p| p.name == "cloned")
+    })
+    .await;
+    let project = snap.projects.iter().find(|p| p.name == "cloned").unwrap();
+    // The bootstrap's one universal step ran: .env exists as a copy of the
+    // example, so compose interpolation works on first start.
+    let env_path = std::path::Path::new(&project.path).join(".env");
+    let env = std::fs::read_to_string(&env_path).unwrap();
+    assert!(env.contains("APP_PORT=8089"), "{env}");
+
+    // Refusals are named: a token-bearing URL, and a taken target.
+    let denied = run_action_capture_failure(
+        &engine,
+        Action::CloneProject {
+            url: "https://x:token@example.com/a.git".into(),
+            parent: parent.to_string_lossy().into(),
+            name: "second".into(),
+        },
+    )
+    .await
+    .expect("credential URLs must refuse");
+    assert!(denied.contains("credential"), "{denied}");
+    let taken = run_action_capture_failure(
+        &engine,
+        Action::CloneProject {
+            url: source.to_string_lossy().into(),
+            parent: parent.to_string_lossy().into(),
+            name: "cloned".into(),
+        },
+    )
+    .await
+    .expect("an occupied target must refuse");
+    assert!(taken.contains("already exists"), "{taken}");
 }

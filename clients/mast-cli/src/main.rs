@@ -17,6 +17,8 @@ use mast_contract::{
 use mast_engine::{Engine, EngineConfig, EngineDeps, RealConnector, RealLifecycleRunner};
 use mast_project::MetadataStore;
 
+mod mcp;
+
 /// Shown above `--help` and on a bare `mast`. Block glyphs, so it needs a
 /// monospace terminal — which is the only place it is ever printed.
 const BANNER: &str = concat!(
@@ -85,6 +87,16 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
+    /// List a project's data snapshots (labeled docker volumes).
+    Snapshots { project: String },
+    /// Snapshot a service's data volumes — the thing to run BEFORE a risky
+    /// migration. The container is stopped for a consistent copy and
+    /// restarted after. Restores happen in the desktop app.
+    Snapshot { project: String, service: String },
+    /// MCP server over stdio — register `mast mcp` in a coding agent's MCP
+    /// settings so it can see and drive your projects instead of shelling
+    /// docker compose blind.
+    Mcp,
 }
 
 #[tokio::main]
@@ -135,6 +147,11 @@ async fn main() {
         Command::History { background, limit } => {
             history(client.as_ref(), background, limit).await
         }
+        Command::Snapshots { project } => snapshots(client.as_ref(), &project).await,
+        Command::Snapshot { project, service } => {
+            snapshot(client.as_ref(), &project, service).await
+        }
+        Command::Mcp => mcp::serve(client.as_ref()).await,
     };
     std::process::exit(code);
 }
@@ -180,7 +197,7 @@ fn embedded_engine() -> Arc<dyn MastClient> {
 
 /// Wait for the effect loops to produce a meaningful snapshot: docker status
 /// resolved and a settle window with no new patches.
-async fn settled_snapshot(client: &dyn MastClient) -> EngineSnapshot {
+pub(crate) async fn settled_snapshot(client: &dyn MastClient) -> EngineSnapshot {
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut last_seq = 0;
     let mut stable_since = Instant::now();
@@ -270,7 +287,7 @@ async fn status(client: &dyn MastClient) -> i32 {
 
 /// Quote one argument so pasting the printed line into a shell reproduces the
 /// command exactly — the whole point of showing it.
-fn shell_quote(arg: &str) -> String {
+pub(crate) fn shell_quote(arg: &str) -> String {
     let bare = !arg.is_empty()
         && arg.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
     if bare {
@@ -337,7 +354,10 @@ async fn history(client: &dyn MastClient, background: bool, limit: usize) -> i32
     0
 }
 
-fn resolve_project(snap: &EngineSnapshot, wanted: &str) -> Result<(ProjectId, String), String> {
+pub(crate) fn resolve_project(
+    snap: &EngineSnapshot,
+    wanted: &str,
+) -> Result<(ProjectId, String), String> {
     let matches: Vec<_> = snap
         .projects
         .iter()
@@ -408,6 +428,105 @@ async fn lifecycle(
             }
             OperationEventKind::Failed { error } => {
                 eprintln!("{name}: {error}");
+                return 1;
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+async fn snapshots(client: &dyn MastClient, wanted: &str) -> i32 {
+    let snap = settled_snapshot(client).await;
+    let (id, name) = match resolve_project(&snap, wanted) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let snapshots = match client.volume_snapshots(id).await {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            eprintln!("cannot list snapshots: {e}");
+            return 2;
+        }
+    };
+    if snapshots.is_empty() {
+        println!("{name}: no data snapshots — take one with `mast snapshot {name} <service>`");
+        return 0;
+    }
+    println!("{name} — newest first:");
+    for snapshot in snapshots {
+        let at = chrono_free_stamp(snapshot.at_unix_ms);
+        println!(
+            "  {}  {}  {}  ({})",
+            at,
+            snapshot.group,
+            snapshot.service,
+            snapshot.volumes.join(", ")
+        );
+    }
+    println!("restores run in the desktop app, behind its confirm");
+    0
+}
+
+/// A local timestamp without pulling a date crate: seconds since the epoch
+/// are exact and sortable, which is what a terminal listing needs most.
+fn chrono_free_stamp(at_unix_ms: u64) -> String {
+    let secs = at_unix_ms / 1000;
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(secs))
+        .unwrap_or(0);
+    match ago {
+        s if s < 90 => format!("{s}s ago"),
+        s if s < 90 * 60 => format!("{}m ago", s / 60),
+        s if s < 48 * 3600 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+async fn snapshot(client: &dyn MastClient, wanted: &str, service: String) -> i32 {
+    let snap = settled_snapshot(client).await;
+    let (id, name) = match resolve_project(&snap, wanted) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let op = match client.dispatch(Action::SnapshotServiceData { id, service: service.clone() }).await
+    {
+        Ok(op) => op,
+        Err(e) => {
+            eprintln!("{name}/{service}: {e}");
+            if snap.read_only {
+                eprintln!("(the desktop app owns mutation — control it from there for now)");
+            }
+            return 1;
+        }
+    };
+    let mut events = match client.operation_events(op).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    while let Some(event) = events.next().await {
+        match event.kind {
+            OperationEventKind::Output { line, .. } => println!("{line}"),
+            OperationEventKind::Completed => {
+                println!("{name}/{service}: snapshot saved");
+                return 0;
+            }
+            OperationEventKind::Cancelled => {
+                println!("{name}/{service}: cancelled");
+                return 1;
+            }
+            OperationEventKind::Failed { error } => {
+                eprintln!("{name}/{service}: {error}");
                 return 1;
             }
             _ => {}

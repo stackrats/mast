@@ -183,6 +183,17 @@ async fn log_captures(state: State<'_, AppState>, limit: u32) -> Result<Vec<LogC
     state.client.log_captures(limit).await.map_err(|e| e.to_string())
 }
 
+/// Data snapshots for a project's services, newest first — read from
+/// docker's volume labels on demand, never cached.
+#[tauri::command]
+#[specta::specta]
+async fn volume_snapshots(
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<Vec<mast_contract::VolumeSnapshot>, String> {
+    state.client.volume_snapshots(project).await.map_err(|e| e.to_string())
+}
+
 /// Follow log captures. Append-only — the frontend prepends. Replaces any
 /// earlier subscription.
 #[tauri::command]
@@ -408,6 +419,7 @@ fn specta_builder() -> tauri_specta::Builder {
             history_recent,
             start_history_stream,
             log_captures,
+            volume_snapshots,
             start_capture_stream,
             start_usage_stream,
             stop_usage_stream,

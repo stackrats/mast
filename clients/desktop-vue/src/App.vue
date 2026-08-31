@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 
@@ -45,6 +45,19 @@ function onKeydown(event: KeyboardEvent) {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     paletteOpen.value = !paletteOpen.value;
+    return;
+  }
+  // Ctrl/Cmd-1…9 jumps to the nth sidebar project (same alphabetical order
+  // the sidebar shows). Same "leave from anywhere" rule as the palette.
+  if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {
+    const n = Number(event.key);
+    if (n >= 1 && n <= 9) {
+      const project = store.projects[n - 1];
+      if (project) {
+        event.preventDefault();
+        store.selection = { kind: "project", id: project.id };
+      }
+    }
   }
 }
 
@@ -64,7 +77,21 @@ applyTheme(loadTheme());
 function syncUsageToVisibility() {
   if (document.hidden) void store.disconnectUsage();
   else void store.connectUsage();
+  // Coming back to a window already showing the project counts as visiting
+  // it — its attention marker has been seen.
+  if (!document.hidden && store.selection.kind === "project") {
+    store.clearAttention(store.selection.id);
+  }
 }
+
+// Navigating to a project is what clears its attention dot: the state the
+// dot pointed at is now on screen.
+watch(
+  () => store.selection,
+  (selection) => {
+    if (selection.kind === "project") store.clearAttention(selection.id);
+  },
+);
 
 onMounted(() => {
   void store.connect();

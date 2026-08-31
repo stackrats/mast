@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Network, Pencil, Play, Square, Trash2, TriangleAlert, X } from "lucide-vue-next";
+import { CircleStop, Network, Pencil, Play, Trash2, TriangleAlert, X } from "lucide-vue-next";
 
 import type { ProjectId, WorkspaceSummary } from "../bindings";
 import { statusBadgeVariant } from "../lib/status";
@@ -98,7 +98,7 @@ function projectName(id: string): string {
           </Button>
           <Button
             v-if="workspace.status !== 'stopped'"
-            variant="destructive"
+            variant="outline"
             :disabled="store.busy > 0"
             @click="
               store.runLifecycle(workspace.id, 'stop workspace', {
@@ -107,7 +107,7 @@ function projectName(id: string): string {
               })
             "
           >
-            <Square class="h-3.5 w-3.5" /> Stop all
+            <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop all
           </Button>
           <Button variant="outline" @click="emit('edit')"
             ><Pencil class="h-3.5 w-3.5" /> Edit</Button

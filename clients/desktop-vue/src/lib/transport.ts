@@ -19,6 +19,7 @@ import {
   type Result,
   type SubscriptionItem,
   type UsageSample,
+  type VolumeSnapshot,
 } from "../bindings";
 import type { PatchTransport } from "./engineSync";
 
@@ -138,6 +139,13 @@ export async function pickDirectory(title: string): Promise<string | null> {
   return typeof chosen === "string" ? chosen : null;
 }
 
+/** Native file picker — for pointing a tool setting at a program on disk
+ * (on macOS an `.app` bundle counts as a file). Null when the user cancels. */
+export async function pickFile(title: string): Promise<string | null> {
+  const chosen = await open({ directory: false, multiple: false, title });
+  return typeof chosen === "string" ? chosen : null;
+}
+
 /** The effect-history backlog: what Mast has run and written, oldest first. */
 export async function historyRecent(): Promise<HistoryEntry[]> {
   return unwrap(await commands.historyRecent());
@@ -153,6 +161,10 @@ export async function startHistoryStream(onEntry: (entry: HistoryEntry) => void)
 
 /** Stored log captures, newest first — read from disk, so this returns
  * captures taken before the app was last closed. */
+export async function volumeSnapshots(project: ProjectId): Promise<VolumeSnapshot[]> {
+  return unwrap(await commands.volumeSnapshots(project));
+}
+
 export async function logCaptures(limit: number): Promise<LogCapture[]> {
   return unwrap(await commands.logCaptures(limit));
 }

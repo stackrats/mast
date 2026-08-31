@@ -223,6 +223,18 @@ async logCaptures(limit: number) : Promise<Result<LogCapture[], string>> {
 }
 },
 /**
+ * Data snapshots for a project's services, newest first — read from
+ * docker's volume labels on demand, never cached.
+ */
+async volumeSnapshots(project: ProjectId) : Promise<Result<VolumeSnapshot[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("volume_snapshots", { project }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Follow log captures. Append-only — the frontend prepends. Replaces any
  * earlier subscription.
  */
@@ -476,9 +488,11 @@ export type Action =
 /**
  * Open one file inside a project in the configured editor — the
  * vendored runtime's `php.ini` or `Dockerfile` from the PHP runtime
- * dialog. `file` is project-relative and may not escape the project.
+ * dialog, or a file named by a log entry. `file` is project-relative
+ * and may not escape the project. `line` jumps there when the editor
+ * has a syntax for it (absent otherwise — older clients never send it).
  */
-{ type: "openProjectFile"; id: ProjectId; file: string } | 
+{ type: "openProjectFile"; id: ProjectId; file: string; line?: number | null } | 
 /**
  * New-project wizard (M7): the documented Sail install — composer
  * create-project, `composer require laravel/sail --dev`, then `php artisan
@@ -516,7 +530,52 @@ export type Action =
 /**
  * Delete every stored log capture.
  */
-{ type: "clearLogCaptures" }
+{ type: "clearLogCaptures" } | 
+/**
+ * Move the project's saved commands into a committed `mast.yml` at the
+ * project root, so the setup travels with the repo instead of living on
+ * one machine. Refuses when the file already exists — Mast writes the
+ * first draft, people maintain it.
+ */
+{ type: "exportProjectManifest"; id: ProjectId } | 
+/**
+ * Open a terminal running `php artisan tinker` inside the app
+ * container — the REPL one click from the project, needing nothing on
+ * the host.
+ */
+{ type: "openTinker"; id: ProjectId } | 
+/**
+ * Hand a database connection URL to the desktop, which dispatches on
+ * scheme to whatever client registered it. Only database schemes are
+ * accepted; http(s) has [`Action::OpenUrl`].
+ */
+{ type: "openDbUrl"; url: string } | 
+/**
+ * Copy a service's named volumes into labeled snapshot volumes, cold:
+ * the container is stopped for the copy and restarted after if it was
+ * running. The insurance to buy BEFORE a risky migration — or before
+ * [`Action::RestoreServiceData`] overwrites what is there now.
+ */
+{ type: "snapshotServiceData"; id: ProjectId; service: string } | 
+/**
+ * Overwrite the service's current volume data with a snapshot's, cold
+ * (stop, wipe, copy back, restart). DESTRUCTIVE of the current data —
+ * clients must confirm, and should offer a fresh snapshot first.
+ */
+{ type: "restoreServiceData"; id: ProjectId; group: string } | 
+/**
+ * Delete one snapshot's volumes permanently.
+ */
+{ type: "removeServiceDataSnapshot"; group: string } | 
+/**
+ * Clone a git repository into `parent/name`, bootstrap what a fresh
+ * clone always lacks (containerized `composer install`, `.env` from
+ * `.env.example`, an app key — each only when missing), and import the
+ * result: the team-onboarding mirror of [`Action::CreateProject`].
+ * Refuses http(s) URLs with embedded credentials — effect history
+ * records every argv verbatim, and a token must never land there.
+ */
+{ type: "cloneProject"; url: string; parent: string; name: string }
 /**
  * Why a capture was taken. The reason is the whole diagnostic frame: the same
  * forty lines mean something different before a user-requested restart than
@@ -723,6 +782,12 @@ terminal: string | null;
  * Editor binary (e.g. "code", "zed").
  */
 editor: string | null; 
+/**
+ * Browser binary (e.g. "vivaldi", "firefox"); on macOS also an app
+ * bundle ("Vivaldi.app"). `None` = the desktop's default browser.
+ * Absent in settings written before this existed.
+ */
+browser?: string | null; 
 /**
  * Move a published host port into `.env` when something else already
  * holds it, instead of letting `up` fail on the bind. Defaults on.
@@ -934,7 +999,27 @@ after?: string | null;
  * up, and one that keeps chattering is indistinguishable from one that
  * is still working.
  */
-readyWhen?: string | null }
+readyWhen?: string | null; 
+/**
+ * Relaunch after ANY exit that was not asked for — a dev server dying
+ * is something to recover from, not report. Rapid exits stop the loop
+ * (a command that cannot stay up needs a person), and the operation
+ * then fails with the last exit in hand.
+ */
+autoRestart?: boolean; 
+/**
+ * Glob patterns, relative to the command's working directory, whose
+ * file changes restart the running command — a queue worker never sees
+ * new code until relaunched. Empty = never restart on file changes.
+ */
+restartWhenChanged?: string[]; 
+/**
+ * Defined by the project's committed `mast.yml` rather than saved in
+ * app data. Shown read-only (edit the file), skipped when persisting
+ * [`Action::SetProjectCommands`], and shadowed by a saved command of
+ * the same name — a local override beats the shared default.
+ */
+fromManifest?: boolean }
 export type ProjectId = string
 export type ProjectStatus = "stopped" | "starting" | "running" | "degraded" | "failed"
 export type ProjectSummary = { id: ProjectId; name: string; 
@@ -1063,7 +1148,13 @@ dbPort?: number | null;
  * verbs cannot address it ("no such service"), so its lifecycle goes
  * straight to the docker CLI, and a whole-project Rebuild reaps it.
  */
-orphaned?: boolean }
+orphaned?: boolean; 
+/**
+ * Named volumes this service mounts (compose source names, bind mounts
+ * excluded) — non-empty is what makes the data-snapshot verbs worth
+ * offering on its chip.
+ */
+dataVolumes?: string[] }
 /**
  * One service's share of the machine, over one sampling interval.
  */
@@ -1116,6 +1207,21 @@ export type UsageSample = { atUnixMs: number;
  * Cores the host has, so a client can say "2.3 of 8" rather than "2.3".
  */
 hostCores: number; hostMemoryBytes: number; services: ServiceUsage[] }
+/**
+ * One point-in-time copy of a service's named volumes
+ * ([`Action::SnapshotServiceData`]). Docker itself is the store: each copy
+ * is a labeled volume, so snapshots survive an app-data wipe and need no
+ * database of their own.
+ */
+export type VolumeSnapshot = { 
+/**
+ * Groups the per-volume copies of one snapshot action.
+ */
+group: string; project: ProjectId; service: string; atUnixMs: number; 
+/**
+ * Compose source names of the volumes captured (e.g. `sail-mysql`).
+ */
+volumes: string[] }
 export type WorkspaceId = string
 export type WorkspaceMember = { project: ProjectId; 
 /**

@@ -287,6 +287,10 @@ async fn handle_request(
             let limit: u32 = param(&params, "limit")?;
             ok(engine.log_captures(limit).await?)
         }
+        "volumeSnapshots" => {
+            let project: ProjectId = param(&params, "project")?;
+            ok(engine.volume_snapshots(&project).await?)
+        }
         "subscribeLogCaptures" => {
             let stream_id: u64 = param(&params, "stream")?;
             pump(tx.clone(), stream_id, engine.subscribe_log_captures());
