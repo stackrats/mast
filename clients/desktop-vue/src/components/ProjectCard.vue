@@ -493,7 +493,12 @@ const newName = ref("");
 const newCommand = ref("");
 const newAuto = ref(false);
 const newCwd = ref("");
-const newAfter = ref("");
+/** "no dependency" needs a real value: a Select treats the empty string as
+ * "nothing selected" and renders its placeholder, so the default option was
+ * invisible and the field looked broken. Mapped back to null on save. */
+const WITH_PROJECT = "with-project";
+
+const newAfter = ref(WITH_PROJECT);
 const newReadyWhen = ref("");
 const newAutoRestart = ref(false);
 const newRestartGlobs = ref("");
@@ -504,7 +509,7 @@ function openCommandDialog(cmd?: ProjectCommand) {
   newCommand.value = cmd?.command ?? "";
   newAuto.value = cmd?.autoStart ?? false;
   newCwd.value = cmd?.cwd ?? "";
-  newAfter.value = cmd?.after ?? "";
+  newAfter.value = cmd?.after ?? WITH_PROJECT;
   newReadyWhen.value = cmd?.readyWhen ?? "";
   newAutoRestart.value = cmd?.autoRestart ?? false;
   newRestartGlobs.value = (cmd?.restartWhenChanged ?? []).join(" ");
@@ -523,18 +528,21 @@ async function exportManifest() {
  * that fails silently: the chip just stays grey. Say so in the dialog, where
  * the mistake is still cheap to undo. */
 const afterNotAuto = computed(() => {
-  const after = newAfter.value.trim();
+  const after = newAfter.value === WITH_PROJECT ? "" : newAfter.value.trim();
   if (!after || !newAuto.value) return false;
   return commands.value.some((c) => c.name === after && !c.autoStart);
 });
 
-/** The other commands this one could wait for — itself excluded, since a
- * command that waits for itself never starts. */
+/** Commands this one could wait for — itself excluded (a command that waits
+ * for itself never starts), and only those that auto-start, since nothing
+ * else will ever be running to wait on. */
+const waitableCommands = computed(() =>
+  commands.value.filter((c) => c.name !== editingCommand.value),
+);
+
 const afterOptions = computed(() => [
-  { value: "", label: "start with the project" },
-  ...commands.value
-    .filter((c) => c.name !== editingCommand.value)
-    .map((c) => ({ value: c.name, label: `after ${c.name}` })),
+  { value: WITH_PROJECT, label: "start with the project" },
+  ...waitableCommands.value.map((c) => ({ value: c.name, label: `after ${c.name}` })),
 ]);
 
 /** Why the form cannot be submitted yet, or null when it can. Names are the
@@ -576,7 +584,7 @@ async function saveCommandForm() {
     command,
     autoStart: newAuto.value,
     cwd: newCwd.value.trim() || null,
-    after: (newAuto.value && newAfter.value.trim()) || null,
+    after: (newAuto.value && newAfter.value !== WITH_PROJECT && newAfter.value) || null,
     readyWhen: newReadyWhen.value.trim() || null,
     autoRestart: newAutoRestart.value,
     restartWhenChanged: newRestartGlobs.value.trim().split(/\s+/).filter(Boolean),
@@ -1995,7 +2003,10 @@ async function clearAppLog() {
         </p>
         <Checkbox block v-model="newAuto" label="Run automatically when the project starts" />
         <template v-if="newAuto">
-          <label class="block text-xs text-slate-600 dark:text-slate-300">
+          <label
+            v-if="waitableCommands.length"
+            class="block text-xs text-slate-600 dark:text-slate-300"
+          >
             Start it
             <Select v-model="newAfter" :options="afterOptions" class="mt-1" />
           </label>
@@ -2004,7 +2015,7 @@ async function clearAppLog() {
             nothing will be waiting on — turn its auto-start on, or this command will never run by
             itself.
           </p>
-          <p v-if="newAfter" class="text-xs text-slate-400">
+          <p v-if="newAfter !== WITH_PROJECT" class="text-xs text-slate-400">
             Waits for <span class="font-mono">{{ newAfter }}</span> to finish starting — not to
             exit, which a dev server never does. Mast takes it as up when its
             <span class="font-mono">ready when</span> text appears, or, if it has none, when its
