@@ -26,8 +26,9 @@ pub struct RealConnector;
 impl RuntimeConnector for RealConnector {
     async fn connect(&self) -> Result<(Arc<dyn RuntimeAdapter>, DockerStatus), DockerError> {
         let endpoint = resolve_endpoint().await?;
-        let adapter = BollardAdapter::connect(&endpoint)?;
-        adapter.ping().await?;
+        let adapter =
+            BollardAdapter::connect(&endpoint).map_err(|e| at_endpoint(e, &endpoint.host))?;
+        adapter.ping().await.map_err(|e| at_endpoint(e, &endpoint.host))?;
         let status = DockerStatus {
             available: true,
             context_name: Some(endpoint.context_name.clone()),
@@ -109,6 +110,15 @@ fn connect_error_text(e: &DockerError) -> String {
     }
 }
 
+/// Attach the endpoint to a connection failure.
+///
+/// bollard reports what went wrong with the transport and never where. "Where"
+/// is the difference between a local daemon that is not running and a remote
+/// host that will not answer — the same failure, and opposite advice.
+fn at_endpoint(e: DockerError, host: &str) -> DockerError {
+    DockerError::Api(format!("{e} (endpoint: {host})"))
+}
+
 /// Which of the four repairs the user is actually facing.
 ///
 /// Only the missing-CLI case is structural; the rest have to be read out of the
@@ -134,16 +144,35 @@ fn classify_unavailable(e: &DockerError) -> DockerUnavailable {
     // Order matters: a permission failure on a socket path also mentions the
     // path, so the narrower diagnosis has to be tested first.
     if text.contains("permission denied") || text.contains("access is denied") {
-        DockerUnavailable::PermissionDenied
-    } else if text.contains("no such file or directory")
+        return DockerUnavailable::PermissionDenied;
+    }
+    // `client error (connect)` is the one that matters and the one this first
+    // shipped without. hyper reports a refused connection with exactly that and
+    // nothing else — no errno, no path — so the earlier list, written against a
+    // plausible-looking string rather than an observed one, matched none of it
+    // and every stopped daemon on Linux was reported as "unreachable".
+    let refused = text.contains("client error (connect)")
+        || text.contains("error trying to connect")
+        || text.contains("no such file or directory")
         || text.contains("connection refused")
         || text.contains("cannot connect to the docker daemon")
         || text.contains("is the docker daemon running")
-        || text.contains("the system cannot find the file specified")
-    {
-        DockerUnavailable::NotRunning
-    } else {
+        || text.contains("the system cannot find the file specified");
+    if !refused {
+        return DockerUnavailable::Unreachable;
+    }
+    // A refused *local* endpoint is a daemon that is not running. A refused
+    // remote one is a network problem, and "start Docker" is useless advice for
+    // a host on the other end of a cable. Absent an endpoint we assume local,
+    // which is what almost every install is.
+    let remote = text.contains("tcp://")
+        || text.contains("ssh://")
+        || text.contains("http://")
+        || text.contains("https://");
+    if remote {
         DockerUnavailable::Unreachable
+    } else {
+        DockerUnavailable::NotRunning
     }
 }
 
@@ -1027,18 +1056,36 @@ mod docker_classification_tests {
         );
     }
 
-    // What the Omarchy guest actually produced: bollard wrapping hyper
-    // wrapping a socket that is not there. The variant says only "Connect",
-    // which is why the text has to be read.
+    // Verbatim from an Omarchy guest with dockerd stopped. Note what is NOT
+    // here: no errno, no socket path, no "is the daemon running". hyper reports
+    // a refused connection as "client error (Connect)" and stops.
+    //
+    // The first version of this test invented a "No such file or directory (os
+    // error 2)" suffix that reads plausibly and does not occur, so the
+    // classifier matched none of the real string and every stopped daemon was
+    // reported to the user as "Docker isn't reachable". A test written from a
+    // guess at the data cannot fail on the data being wrong.
+    const REAL_STOPPED_DAEMON: &str =
+        "docker API error: Error in the hyper legacy client: client error (Connect) \
+         (endpoint: unix:///var/run/docker.sock)";
+
+    #[test]
+    fn the_error_a_stopped_daemon_actually_produces_is_not_running() {
+        assert_eq!(
+            classify_unavailable(&api(REAL_STOPPED_DAEMON)),
+            DockerUnavailable::NotRunning
+        );
+    }
+
     #[test]
     fn a_dead_socket_is_not_running() {
         for message in [
-            "docker API error: Error in the hyper legacy client: client error (Connect): \
-             No such file or directory (os error 2)",
-            "error trying to connect: Connection refused (os error 111)",
+            "error trying to connect: Connection refused (os error 111) \
+             (endpoint: unix:///var/run/docker.sock)",
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
              Is the docker daemon running?",
-            "The system cannot find the file specified. (os error 2)",
+            "The system cannot find the file specified. (os error 2) \
+             (endpoint: npipe:////./pipe/docker_engine)",
         ] {
             assert_eq!(
                 classify_unavailable(&api(message)),
@@ -1048,10 +1095,29 @@ mod docker_classification_tests {
         }
     }
 
+    // The same transport failure against a remote host is not a stopped local
+    // daemon, and "start the Docker service" would send the reader to the wrong
+    // machine entirely.
+    #[test]
+    fn the_same_failure_against_a_remote_endpoint_is_unreachable() {
+        for endpoint in ["tcp://10.0.0.4:2375", "ssh://user@buildbox", "https://docker.example"] {
+            let message = format!(
+                "docker API error: Error in the hyper legacy client: client error (Connect) \
+                 (endpoint: {endpoint})"
+            );
+            assert_eq!(
+                classify_unavailable(&api(&message)),
+                DockerUnavailable::Unreachable,
+                "{endpoint}"
+            );
+        }
+    }
+
     #[test]
     fn a_refused_socket_is_a_permission_problem() {
         for message in [
-            "error trying to connect: Permission denied (os error 13)",
+            "error trying to connect: Permission denied (os error 13) \
+             (endpoint: unix:///var/run/docker.sock)",
             "Got permission denied while trying to connect to the Docker daemon socket",
             "Access is denied. (os error 5)",
         ] {

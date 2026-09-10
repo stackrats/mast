@@ -51,10 +51,15 @@ export async function sessionInfo(): Promise<SessionInfo> {
 export async function applyZoom(scale: number): Promise<void> {
   try {
     await getCurrentWebview().setZoom(scale);
-  } catch {
-    // Zoom is unsupported on some webviews and absent outside Tauri entirely
-    // (the vanilla-vite fallback build runs in a plain browser). The app is
-    // fully usable at 100%; refusing to start over it would not be.
+  } catch (error) {
+    // Not fatal: zoom is absent outside Tauri entirely (the vanilla-vite
+    // fallback build runs in a plain browser) and the app is fully usable at
+    // 100%. But it is reported, because the first version of this swallowed
+    // the error and the setting silently did nothing on every platform — the
+    // capability was missing `core:webview:allow-set-webview-zoom`, Tauri's
+    // ACL rejected every call, and a bare `catch {}` turned a one-line
+    // manifest fix into an invisible one.
+    console.warn("Could not set the webview zoom", error);
   }
 }
 
