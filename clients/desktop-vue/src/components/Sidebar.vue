@@ -327,7 +327,12 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
     :inert="!visible || undefined"
     class="flex flex-col overflow-hidden border-r border-slate-200 motion-reduce:transition-none dark:border-slate-800"
     :class="[
-      dragging ? '' : 'transition-[width,transform] duration-200 ease-out',
+      // `translate`, not `transform`: Tailwind 4's translate-x utilities set
+      // the standalone `translate` property, so a transition list naming
+      // `transform` covers nothing that changes here. Docked mode slid anyway
+      // because it animates width, which hid the fault in exactly the mode
+      // that was easiest to check.
+      dragging ? '' : 'transition-[width,translate] duration-200 ease-out',
       floating
         ? // Opaque, unlike the docked panel: 60% over a matching pane reads as
           // a tint, but 60% over the content it is covering reads as broken.
