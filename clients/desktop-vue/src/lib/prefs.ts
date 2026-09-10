@@ -90,13 +90,33 @@ export function recordWorkspaceStart(id: string): void {
   local?.setItem(RECENT_WS_KEY, JSON.stringify(next.slice(0, RECENT_WS_CAP)));
 }
 
+export const SIDEBAR_MIN_WIDTH = 180;
+export const SIDEBAR_MAX_WIDTH = 480;
+export const SIDEBAR_DEFAULT_WIDTH = 240;
+
 export function loadSidebarWidth(): number {
   const raw = Number(local?.getItem(SIDEBAR_KEY));
-  return Number.isFinite(raw) && raw >= 180 && raw <= 480 ? raw : 240;
+  return Number.isFinite(raw) && raw >= SIDEBAR_MIN_WIDTH && raw <= SIDEBAR_MAX_WIDTH
+    ? raw
+    : SIDEBAR_DEFAULT_WIDTH;
 }
 
 export function saveSidebarWidth(width: number): void {
   local?.setItem(SIDEBAR_KEY, String(width));
+}
+
+// Whether the sidebar is docked open. Open until the user shuts it, and only
+// the user shuts it — a window too narrow to dock one floats it instead
+// (lib/layout's overlay mode) without touching this, so a tiled window does
+// not quietly rewrite what the next full-size one shows.
+const SIDEBAR_OPEN_KEY = "mast.sidebarOpen";
+
+export function loadSidebarOpen(): boolean {
+  return local?.getItem(SIDEBAR_OPEN_KEY) !== "false";
+}
+
+export function saveSidebarOpen(open: boolean): void {
+  local?.setItem(SIDEBAR_OPEN_KEY, String(open));
 }
 
 // Sidebar rows folded shut, keyed "group:workspaces" / "group:projects" /

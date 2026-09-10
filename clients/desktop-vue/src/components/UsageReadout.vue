@@ -54,7 +54,10 @@ const idle = computed(() => latest.value === null || latest.value.services.lengt
       <template v-else>
         <span class="flex items-center gap-1.5">
           <span class="tabular-nums">{{ formatCores(total.cpuCores) }}</span>
-          <span class="text-slate-400">/ {{ hostCores }} cores</span>
+          <!-- The figure and the strip are the readout; "/ 14 cores" is the
+               caption, and a status strip in a narrow tile has room for one of
+               the two. The tooltip still spells all of it out. -->
+          <span class="hidden text-slate-400 sm:inline">/ {{ hostCores }} cores</span>
           <!-- Floored rather than pinned to the host's core count. A dev
              machine idles at a fraction of a core, and against a 14-core
              ceiling that draws a flat dotted rule with no shape in it. The

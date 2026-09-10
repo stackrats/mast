@@ -22,12 +22,15 @@ import { EngineSync, type SyncPhase } from "../lib/engineSync";
 import { stripAnsi } from "../lib/ansi";
 import { formatElapsed } from "../lib/elapsed";
 import { notify } from "../lib/notify";
+import type { SidebarMode } from "../lib/layout";
 import {
   loadCapturesSeen,
   loadLogsOpen,
+  loadSidebarOpen,
   recordWorkspaceStart,
   saveCapturesSeen,
   saveLogsOpen,
+  saveSidebarOpen,
 } from "../lib/prefs";
 import { applyPatchEvent, sortProjects } from "../lib/projects";
 import { pushBounded } from "../lib/ring";
@@ -189,6 +192,13 @@ export const useEngineStore = defineStore("engine", {
     usageConnected: false,
     logsTab: "output" as "output" | "history" | "captures" | "resources",
     logsOpen: loadLogsOpen(),
+    /** Whether the sidebar is docked open. Persisted: a shut sidebar is a
+     * standing choice. */
+    sidebarOpen: loadSidebarOpen(),
+    /** Whether the floating sidebar is showing, in a window too narrow to
+     * dock one. Deliberately not persisted and always starts shut — it covers
+     * the content pane, so it is a glance, not a state to be restored into. */
+    sidebarOverlay: false,
     logs: null as LogView | null,
     selection: { kind: "home" } as Selection,
     busy: 0,
@@ -505,6 +515,25 @@ export const useEngineStore = defineStore("engine", {
     setLogsOpen(open: boolean) {
       this.logsOpen = open;
       saveLogsOpen(open);
+    },
+
+    /** The one toggle behind the shortcut and the View menu. Which flag it
+     * flips depends on how the sidebar is laid out at that moment: docked, the
+     * choice is a preference and persists; floating, it is a glance the next
+     * selection dismisses. Passing the mode in keeps the store out of the
+     * business of measuring the window. */
+    toggleSidebar(mode: SidebarMode) {
+      if (mode === "overlay") this.sidebarOverlay = !this.sidebarOverlay;
+      else this.setSidebarOpen(!this.sidebarOpen);
+    },
+
+    setSidebarOpen(open: boolean) {
+      this.sidebarOpen = open;
+      saveSidebarOpen(open);
+    },
+
+    setSidebarOverlay(open: boolean) {
+      this.sidebarOverlay = open;
     },
 
     /** Append a line to the global activity feed (the bottom logs panel). */

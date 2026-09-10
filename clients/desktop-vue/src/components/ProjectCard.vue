@@ -1637,7 +1637,9 @@ async function clearAppLog() {
         <p class="mt-4 text-xs font-medium text-slate-600 dark:text-slate-300">
           Extensions ({{ phpRt.extensions.length }})
         </p>
-        <div class="mt-1.5 grid max-h-[32vh] grid-cols-4 gap-x-3 gap-y-1 overflow-y-auto">
+        <div
+          class="mt-1.5 grid max-h-[32vh] grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto sm:grid-cols-3 lg:grid-cols-4"
+        >
           <span
             v-for="ext in phpRt.extensions"
             :key="ext"
