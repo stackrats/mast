@@ -108,9 +108,17 @@ describe("clampScale", () => {
     expect(clampScale(1)).toBe(1);
   });
 
-  it("covers the range that was asked for", () => {
-    expect(SCALE_MIN).toBeLessThanOrEqual(0.25);
+  // Every offered value must actually do something. WebKit clamps page zoom
+  // below 50%, so a range reaching further down would move a number that
+  // changes nothing on screen — which reads as a broken setting rather than as
+  // the end of the range.
+  it("offers no scale the webview will refuse to apply", () => {
+    expect(SCALE_MIN).toBeGreaterThanOrEqual(0.5);
     expect(SCALE_MAX).toBeGreaterThanOrEqual(2);
+    for (const step of SCALE_STEPS) {
+      expect(step).toBeGreaterThanOrEqual(SCALE_MIN);
+      expect(step).toBeLessThanOrEqual(SCALE_MAX);
+    }
   });
 
   it("accepts every step it offers", () => {

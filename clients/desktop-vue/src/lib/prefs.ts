@@ -126,7 +126,11 @@ export function saveSidebarOpen(open: boolean): void {
 // to launch first.
 const SCALE_KEY = "mast.uiScale";
 
-export const SCALE_MIN = 0.25;
+// 50%, not the 25% first shipped. WebKit clamps page zoom below half, so the
+// slider's lower quarter moved a number that changed nothing on screen —
+// which is worse than a shorter range, because it reads as the setting being
+// broken rather than as the range ending.
+export const SCALE_MIN = 0.5;
 export const SCALE_MAX = 2;
 
 export function loadScale(): number | null {

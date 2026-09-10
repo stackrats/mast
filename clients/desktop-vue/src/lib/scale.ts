@@ -13,9 +13,7 @@ import { SCALE_MAX, SCALE_MIN } from "./prefs";
  * shortcuts do not, because a keystroke that changes the size by 5% has to be
  * pressed fifteen times to do anything you would notice. These are the
  * familiar browser-zoom stops. */
-export const SCALE_STEPS = [
-  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2,
-] as const;
+export const SCALE_STEPS = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2] as const;
 
 /** The slider's granularity. Fine enough to feel continuous, coarse enough
  * that the readout is a round number and the same drag lands on the same value
