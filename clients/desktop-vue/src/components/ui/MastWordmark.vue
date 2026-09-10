@@ -15,6 +15,15 @@
 // mark's viewBox height exactly, which is what keeps `items-start` aligning
 // them.
 //
+// No `shape-rendering="crispEdges"`, and that is the point rather than an
+// omission. The shadow rules are 5 units of a 365-unit viewBox — 0.23px at the
+// 17px the menubar draws this at — and crisp-snapping rounds a rect that thin
+// to zero device pixels or one, depending on where it lands. That is the same
+// "visible at a random percentage" behaviour the glyphs had, arriving by a
+// different route: the first version of this component set it and broke in
+// exactly the way it was written to fix. Antialiasing renders a sub-pixel rule
+// as a faint line, which is what the mark beside it has always done.
+//
 // `currentColor` so callers set it with text color, like any glyph, and
 // `aria-hidden` because the menubar's wrapper already carries role="img" and
 // the label — two nested image roles announce the app's name twice.
@@ -24,9 +33,9 @@
   <svg
     viewBox="0 0 1170 365"
     fill="currentColor"
-    shape-rendering="crispEdges"
     aria-hidden="true"
     focusable="false"
+    preserveAspectRatio="xMidYMid meet"
   >
     <rect x="0" y="0" width="90" height="65" />
     <rect x="210" y="0" width="90" height="65" />
