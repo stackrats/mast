@@ -14,6 +14,7 @@ import { comboLabel } from "../lib/shortcuts";
 import { useViewport } from "../lib/viewport";
 import { useEngineStore } from "../stores/engine";
 import MastMark from "./ui/MastMark.vue";
+import MastWordmark from "./ui/MastWordmark.vue";
 import Tooltip from "./ui/Tooltip.vue";
 
 const emit = defineEmits<{
@@ -26,20 +27,6 @@ const emit = defineEmits<{
   openShortcuts: [];
 }>();
 const store = useEngineStore();
-
-// The wordmark half of the CLI's banner (clients/mast-cli/src/main.rs), so
-// the desktop and the terminal still introduce the app the same way. Only
-// the mark that preceded it is drawn as vectors now — the glyph rows spell
-// letters, but the mark relied on those same rows touching pixel-exactly at
-// 3px, which is a promise no font makes.
-const WORDMARK = [
-  " ███╗   ███╗  █████╗  ███████╗ ████████╗",
-  " ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝",
-  " ██╔████╔██║ ███████║ ███████╗    ██║",
-  " ██║╚██╔╝██║ ██╔══██║ ╚════██║    ██║",
-  " ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║",
-  " ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝",
-].join("\n");
 
 const viewport = useViewport();
 const layout = computed(() => sidebarMode(viewport.width.value));
@@ -181,12 +168,10 @@ async function closeToTray() {
       aria-label="Mast"
     >
       <MastMark class="h-[16.85px] w-auto" />
-      <!-- v-text, not interpolation: inside `white-space: pre` the template's
-           own indentation would become part of the art. -->
       <!-- Dropped below `sm`, where the bar has to choose between the wordmark
            and the menu titles. The mark stays: it is 17px wide and it is the
            only thing identifying the window. -->
-      <pre class="hidden font-mono text-[3px] leading-none sm:block" v-text="WORDMARK" />
+      <MastWordmark class="hidden h-[16.85px] w-auto sm:block" />
     </span>
 
     <div v-for="menu in MENUS" :key="menu.id" class="relative">
