@@ -23,7 +23,9 @@ import Button from "./components/ui/Button.vue";
 import { TooltipProvider } from "reka-ui";
 
 import { parseDeepLink } from "./lib/deeplink";
+import { sidebarMode } from "./lib/layout";
 import { applyTheme, loadTheme } from "./lib/prefs";
+import { useViewport } from "./lib/viewport";
 import { onDeepLink, takeDeepLinks } from "./lib/transport";
 import { useEngineStore } from "./stores/engine";
 
@@ -78,6 +80,13 @@ const aboutOpen = ref(false);
 const paletteOpen = ref(false);
 const shortcutsOpen = ref(false);
 
+// The shell measures the window once and both panels read from it. Under a
+// tiling manager this is not a startup measurement — the window is resized by
+// the manager whenever anything else on the workspace changes.
+const viewport = useViewport();
+/** Docked or floating: the sidebar toggle means a different thing in each. */
+const layout = computed(() => sidebarMode(viewport.width.value));
+
 // Ctrl/Cmd-K from anywhere, including from inside a text field — the palette
 // is how you leave wherever you are, so it must not be capturable by the
 // thing you are trying to leave. The one exception is itself.
@@ -85,6 +94,14 @@ function onKeydown(event: KeyboardEvent) {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     paletteOpen.value = !paletteOpen.value;
+    return;
+  }
+  // Ctrl/Cmd-B shows and hides the sidebar, the shortcut every editor with a
+  // sidebar uses. It earns its keystroke in a tiled window, where the sidebar
+  // is the difference between a readable content pane and a squeezed one.
+  if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "b") {
+    event.preventDefault();
+    store.toggleSidebar(layout.value);
     return;
   }
   // Ctrl/Cmd-1…9 jumps to the nth sidebar project (same alphabetical order
@@ -202,10 +219,13 @@ function editWorkspace(ws: WorkspaceSummary) {
         @open-shortcuts="shortcutsOpen = true"
       />
 
-      <div class="flex min-h-0 flex-1">
+      <!-- `relative`: in a window too narrow to dock it, the sidebar lays over
+           the content pane rather than taking room from it, and this row is
+           what it is positioned against. -->
+      <div class="relative flex min-h-0 flex-1">
         <Sidebar @new-workspace="newWorkspace" @edit-workspace="editWorkspace" />
 
-        <main class="min-w-0 flex-1 overflow-y-auto bg-slate-50/40 p-5 dark:bg-slate-950">
+        <main class="min-w-0 flex-1 overflow-y-auto bg-slate-50/40 p-3 sm:p-5 dark:bg-slate-950">
           <p
             v-if="store.error"
             class="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/50 dark:text-red-200"

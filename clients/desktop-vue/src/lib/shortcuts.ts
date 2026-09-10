@@ -30,6 +30,10 @@ export const SHORTCUTS: { combo: string[]; does: string }[] = [
     does: "…then move through the command palette's results and run one",
   },
   { combo: ["mod", "1–9"], does: "Jump to the nth project in the sidebar" },
+  {
+    combo: ["mod", "B"],
+    does: "Show or hide the sidebar — it floats over the pane in a narrow window",
+  },
   { combo: ["Esc"], does: "Clear the sidebar filter; close menus and dialogs" },
   { combo: ["?"], does: "Show this list" },
 ];

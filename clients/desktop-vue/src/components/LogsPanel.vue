@@ -44,16 +44,11 @@ import {
   outcomeDetail,
   outcomeLabel,
 } from "../lib/history";
-import {
-  LOGS_MAX_HEIGHT,
-  LOGS_MIN_HEIGHT,
-  loadLogsHeight,
-  loadLogsWrap,
-  saveLogsHeight,
-  saveLogsWrap,
-} from "../lib/prefs";
+import { logsHeight } from "../lib/layout";
+import { loadLogsHeight, loadLogsWrap, saveLogsHeight, saveLogsWrap } from "../lib/prefs";
 import { iconButtonClass } from "../lib/menu";
 import { useEngineStore } from "../stores/engine";
+import { useViewport } from "../lib/viewport";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
 import AnsiText from "./ui/AnsiText.vue";
@@ -73,7 +68,13 @@ const scroller = ref<HTMLElement | null>(null);
 // Follow the tail unless the user scrolled up to read something.
 const pinned = ref(true);
 
+// Same split as the sidebar: `height` is what the user dragged the panel to,
+// `renderedHeight` is what a window this tall can actually spare. A short tile
+// borrows the difference and gives it back.
 const height = ref(loadLogsHeight());
+const viewport = useViewport();
+const renderedHeight = computed(() => logsHeight(height.value, viewport.height.value));
+
 let dragging = false;
 
 /** Soft-wrap long lines instead of scrolling sideways. Applies to both tabs —
@@ -204,9 +205,10 @@ function startDrag(event: MouseEvent) {
   const move = (e: MouseEvent) => {
     if (!dragging) return;
     // Dragged from the top edge, so the panel grows as the pointer rises.
-    // Leave room for the chrome above it however tall the window is.
-    const ceiling = Math.min(LOGS_MAX_HEIGHT, window.innerHeight - 160);
-    height.value = Math.min(ceiling, Math.max(LOGS_MIN_HEIGHT, window.innerHeight - e.clientY));
+    // Room for the chrome above it is lib/layout's business now, and it is the
+    // same clamp the panel is rendered through — the handle cannot ask for a
+    // height the window would refuse anyway.
+    height.value = logsHeight(window.innerHeight - e.clientY, viewport.height.value);
     if (pinned.value) void scrollToEnd();
   };
   const up = () => {
@@ -287,7 +289,7 @@ watch(
   <div
     v-if="store.logsOpen"
     class="relative flex shrink-0 flex-col border-t border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950"
-    :style="{ height: `${height}px` }"
+    :style="{ height: `${renderedHeight}px` }"
   >
     <!-- Drag handle -->
     <div

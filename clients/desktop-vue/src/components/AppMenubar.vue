@@ -5,10 +5,12 @@
 // a primitive that can fail per-webview. Click toggles, hover switches while
 // one is open, Escape or a pointerdown anywhere else closes — no portal, no
 // focus dance. Styling mirrors lib/menu so it still reads as the one family.
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+import { sidebarMode } from "../lib/layout";
 import { comboLabel } from "../lib/shortcuts";
+import { useViewport } from "../lib/viewport";
 import { useEngineStore } from "../stores/engine";
 import MastMark from "./ui/MastMark.vue";
 import Tooltip from "./ui/Tooltip.vue";
@@ -37,6 +39,15 @@ const WORDMARK = [
   " ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║",
   " ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝",
 ].join("\n");
+
+const viewport = useViewport();
+const layout = computed(() => sidebarMode(viewport.width.value));
+// Reads the flag the current layout actually uses, so the menu says what the
+// keystroke will do rather than what it would do in some other window size.
+const sidebarShown = computed(() =>
+  layout.value === "overlay" ? store.sidebarOverlay : store.sidebarOpen,
+);
+const sidebarAccel = comboLabel(["mod", "B"]);
 
 type MenuId = "app" | "workspace" | "view";
 
@@ -125,7 +136,10 @@ async function closeToTray() {
       <MastMark class="h-[16.85px] w-auto" />
       <!-- v-text, not interpolation: inside `white-space: pre` the template's
            own indentation would become part of the art. -->
-      <pre class="font-mono text-[3px] leading-none" v-text="WORDMARK" />
+      <!-- Dropped below `sm`, where the bar has to choose between the wordmark
+           and the menu titles. The mark stays: it is 17px wide and it is the
+           only thing identifying the window. -->
+      <pre class="hidden font-mono text-[3px] leading-none sm:block" v-text="WORDMARK" />
     </span>
 
     <div v-for="menu in MENUS" :key="menu.id" class="relative">
@@ -205,6 +219,16 @@ async function closeToTray() {
             type="button"
             role="menuitem"
             :class="itemClass"
+            @click="select(() => store.toggleSidebar(layout))"
+          >
+            {{ sidebarShown ? "Hide sidebar" : "Show sidebar" }}
+            <span :class="accelClass">{{ sidebarAccel }}</span>
+          </button>
+          <div :class="separatorClass" />
+          <button
+            type="button"
+            role="menuitem"
+            :class="itemClass"
             @click="select(() => store.run({ type: 'refreshNow' }))"
           >
             Refresh now
@@ -223,14 +247,20 @@ async function closeToTray() {
       </div>
     </div>
 
-    <div class="ml-auto flex items-center gap-2 pr-1 text-[11px] text-slate-400">
+    <div class="ml-auto flex min-w-0 shrink items-center gap-2 pr-1 text-[11px] text-slate-400">
       <Tooltip v-if="store.docker" :text="store.docker.endpoint ?? 'resolving endpoint…'">
-        <span class="flex items-center gap-1.5">
+        <span class="flex min-w-0 items-center gap-1.5">
           <span
-            class="h-2 w-2 rounded-full"
+            class="h-2 w-2 shrink-0 rounded-full"
             :class="store.docker.available ? 'bg-emerald-500' : 'bg-red-500'"
           />
-          {{ store.docker.available ? `docker · ${store.docker.contextName}` : "docker offline" }}
+          <!-- The dot already says available or not, and it survives any width.
+               Losing the words costs the context name, which the tooltip still
+               carries — and the alternative is the words shoving the menu
+               titles off the bar. -->
+          <span class="hidden truncate md:inline">
+            {{ store.docker.available ? `docker · ${store.docker.contextName}` : "docker offline" }}
+          </span>
         </span>
       </Tooltip>
       <span v-if="store.readOnly" class="text-amber-600 dark:text-amber-400">read-only</span>

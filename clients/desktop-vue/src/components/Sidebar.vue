@@ -4,10 +4,11 @@
 // CSS variable with fixed expanded/collapsed states, which cannot express the
 // drag-to-resize this panel has — and its offcanvas mobile drawer is dead
 // weight in a desktop window.
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { Boxes, ChevronRight, Folder, Home, Loader2, Plus, Search } from "lucide-vue-next";
 
 import type { ProjectStatus, WorkspaceSummary } from "../bindings";
+import { sidebarMode, sidebarWidth } from "../lib/layout";
 import {
   loadSidebarCollapsed,
   loadSidebarWidth,
@@ -15,6 +16,7 @@ import {
   saveSidebarWidth,
 } from "../lib/prefs";
 import { statusDot } from "../lib/status";
+import { useViewport } from "../lib/viewport";
 import { useEngineStore } from "../stores/engine";
 import ProjectContextMenu from "./ProjectContextMenu.vue";
 import WorkspaceContextMenu from "./WorkspaceContextMenu.vue";
@@ -32,7 +34,37 @@ import Tooltip from "./ui/Tooltip.vue";
 const emit = defineEmits<{ newWorkspace: []; editWorkspace: [ws: WorkspaceSummary] }>();
 const store = useEngineStore();
 
+// What the user last dragged the panel to. Held separately from what gets
+// rendered: a window too narrow for this width borrows some back for the
+// duration, and hands it straight back when the window grows again. Writing
+// the borrowed value into `width` would make that loss permanent — which is
+// what a tiling manager would do to it several times an evening.
 const width = ref(loadSidebarWidth());
+const viewport = useViewport();
+
+/** Too narrow to dock a sidebar and a readable content pane side by side, so
+ * the sidebar lays over the content instead of taking room from it. */
+const floating = computed(() => sidebarMode(viewport.width.value) === "overlay");
+const renderedWidth = computed(() => sidebarWidth(width.value, viewport.width.value));
+const visible = computed(() => (floating.value ? store.sidebarOverlay : store.sidebarOpen));
+
+// A floating sidebar is a glance, not a place: picking something out of it has
+// answered the question it was opened to answer, and leaving it over the
+// content would hide the very thing that was just selected.
+watch(
+  () => store.selection,
+  () => {
+    if (floating.value) store.setSidebarOverlay(false);
+  },
+);
+
+// Widening the window past the threshold docks the sidebar again. Drop the
+// floating flag on the way through, or it stays armed and the next narrow
+// window opens with the sidebar already over the content.
+watch(floating, (isFloating) => {
+  if (!isFloating) store.setSidebarOverlay(false);
+});
+
 let dragging = false;
 
 function startDrag(event: MouseEvent) {
@@ -40,7 +72,9 @@ function startDrag(event: MouseEvent) {
   event.preventDefault();
   const move = (e: MouseEvent) => {
     if (!dragging) return;
-    width.value = Math.min(480, Math.max(180, e.clientX));
+    // Clamped against the live window, not just the stored range: the handle
+    // must not be able to drag the content pane out of existence.
+    width.value = sidebarWidth(e.clientX, viewport.width.value);
   };
   const up = () => {
     dragging = false;
@@ -267,9 +301,25 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
 </script>
 
 <template>
+  <!-- Only while it floats: the content behind it is still the thing being
+       worked on, so clicking it puts the sidebar away rather than doing
+       nothing. Absent entirely when docked, where there is nothing to dismiss. -->
+  <div
+    v-if="floating && visible"
+    class="absolute inset-0 z-20 bg-slate-950/30"
+    @click="store.setSidebarOverlay(false)"
+  />
   <aside
-    class="relative flex shrink-0 flex-col border-r border-slate-200 bg-slate-50/60 dark:border-slate-800 dark:bg-neutral-900/60"
-    :style="{ width: `${width}px` }"
+    v-show="visible"
+    class="flex flex-col border-r border-slate-200 dark:border-slate-800"
+    :class="
+      floating
+        ? // Opaque, unlike the docked panel: 60% over a matching pane reads as
+          // a tint, but 60% over the content it is covering reads as broken.
+          'absolute inset-y-0 left-0 z-30 bg-slate-50 shadow-xl dark:bg-neutral-900'
+        : 'relative shrink-0 bg-slate-50/60 dark:bg-neutral-900/60'
+    "
+    :style="{ width: `${renderedWidth}px` }"
   >
     <nav class="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
       <!-- Only once the list outgrows a glance — a filter over five rows is
