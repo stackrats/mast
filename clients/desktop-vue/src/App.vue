@@ -205,7 +205,7 @@ function editWorkspace(ws: WorkspaceSummary) {
 <template>
   <TooltipProvider :delay-duration="500" :skip-delay-duration="200" disable-hoverable-content>
     <div
-      class="flex h-screen flex-col bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100"
+      class="flex h-screen flex-col overflow-x-clip bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100"
     >
       <CommandPalette v-model:open="paletteOpen" @dialog="openPaletteDialog" />
 
