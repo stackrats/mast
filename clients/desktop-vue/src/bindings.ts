@@ -6,6 +6,9 @@
 
 
 export const commands = {
+async sessionInfo() : Promise<SessionInfo> {
+    return await TAURI_INVOKE("session_info");
+},
 async snapshot() : Promise<Result<EngineSnapshot, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("snapshot") };
@@ -234,10 +237,6 @@ async volumeSnapshots(project: ProjectId) : Promise<Result<VolumeSnapshot[], str
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Drain the links the app was launched with. Called once at startup, after
- * the frontend has subscribed to [`DeepLinkEvent`] for everything later.
- */
 async takeDeepLinks() : Promise<string[]> {
     return await TAURI_INVOKE("take_deep_links");
 },
@@ -1209,6 +1208,23 @@ memoryBytes: number; memoryLimitBytes: number;
  * machine" and "a third of the way to being OOM-killed".
  */
 memoryLimited: boolean }
+/**
+ * Drain the links the app was launched with. Called once at startup, after
+ * the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+ * What the app can tell about the session it was launched into. Read once at
+ * startup by the frontend, to pick a default UI scale.
+ */
+export type SessionInfo = { 
+/**
+ * The desktop identifier the session advertises, verbatim, or null when
+ * it advertises none. Shown in Settings so a wrong guess is at least a
+ * legible wrong guess.
+ */
+desktop: string | null; 
+/**
+ * Whether that identifier names a window manager that tiles by default.
+ */
+tiling: boolean }
 export type SnapshotDelta = { projectName: string; changes: string[] }
 export type SnapshotFileHash = { path: string; sha256: string }
 export type SnapshotMemberState = { project: ProjectId; projectName: string; gitBranch: string | null; gitCommit: string | null; gitDirty: boolean | null; 

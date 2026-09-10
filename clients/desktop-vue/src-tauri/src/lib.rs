@@ -25,6 +25,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_specta::Event;
 
+mod session;
 mod tray;
 
 pub struct AppState {
@@ -66,6 +67,28 @@ struct DeepLinks(Mutex<Vec<String>>);
 
 /// Drain the links the app was launched with. Called once at startup, after
 /// the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+/// What the app can tell about the session it was launched into. Read once at
+/// startup by the frontend, to pick a default UI scale.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct SessionInfo {
+    /// The desktop identifier the session advertises, verbatim, or null when
+    /// it advertises none. Shown in Settings so a wrong guess is at least a
+    /// legible wrong guess.
+    pub desktop: Option<String>,
+    /// Whether that identifier names a window manager that tiles by default.
+    pub tiling: bool,
+}
+
+#[tauri::command]
+#[specta::specta]
+fn session_info() -> SessionInfo {
+    let desktop = session::desktop_name();
+    SessionInfo {
+        tiling: desktop.as_deref().is_some_and(session::is_tiling),
+        desktop,
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 fn take_deep_links(state: State<'_, DeepLinks>) -> Vec<String> {
@@ -416,6 +439,7 @@ async fn stop_log_stream(state: State<'_, AppState>, handle: u32) -> Result<(), 
 fn specta_builder() -> tauri_specta::Builder {
     tauri_specta::Builder::<tauri::Wry>::new()
         .commands(tauri_specta::collect_commands![
+            session_info,
             snapshot,
             start_patch_stream,
             dispatch_action,

@@ -119,6 +119,29 @@ export function saveSidebarOpen(open: boolean): void {
   local?.setItem(SIDEBAR_OPEN_KEY, String(open));
 }
 
+// UI scale, as a webview zoom factor. Stored only once the user has chosen
+// one: the absence of a value is meaningful, because it lets the default
+// follow the session (a tiling compositor starts smaller — see lib/scale).
+// Writing a default in on first run would freeze whichever machine happened
+// to launch first.
+const SCALE_KEY = "mast.uiScale";
+
+export const SCALE_MIN = 0.7;
+export const SCALE_MAX = 1.5;
+
+export function loadScale(): number | null {
+  const raw = Number(local?.getItem(SCALE_KEY));
+  return Number.isFinite(raw) && raw >= SCALE_MIN && raw <= SCALE_MAX ? raw : null;
+}
+
+export function saveScale(scale: number): void {
+  local?.setItem(SCALE_KEY, String(scale));
+}
+
+export function clearScale(): void {
+  local?.removeItem(SCALE_KEY);
+}
+
 // Sidebar rows folded shut, keyed "group:workspaces" / "group:projects" /
 // "ws:<id>". Only `true` entries are kept — everything starts open, and a
 // removed workspace's stale key costs nothing.

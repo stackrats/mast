@@ -23,24 +23,30 @@ import { stripAnsi } from "../lib/ansi";
 import { formatElapsed } from "../lib/elapsed";
 import { notify } from "../lib/notify";
 import type { SidebarMode } from "../lib/layout";
+import { clampScale, defaultScale, stepScale } from "../lib/scale";
 import {
+  clearScale,
   loadCapturesSeen,
   loadLogsOpen,
+  loadScale,
   loadSidebarOpen,
   recordWorkspaceStart,
   saveCapturesSeen,
   saveLogsOpen,
+  saveScale,
   saveSidebarOpen,
 } from "../lib/prefs";
 import { applyPatchEvent, sortProjects } from "../lib/projects";
 import { pushBounded } from "../lib/ring";
 import {
+  applyZoom,
   cancelOperation,
   dispatchAction,
   envReport,
   historyRecent,
   logCaptures,
   onPatchStreamItem,
+  sessionInfo,
   startCaptureStream,
   startHistoryStream,
   startUsageStream,
@@ -199,6 +205,15 @@ export const useEngineStore = defineStore("engine", {
      * dock one. Deliberately not persisted and always starts shut — it covers
      * the content pane, so it is a glance, not a state to be restored into. */
     sidebarOverlay: false,
+    /** The webview zoom factor in force. */
+    uiScale: 1,
+    /** Whether `uiScale` came from the session default rather than the user.
+     * Settings shows which, because "90% because you are on Hyprland" and
+     * "90% because you chose it" are different facts about the same number. */
+    uiScaleIsDefault: true,
+    /** The desktop identifier the session reported, for Settings to show. */
+    sessionDesktop: null as string | null,
+    sessionTiling: false,
     logs: null as LogView | null,
     selection: { kind: "home" } as Selection,
     busy: 0,
@@ -534,6 +549,42 @@ export const useEngineStore = defineStore("engine", {
 
     setSidebarOverlay(open: boolean) {
       this.sidebarOverlay = open;
+    },
+
+    /** Settle the UI scale for this session and apply it.
+     *
+     * A stored preference wins outright. Only in its absence does the session
+     * get a say, and then only to pick a starting point — which is why the
+     * absence is stored as absence rather than written out as 1.0 on first
+     * run. Freeze it and every later machine inherits whichever one launched
+     * first. */
+    async initScale() {
+      const info = await sessionInfo();
+      this.sessionDesktop = info.desktop;
+      this.sessionTiling = info.tiling;
+      const stored = loadScale();
+      this.uiScaleIsDefault = stored === null;
+      this.uiScale = stored ?? defaultScale(info.tiling);
+      await applyZoom(this.uiScale);
+    },
+
+    async setUiScale(scale: number) {
+      this.uiScale = clampScale(scale);
+      this.uiScaleIsDefault = false;
+      saveScale(this.uiScale);
+      await applyZoom(this.uiScale);
+    },
+
+    async stepUiScale(direction: 1 | -1) {
+      await this.setUiScale(stepScale(this.uiScale, direction));
+    },
+
+    /** Hand the scale back to the session's judgement. */
+    async resetUiScale() {
+      clearScale();
+      this.uiScaleIsDefault = true;
+      this.uiScale = defaultScale(this.sessionTiling);
+      await applyZoom(this.uiScale);
     },
 
     /** Append a line to the global activity feed (the bottom logs panel). */

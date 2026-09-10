@@ -104,6 +104,27 @@ function onKeydown(event: KeyboardEvent) {
     store.toggleSidebar(layout.value);
     return;
   }
+  // Ctrl/Cmd with +/-/0: the zoom convention every browser and editor shares.
+  // `event.key` rather than a code, so it works on a layout where these sit
+  // somewhere other than a US keyboard puts them; the shifted forms are listed
+  // because +/_ are what a shifted =/- actually report.
+  if ((event.metaKey || event.ctrlKey) && !event.altKey) {
+    if (event.key === "=" || event.key === "+") {
+      event.preventDefault();
+      void store.stepUiScale(1);
+      return;
+    }
+    if (event.key === "-" || event.key === "_") {
+      event.preventDefault();
+      void store.stepUiScale(-1);
+      return;
+    }
+    if (event.key === "0") {
+      event.preventDefault();
+      void store.resetUiScale();
+      return;
+    }
+  }
   // Ctrl/Cmd-1…9 jumps to the nth sidebar project (same alphabetical order
   // the sidebar shows). Same "leave from anywhere" rule as the palette.
   if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {
@@ -164,6 +185,9 @@ watch(
 );
 
 onMounted(() => {
+  // Before connect: the scale governs how the whole shell measures itself, and
+  // settling it after the first paint is a visible jump.
+  void store.initScale();
   void store.connect();
   document.addEventListener("visibilitychange", syncUsageToVisibility);
   window.addEventListener("keydown", onKeydown);

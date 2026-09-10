@@ -13,6 +13,8 @@ import {
   type Theme,
 } from "../lib/prefs";
 import type { IntegrationSettings } from "../bindings";
+import { SCALE_STEPS, defaultScale, scaleLabel } from "../lib/scale";
+import { comboLabel } from "../lib/shortcuts";
 import { pickDirectory, pickFile } from "../lib/transport";
 import { useEngineStore } from "../stores/engine";
 import Button from "./ui/Button.vue";
@@ -166,6 +168,49 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
             {{ option.label }}
           </Button>
         </div>
+      </section>
+
+      <section class="space-y-2">
+        <h4 :class="headingClass">Interface size</h4>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button
+            v-for="step in SCALE_STEPS"
+            :key="step"
+            :variant="Math.abs(store.uiScale - step) < 1e-9 ? 'default' : 'outline'"
+            size="sm"
+            class="tabular-nums"
+            @click="store.setUiScale(step)"
+          >
+            {{ scaleLabel(step) }}
+          </Button>
+        </div>
+        <!-- Which of the two facts is true about the current number matters:
+             "90% because you chose it" and "90% because this compositor tiles"
+             look identical on screen and are not the same thing at all. Naming
+             the compositor makes a wrong guess a legible wrong guess rather
+             than a mystery shrinking of the app. -->
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          <template v-if="store.uiScaleIsDefault && store.sessionTiling">
+            Defaulting to {{ scaleLabel(store.uiScale) }} because
+            {{ store.sessionDesktop ?? "this session" }} tiles windows, so Mast rarely gets the size
+            it asks for. Pick any size above and it sticks.
+          </template>
+          <template v-else-if="store.uiScaleIsDefault">
+            Using the standard {{ scaleLabel(store.uiScale) }}. Also
+            {{ comboLabel(["mod", "+"]) }} and {{ comboLabel(["mod", "−"]) }} from anywhere.
+          </template>
+          <template v-else>
+            Set to {{ scaleLabel(store.uiScale) }}.
+            <button
+              type="button"
+              class="underline underline-offset-2 hover:text-slate-700 dark:hover:text-slate-200"
+              @click="store.resetUiScale()"
+            >
+              Use the default for this session
+            </button>
+            ({{ scaleLabel(defaultScale(store.sessionTiling)) }}).
+          </template>
+        </p>
       </section>
 
       <section class="space-y-2">
