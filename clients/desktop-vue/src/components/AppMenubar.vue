@@ -168,10 +168,14 @@ async function closeToTray() {
       aria-label="Mast"
     >
       <MastMark class="h-[16.85px] w-auto" />
-      <!-- Dropped below `sm`, where the bar has to choose between the wordmark
-           and the menu titles. The mark stays: it is 17px wide and it is the
-           only thing identifying the window. -->
-      <MastWordmark class="hidden h-[16.85px] w-auto sm:block" />
+      <!-- Shown until the bar genuinely runs out of room. It was behind `sm`,
+           which hid it below 640px — and since a tiling session starts zoomed
+           out, a perfectly ordinary window came to 567 CSS px and the wordmark
+           never appeared at all. It is 54px wide against roughly 160px of menu
+           titles, so there is nothing to trade until the window is very narrow
+           indeed. The mark stays at every width: it is 17px and it is the only
+           thing identifying the window. -->
+      <MastWordmark class="h-[16.85px] w-auto max-[400px]:hidden" />
     </span>
 
     <div v-for="menu in MENUS" :key="menu.id" class="relative">
