@@ -13,7 +13,8 @@ import {
   type Theme,
 } from "../lib/prefs";
 import type { IntegrationSettings } from "../bindings";
-import { SCALE_STEPS, defaultScale, scaleLabel } from "../lib/scale";
+import { SCALE_MAX, SCALE_MIN } from "../lib/prefs";
+import { SCALE_SLIDER_STEP, defaultScale, scaleLabel, snapScale } from "../lib/scale";
 import { comboLabel } from "../lib/shortcuts";
 import { pickDirectory, pickFile } from "../lib/transport";
 import { useEngineStore } from "../stores/engine";
@@ -172,17 +173,22 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
 
       <section class="space-y-2">
         <h4 :class="headingClass">Interface size</h4>
-        <div class="flex flex-wrap items-center gap-2">
-          <Button
-            v-for="step in SCALE_STEPS"
-            :key="step"
-            :variant="Math.abs(store.uiScale - step) < 1e-9 ? 'default' : 'outline'"
-            size="sm"
-            class="tabular-nums"
-            @click="store.setUiScale(step)"
+        <div class="flex items-center gap-3">
+          <input
+            :value="store.uiScale"
+            type="range"
+            :min="SCALE_MIN"
+            :max="SCALE_MAX"
+            :step="SCALE_SLIDER_STEP"
+            aria-label="Interface size"
+            class="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-slate-200 accent-slate-900 dark:bg-slate-700 dark:accent-slate-100"
+            @input="store.setUiScale(snapScale(Number(($event.target as HTMLInputElement).value)))"
+          />
+          <span
+            class="w-12 shrink-0 text-right text-xs tabular-nums text-slate-600 dark:text-slate-300"
           >
-            {{ scaleLabel(step) }}
-          </Button>
+            {{ scaleLabel(store.uiScale) }}
+          </span>
         </div>
         <!-- Which of the two facts is true about the current number matters:
              "90% because you chose it" and "90% because this compositor tiles"

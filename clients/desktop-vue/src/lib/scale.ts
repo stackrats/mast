@@ -9,11 +9,28 @@
 
 import { SCALE_MAX, SCALE_MIN } from "./prefs";
 
-/** The steps the zoom shortcuts walk through. Not a free-running multiplier:
- * arbitrary factors land on fractional pixels, and a 1px border that rounds to
- * nothing is how a panel loses its edge at one zoom level and gets it back at
- * the next. */
-export const SCALE_STEPS = [0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5] as const;
+/** The rungs the keyboard shortcuts climb. The slider moves continuously; the
+ * shortcuts do not, because a keystroke that changes the size by 5% has to be
+ * pressed fifteen times to do anything you would notice. These are the
+ * familiar browser-zoom stops. */
+export const SCALE_STEPS = [
+  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2,
+] as const;
+
+/** The slider's granularity. Fine enough to feel continuous, coarse enough
+ * that the readout is a round number and the same drag lands on the same value
+ * twice. */
+export const SCALE_SLIDER_STEP = 0.05;
+
+/** Snap an arbitrary value (a slider drag) onto that granularity, so a stored
+ * scale is always something the readout can print exactly. */
+export function snapScale(scale: number): number {
+  const snapped = Math.round(scale / SCALE_SLIDER_STEP) * SCALE_SLIDER_STEP;
+  // Multiply-then-round rather than trusting the float: 0.05 * 15 is
+  // 0.7500000000000001, and a scale that prints as "75.00000000000001%" is a
+  // rounding artefact escaping into the interface.
+  return clampScale(Math.round(snapped * 100) / 100);
+}
 
 /** What a session gets before the user has expressed a preference. A tiling
  * compositor sizes the window itself, and usually smaller than the config asks

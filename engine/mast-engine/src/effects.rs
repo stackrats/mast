@@ -76,16 +76,27 @@ async fn docker_loop(engine: Engine) {
                 *engine.inner.adapter.lock().unwrap() = None;
                 // The daemon answered once and then stopped. Whatever it is
                 // now, it is not "never installed".
+                let last_endpoint = engine.inner.state.lock().unwrap().docker.endpoint.clone();
                 engine.update_docker_status_unavailable(
                     "docker connection lost",
                     DockerUnavailable::NotRunning,
+                    last_endpoint,
                 );
             }
             Err(e) => {
                 *engine.inner.adapter.lock().unwrap() = None;
+                // Name the endpoint even though we could not reach it.
+                // Diagnostics reports "could not reach the daemon at X", and
+                // "(unknown endpoint)" is the least useful thing it can say
+                // about a socket whose path we know perfectly well. Costs one
+                // CLI call per failed attempt, on a loop already sleeping
+                // between them; when the CLI itself is missing this resolves
+                // to None, which is the honest answer.
+                let endpoint = resolve_endpoint().await.ok().map(|ep| ep.host);
                 engine.update_docker_status_unavailable(
                     &connect_error_text(&e),
                     classify_unavailable(&e),
+                    endpoint,
                 );
             }
         }
@@ -116,7 +127,13 @@ fn connect_error_text(e: &DockerError) -> String {
 /// is the difference between a local daemon that is not running and a remote
 /// host that will not answer — the same failure, and opposite advice.
 fn at_endpoint(e: DockerError, host: &str) -> DockerError {
-    DockerError::Api(format!("{e} (endpoint: {host})"))
+    match e {
+        // Rewrap the payload, not the rendered error: `DockerError::Api`'s
+        // Display already prefixes "docker API error:", so wrapping the whole
+        // string printed it twice.
+        DockerError::Api(message) => DockerError::Api(format!("{message} (endpoint: {host})")),
+        other => DockerError::Api(format!("{other} (endpoint: {host})")),
+    }
 }
 
 /// Which of the four repairs the user is actually facing.
@@ -262,15 +279,18 @@ impl Engine {
         &self,
         error: &str,
         reason: DockerUnavailable,
+        endpoint: Option<String>,
     ) {
         self.with_state(|st, events| {
             if st.docker.available
                 || st.docker.error.as_deref() != Some(error)
                 || st.docker.reason != Some(reason)
+                || st.docker.endpoint != endpoint
             {
                 st.docker.available = false;
                 st.docker.error = Some(error.to_string());
                 st.docker.reason = Some(reason);
+                st.docker.endpoint = endpoint;
                 events.push(PatchEvent::DockerStatusChanged { status: st.docker.clone() });
             }
         });

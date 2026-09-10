@@ -126,8 +126,8 @@ export function saveSidebarOpen(open: boolean): void {
 // to launch first.
 const SCALE_KEY = "mast.uiScale";
 
-export const SCALE_MIN = 0.7;
-export const SCALE_MAX = 1.5;
+export const SCALE_MIN = 0.25;
+export const SCALE_MAX = 2;
 
 export function loadScale(): number | null {
   const raw = Number(local?.getItem(SCALE_KEY));
