@@ -5,7 +5,7 @@
 // a primitive that can fail per-webview. Click toggles, hover switches while
 // one is open, Escape or a pointerdown anywhere else closes — no portal, no
 // focus dance. Styling mirrors lib/menu so it still reads as the one family.
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { sidebarMode } from "../lib/layout";
@@ -53,15 +53,58 @@ type MenuId = "app" | "workspace" | "view";
 
 const openMenu = ref<MenuId | null>(null);
 const rootEl = ref<HTMLElement | null>(null);
+/** How far the open panel is nudged from its trigger's left edge, in px.
+ * Zero in a window with room; negative once the panel would run off the right. */
+const panelOffset = ref(0);
+
+/** Gap kept between a menu and the window edge, so a nudged panel never sits
+ * flush against the frame. */
+const EDGE_GUTTER = 8;
+
+// A menu that overflows the window is not a cosmetic problem: an absolutely
+// positioned child wider than the viewport extends the document, and the whole
+// app picks up a horizontal scrollbar.
+//
+// Nudged rather than flipped. Flipping a panel to its trigger's right edge only
+// helps while the trigger is near the right of the bar; for a trigger on the
+// left it throws the panel off the *other* side, which is the same bug mirrored.
+// Clamping the panel into the viewport is right at every width, and width is
+// exactly what a tiling manager refuses to keep still.
+//
+// Measured on every open, never inferred: panels size to their content, and
+// content width depends on the font the platform actually resolved. This
+// overflowed on Omarchy at a width where it fits under Ubuntu's fonts.
+async function placeMenu() {
+  panelOffset.value = 0;
+  await nextTick();
+  // Queried, not held in a template ref: the panel is inside the `v-for` over
+  // MENUS, and Vue collects refs declared inside a loop into an array. Reading
+  // `.parentElement` off that array is `undefined`, so the whole measurement
+  // silently did nothing — no error, just a menu that never moved.
+  const panel = rootEl.value?.querySelector<HTMLElement>('[role="menu"]');
+  const wrapper = panel?.parentElement;
+  if (!panel || !wrapper) return;
+  const anchor = wrapper.getBoundingClientRect().left;
+  const width = panel.getBoundingClientRect().width;
+  const rightmost = window.innerWidth - EDGE_GUTTER - width;
+  // Floor of EDGE_GUTTER second, so a panel wider than the window lands
+  // against the left edge rather than being pushed off it.
+  const placed = Math.max(EDGE_GUTTER, Math.min(anchor, rightmost));
+  panelOffset.value = Math.round(placed - anchor);
+}
 
 function toggle(menu: MenuId) {
   openMenu.value = openMenu.value === menu ? null : menu;
+  if (openMenu.value !== null) void placeMenu();
 }
 
 // Desktop-menubar convention: once one menu is open, sliding along the bar
 // opens siblings without another click.
 function slideTo(menu: MenuId) {
-  if (openMenu.value !== null && openMenu.value !== menu) openMenu.value = menu;
+  if (openMenu.value !== null && openMenu.value !== menu) {
+    openMenu.value = menu;
+    void placeMenu();
+  }
 }
 
 function select(action: () => void) {
@@ -97,7 +140,7 @@ const triggerOpenClass = "bg-slate-100 dark:bg-slate-800";
 // lib/menu's content/item recipes, with hover: variants standing in for the
 // data-highlighted state reka would have managed.
 const panelClass =
-  "absolute top-full left-0 z-50 mt-1 min-w-44 rounded-md border border-slate-200 bg-white p-1 shadow-lg dark:border-slate-700 dark:bg-slate-900";
+  "absolute top-full left-0 z-50 mt-1 max-w-[calc(100vw-1rem)] min-w-44 rounded-md border border-slate-200 bg-white p-1 shadow-lg dark:border-slate-700 dark:bg-slate-900";
 const itemClass =
   "flex w-full cursor-default items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-slate-400 dark:text-slate-200 dark:hover:bg-slate-800";
 const separatorClass = "my-1 h-px bg-slate-100 dark:bg-slate-800";
@@ -155,7 +198,12 @@ async function closeToTray() {
         {{ menu.title }}
       </button>
 
-      <div v-if="openMenu === menu.id" role="menu" :class="panelClass">
+      <div
+        v-if="openMenu === menu.id"
+        role="menu"
+        :class="panelClass"
+        :style="{ transform: `translateX(${panelOffset}px)` }"
+      >
         <template v-if="menu.id === 'app'">
           <button
             type="button"
