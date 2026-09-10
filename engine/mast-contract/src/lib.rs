@@ -296,13 +296,42 @@ pub struct DiscoveredProject {
     pub is_sail: bool,
 }
 
+/// Why docker could not be reached, in the terms a person can act on.
+///
+/// Four separate repairs hide behind one raw connection error: install it,
+/// start it, be allowed to talk to it, or fix the network between you and it.
+/// The error string names none of them — "Error in the hyper legacy client:
+/// client error (Connect)" is true and useless — so the classification is made
+/// once here rather than guessed at by every client that renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum DockerUnavailable {
+    /// No docker CLI on PATH. The usual state of a machine that has never had
+    /// Docker, and the first thing a newcomer hits.
+    NotInstalled,
+    /// Docker is installed but its daemon is not answering — not started, or
+    /// stopped since.
+    NotRunning,
+    /// The endpoint is there and refused this user. On Linux that is almost
+    /// always group membership.
+    PermissionDenied,
+    /// Everything else: a remote endpoint that will not answer, TLS trouble, a
+    /// context pointing somewhere that no longer exists.
+    Unreachable,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DockerStatus {
     pub available: bool,
     pub context_name: Option<String>,
     pub endpoint: Option<String>,
+    /// The underlying error, verbatim. Kept for diagnostics — clients show
+    /// `reason` and keep this behind a disclosure.
     pub error: Option<String>,
+    /// What kind of failure `error` describes. `None` while docker is
+    /// available.
+    pub reason: Option<DockerUnavailable>,
 }
 
 /// Consistent point-in-time view of engine state, tagged with the sequence
@@ -1357,6 +1386,7 @@ mod tests {
             context_name: Some("default".into()),
             endpoint: Some("unix:///var/run/docker.sock".into()),
             error: None,
+            reason: None,
         }
     }
 

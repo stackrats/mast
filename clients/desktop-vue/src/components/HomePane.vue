@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-vue-next";
 
+import { dockerAdvice } from "../lib/docker";
 import { loadRecentWorkspaces } from "../lib/prefs";
 import { statusBadgeVariant } from "../lib/status";
 import { createdName, useEngineStore } from "../stores/engine";
@@ -23,6 +24,8 @@ import Button from "./ui/Button.vue";
 
 const emit = defineEmits<{ openSettings: [] }>();
 const store = useEngineStore();
+
+const advice = computed(() => dockerAdvice(store.docker?.reason ?? null));
 
 /// Live totals across everything Mast watches.
 const overview = computed(() => {
@@ -77,12 +80,33 @@ const scaffolding = computed(() =>
 
 <template>
   <div class="mx-auto max-w-4xl space-y-4">
+    <!-- The engine classifies the failure; this states it and names the
+         repair. The raw error stays available but folded away: it is the right
+         thing to paste into an issue and the wrong thing to lead with. -->
     <div
       v-if="store.docker && !store.docker.available"
       class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
     >
-      Docker unavailable{{ store.docker.error ? `: ${store.docker.error}` : "" }} — observation
-      paused, retrying…
+      <p class="font-medium">{{ advice.title }}</p>
+      <p class="mt-1 text-red-700 dark:text-red-300">{{ advice.fix }}</p>
+      <code
+        v-if="advice.command"
+        class="mt-1.5 block overflow-x-auto rounded border border-red-200 bg-red-100/60 px-2 py-1 font-mono text-xs break-all text-red-900 dark:border-red-900 dark:bg-red-950/60 dark:text-red-200"
+        >{{ advice.command }}</code
+      >
+      <p class="mt-1 text-xs text-red-700/80 dark:text-red-300/80">
+        Observation is paused until it answers. Mast keeps retrying — nothing to click.
+      </p>
+      <details v-if="store.docker.error" class="mt-2">
+        <summary
+          class="cursor-pointer text-xs text-red-700/80 select-none hover:text-red-800 dark:text-red-300/80 dark:hover:text-red-200"
+        >
+          Technical detail
+        </summary>
+        <p class="mt-1 font-mono text-[11px] break-words text-red-700/90 dark:text-red-300/90">
+          {{ store.docker.error }}
+        </p>
+      </details>
     </div>
 
     <div
