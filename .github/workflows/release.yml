@@ -185,6 +185,25 @@ jobs:
             --target ${{ matrix.target }} \
             --bundles ${{ matrix.bundles }} \
             --config ci-config.json
+      # Tauri drives linuxdeploy, which copies this runner's libwayland-* into
+      # the AppDir; AppRun then loads them ahead of the user's. On any host
+      # whose Mesa differs from Ubuntu's that kills EGL and the app aborts
+      # before drawing a window (reproduced on Arch/Omarchy against 0.7.0).
+      # Tauri exposes no library-exclusion setting, so strip them afterwards.
+      # The script verifies its own output and fails the build if the repack
+      # is bad. scripts/test-fix-appimage-wayland.sh guards the list in CI.
+      - name: Strip host-coupled Wayland libraries from the AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          imgs=(target/${{ matrix.target }}/release/bundle/appimage/*.AppImage)
+          if (( ${#imgs[@]} == 0 )); then
+            echo "::error::No AppImage was produced — nothing to fix."
+            exit 1
+          fi
+          scripts/fix-appimage-wayland.sh "${imgs[@]}"
       - name: Package and upload
         shell: bash
         env:
