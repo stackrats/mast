@@ -30,7 +30,13 @@ function snap(seq: number): EngineSnapshot {
     protocolVersion: 1,
     seq,
     readOnly: false,
-    docker: { available: true, contextName: "default", endpoint: "unix:///x", error: null },
+    docker: {
+      available: true,
+      contextName: "default",
+      endpoint: "unix:///x",
+      error: null,
+      reason: null,
+    },
     integrations: { terminal: null, editor: null, autoPortRemap: true },
     watchedDirectories: [],
     discovered: [],
@@ -191,7 +197,13 @@ describe("applyPatchEvent reducer", () => {
   it("leaves the list untouched for non-project events", () => {
     const result = applyPatchEvent(base, {
       type: "dockerStatusChanged",
-      status: { available: false, contextName: null, endpoint: null, error: "gone" },
+      status: {
+        available: false,
+        contextName: null,
+        endpoint: null,
+        error: "gone",
+        reason: "notRunning",
+      },
     });
     expect(result).toEqual(base);
   });

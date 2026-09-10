@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use mast_contract::{DiscoveredProject, DockerStatus, PatchEvent, ServiceState};
+use mast_contract::{DiscoveredProject, DockerStatus, DockerUnavailable, PatchEvent, ServiceState};
 use mast_docker::{
     BollardAdapter, CommandError, ContainerObservation, DockerError, RuntimeAdapter,
     resolve_endpoint,
@@ -33,6 +33,7 @@ impl RuntimeConnector for RealConnector {
             context_name: Some(endpoint.context_name.clone()),
             endpoint: Some(endpoint.host.clone()),
             error: None,
+            reason: None,
         };
         Ok((Arc::new(adapter), status))
     }
@@ -72,11 +73,19 @@ async fn docker_loop(engine: Engine) {
                 }
                 // Stream ended: connection lost.
                 *engine.inner.adapter.lock().unwrap() = None;
-                engine.update_docker_status_unavailable("docker connection lost");
+                // The daemon answered once and then stopped. Whatever it is
+                // now, it is not "never installed".
+                engine.update_docker_status_unavailable(
+                    "docker connection lost",
+                    DockerUnavailable::NotRunning,
+                );
             }
             Err(e) => {
                 *engine.inner.adapter.lock().unwrap() = None;
-                engine.update_docker_status_unavailable(&connect_error_text(&e));
+                engine.update_docker_status_unavailable(
+                    &connect_error_text(&e),
+                    classify_unavailable(&e),
+                );
             }
         }
         tokio::time::sleep(backoff).await;
@@ -97,6 +106,44 @@ fn connect_error_text(e: &DockerError) -> String {
                 .to_string()
         }
         _ => e.to_string(),
+    }
+}
+
+/// Which of the four repairs the user is actually facing.
+///
+/// Only the missing-CLI case is structural; the rest have to be read out of the
+/// message, because bollard and hyper wrap the operating system's errno by the
+/// time it reaches us and the variant that survives says only "Connect". The
+/// substrings matched here are the ones the platforms actually emit — a socket
+/// that is not there, a connection nobody is listening for, a socket this user
+/// may not open.
+///
+/// Unknown text classifies as `Unreachable`, which is the honest answer: it is
+/// the bucket whose advice is "here is what went wrong, we cannot narrow it
+/// further", and clients show the raw error alongside it.
+fn classify_unavailable(e: &DockerError) -> DockerUnavailable {
+    if let DockerError::Command(CommandError::Spawn { source, .. }) = e {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return DockerUnavailable::NotInstalled;
+        }
+        if source.kind() == std::io::ErrorKind::PermissionDenied {
+            return DockerUnavailable::PermissionDenied;
+        }
+    }
+    let text = e.to_string().to_ascii_lowercase();
+    // Order matters: a permission failure on a socket path also mentions the
+    // path, so the narrower diagnosis has to be tested first.
+    if text.contains("permission denied") || text.contains("access is denied") {
+        DockerUnavailable::PermissionDenied
+    } else if text.contains("no such file or directory")
+        || text.contains("connection refused")
+        || text.contains("cannot connect to the docker daemon")
+        || text.contains("is the docker daemon running")
+        || text.contains("the system cannot find the file specified")
+    {
+        DockerUnavailable::NotRunning
+    } else {
+        DockerUnavailable::Unreachable
     }
 }
 
@@ -182,11 +229,19 @@ impl Engine {
         });
     }
 
-    pub(crate) fn update_docker_status_unavailable(&self, error: &str) {
+    pub(crate) fn update_docker_status_unavailable(
+        &self,
+        error: &str,
+        reason: DockerUnavailable,
+    ) {
         self.with_state(|st, events| {
-            if st.docker.available || st.docker.error.as_deref() != Some(error) {
+            if st.docker.available
+                || st.docker.error.as_deref() != Some(error)
+                || st.docker.reason != Some(reason)
+            {
                 st.docker.available = false;
                 st.docker.error = Some(error.to_string());
+                st.docker.reason = Some(reason);
                 events.push(PatchEvent::DockerStatusChanged { status: st.docker.clone() });
             }
         });
@@ -944,5 +999,112 @@ mod tests {
         // Every other failure keeps its own words.
         let api = DockerError::Api("boom".into());
         assert_eq!(connect_error_text(&api), api.to_string());
+    }
+}
+
+#[cfg(test)]
+mod docker_classification_tests {
+    use super::*;
+
+    fn api(message: &str) -> DockerError {
+        DockerError::Api(message.to_string())
+    }
+
+    fn spawn(kind: std::io::ErrorKind) -> DockerError {
+        DockerError::Command(CommandError::Spawn {
+            argv0: "docker".into(),
+            source: std::io::Error::new(kind, "test"),
+        })
+    }
+
+    // The state of every machine that has never had Docker, and the one the
+    // retry loop can genuinely fix by itself once the user installs it.
+    #[test]
+    fn a_missing_cli_is_not_installed() {
+        assert_eq!(
+            classify_unavailable(&spawn(std::io::ErrorKind::NotFound)),
+            DockerUnavailable::NotInstalled
+        );
+    }
+
+    // What the Omarchy guest actually produced: bollard wrapping hyper
+    // wrapping a socket that is not there. The variant says only "Connect",
+    // which is why the text has to be read.
+    #[test]
+    fn a_dead_socket_is_not_running() {
+        for message in [
+            "docker API error: Error in the hyper legacy client: client error (Connect): \
+             No such file or directory (os error 2)",
+            "error trying to connect: Connection refused (os error 111)",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+             Is the docker daemon running?",
+            "The system cannot find the file specified. (os error 2)",
+        ] {
+            assert_eq!(
+                classify_unavailable(&api(message)),
+                DockerUnavailable::NotRunning,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_socket_is_a_permission_problem() {
+        for message in [
+            "error trying to connect: Permission denied (os error 13)",
+            "Got permission denied while trying to connect to the Docker daemon socket",
+            "Access is denied. (os error 5)",
+        ] {
+            assert_eq!(
+                classify_unavailable(&api(message)),
+                DockerUnavailable::PermissionDenied,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            classify_unavailable(&spawn(std::io::ErrorKind::PermissionDenied)),
+            DockerUnavailable::PermissionDenied
+        );
+    }
+
+    // A permission failure names the socket path too, so it also matches the
+    // not-running substrings. The narrower diagnosis has to win, or every
+    // group-membership problem is reported as a stopped daemon and the advice
+    // sends the user to restart a service that is already running.
+    #[test]
+    fn permission_wins_over_the_path_it_mentions() {
+        let both = api(
+            "error trying to connect to unix:///var/run/docker.sock: \
+             Permission denied (os error 13)",
+        );
+        assert_eq!(classify_unavailable(&both), DockerUnavailable::PermissionDenied);
+    }
+
+    // Not a catch-all for "we did not think about it": Unreachable's advice is
+    // "here is the raw error", which is the right answer when we cannot narrow
+    // it and the wrong one whenever we can.
+    #[test]
+    fn anything_unrecognised_is_unreachable() {
+        assert_eq!(
+            classify_unavailable(&api("certificate verify failed")),
+            DockerUnavailable::Unreachable
+        );
+        assert_eq!(classify_unavailable(&api("")), DockerUnavailable::Unreachable);
+        assert_eq!(
+            classify_unavailable(&DockerError::UnsupportedEndpoint("ssh://box".into())),
+            DockerUnavailable::Unreachable
+        );
+    }
+
+    #[test]
+    fn classification_ignores_case() {
+        assert_eq!(
+            classify_unavailable(&api("PERMISSION DENIED")),
+            DockerUnavailable::PermissionDenied
+        );
+        assert_eq!(
+            classify_unavailable(&api("Connection Refused")),
+            DockerUnavailable::NotRunning
+        );
     }
 }
