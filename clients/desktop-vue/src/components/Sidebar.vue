@@ -65,19 +65,19 @@ watch(floating, (isFloating) => {
   if (!isFloating) store.setSidebarOverlay(false);
 });
 
-let dragging = false;
+const dragging = ref(false);
 
 function startDrag(event: MouseEvent) {
-  dragging = true;
+  dragging.value = true;
   event.preventDefault();
   const move = (e: MouseEvent) => {
-    if (!dragging) return;
+    if (!dragging.value) return;
     // Clamped against the live window, not just the stored range: the handle
     // must not be able to drag the content pane out of existence.
     width.value = sidebarWidth(e.clientX, viewport.width.value);
   };
   const up = () => {
-    dragging = false;
+    dragging.value = false;
     saveSidebarWidth(width.value);
     window.removeEventListener("mousemove", move);
     window.removeEventListener("mouseup", up);
@@ -87,7 +87,7 @@ function startDrag(event: MouseEvent) {
 }
 
 onBeforeUnmount(() => {
-  dragging = false;
+  dragging.value = false;
 });
 
 function isSelected(kind: string, id?: string): boolean {
@@ -304,22 +304,38 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
   <!-- Only while it floats: the content behind it is still the thing being
        worked on, so clicking it puts the sidebar away rather than doing
        nothing. Absent entirely when docked, where there is nothing to dismiss. -->
-  <div
-    v-if="floating && visible"
-    class="absolute inset-0 z-20 bg-slate-950/30"
-    @click="store.setSidebarOverlay(false)"
-  />
+  <Transition
+    enter-active-class="transition-opacity duration-200 motion-reduce:transition-none"
+    leave-active-class="transition-opacity duration-200 motion-reduce:transition-none"
+    enter-from-class="opacity-0"
+    leave-to-class="opacity-0"
+  >
+    <div
+      v-if="floating && visible"
+      class="absolute inset-0 z-20 bg-slate-950/30"
+      @click="store.setSidebarOverlay(false)"
+    />
+  </Transition>
+  <!-- Mounted whether or not it is showing, because `display: none` cannot be
+       animated — hiding is a width of zero when docked and a slide out of frame
+       when floating. `overflow-hidden` keeps the rows from spilling out of a
+       panel mid-collapse. The transition is suppressed while the handle is
+       being dragged: a drag is direct manipulation and must track the pointer
+       exactly, not lag 200ms behind it. -->
   <aside
-    v-show="visible"
-    class="flex flex-col border-r border-slate-200 dark:border-slate-800"
-    :class="
+    :aria-hidden="!visible"
+    :inert="!visible || undefined"
+    class="flex flex-col overflow-hidden border-r border-slate-200 motion-reduce:transition-none dark:border-slate-800"
+    :class="[
+      dragging ? '' : 'transition-[width,transform] duration-200 ease-out',
       floating
         ? // Opaque, unlike the docked panel: 60% over a matching pane reads as
           // a tint, but 60% over the content it is covering reads as broken.
           'absolute inset-y-0 left-0 z-30 bg-slate-50 shadow-xl dark:bg-neutral-900'
-        : 'relative shrink-0 bg-slate-50/60 dark:bg-neutral-900/60'
-    "
-    :style="{ width: `${renderedWidth}px` }"
+        : 'relative shrink-0 bg-slate-50/60 dark:bg-neutral-900/60',
+      floating && !visible ? '-translate-x-full' : 'translate-x-0',
+    ]"
+    :style="{ width: `${floating || visible ? renderedWidth : 0}px` }"
   >
     <nav class="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
       <!-- Only once the list outgrows a glance — a filter over five rows is
@@ -533,9 +549,11 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
       </SidebarGroup>
     </nav>
 
-    <!-- Drag handle -->
+    <!-- Drag handle. `right-0` rather than `-right-0.5`: the panel clips its
+         overflow now, so a handle hanging outside it would be half invisible. -->
     <div
-      class="absolute top-0 -right-0.5 z-10 h-full w-1.5 cursor-col-resize hover:bg-slate-300/60 dark:hover:bg-neutral-600/60"
+      v-if="visible"
+      class="absolute top-0 right-0 z-10 h-full w-1.5 cursor-col-resize hover:bg-slate-300/60 dark:hover:bg-neutral-600/60"
       @mousedown="startDrag"
     />
   </aside>
