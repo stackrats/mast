@@ -9,6 +9,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { sidebarMode } from "../lib/layout";
+import { scaleLabel } from "../lib/scale";
 import { comboLabel } from "../lib/shortcuts";
 import { useViewport } from "../lib/viewport";
 import { useEngineStore } from "../stores/engine";
@@ -48,6 +49,9 @@ const sidebarShown = computed(() =>
   layout.value === "overlay" ? store.sidebarOverlay : store.sidebarOpen,
 );
 const sidebarAccel = comboLabel(["mod", "B"]);
+const zoomInAccel = comboLabel(["mod", "+"]);
+const zoomOutAccel = comboLabel(["mod", "−"]);
+const zoomResetAccel = comboLabel(["mod", "0"]);
 
 type MenuId = "app" | "workspace" | "view";
 
@@ -271,6 +275,30 @@ async function closeToTray() {
           >
             {{ sidebarShown ? "Hide sidebar" : "Show sidebar" }}
             <span :class="accelClass">{{ sidebarAccel }}</span>
+          </button>
+          <div :class="separatorClass" />
+          <!-- The percentage is the label's whole job: without it "Zoom in"
+               gives no way to tell how far in you already are, and no way to
+               notice that this session started at 90% because the compositor
+               tiles. `select` is not used — the menu stays open so the size can
+               be walked to where it belongs in one visit. -->
+          <div
+            class="flex items-center justify-between px-2 py-1 text-xs text-slate-500 dark:text-slate-400"
+          >
+            <span>Interface size</span>
+            <span class="tabular-nums">{{ scaleLabel(store.uiScale) }}</span>
+          </div>
+          <button type="button" role="menuitem" :class="itemClass" @click="store.stepUiScale(1)">
+            Zoom in
+            <span :class="accelClass">{{ zoomInAccel }}</span>
+          </button>
+          <button type="button" role="menuitem" :class="itemClass" @click="store.stepUiScale(-1)">
+            Zoom out
+            <span :class="accelClass">{{ zoomOutAccel }}</span>
+          </button>
+          <button type="button" role="menuitem" :class="itemClass" @click="store.resetUiScale()">
+            Reset zoom
+            <span :class="accelClass">{{ zoomResetAccel }}</span>
           </button>
           <div :class="separatorClass" />
           <button

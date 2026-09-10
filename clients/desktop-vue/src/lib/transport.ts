@@ -3,6 +3,7 @@
 
 import { getVersion } from "@tauri-apps/api/app";
 import { Channel } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import {
@@ -18,6 +19,7 @@ import {
   type ProjectId,
   type Result,
   type SubscriptionItem,
+  type SessionInfo,
   type UsageSample,
   type VolumeSnapshot,
 } from "../bindings";
@@ -26,6 +28,34 @@ import type { PatchTransport } from "./engineSync";
 function unwrap<T>(result: Result<T, string>): T {
   if (result.status === "error") throw new Error(result.error);
   return result.data;
+}
+
+/** What the app can tell about the session it was launched into. Only the
+ * default UI scale depends on it, so a failure here is not worth surfacing:
+ * a session we cannot identify is treated as a floating one, which is what
+ * every release before this behaved like anyway. */
+export async function sessionInfo(): Promise<SessionInfo> {
+  try {
+    return await commands.sessionInfo();
+  } catch {
+    return { desktop: null, tiling: false };
+  }
+}
+
+/** Set the webview's zoom factor.
+ *
+ * Zoom rather than a root font size: half the app's sizes are rem and would
+ * follow the font, and the other half are the deliberate pixel values that keep
+ * the chrome in register — the wordmark's 16.85px, the banner's 3px rows. Only
+ * zoom moves both halves together. */
+export async function applyZoom(scale: number): Promise<void> {
+  try {
+    await getCurrentWebview().setZoom(scale);
+  } catch {
+    // Zoom is unsupported on some webviews and absent outside Tauri entirely
+    // (the vanilla-vite fallback build runs in a plain browser). The app is
+    // fully usable at 100%; refusing to start over it would not be.
+  }
 }
 
 export const tauriPatchTransport: PatchTransport = {
