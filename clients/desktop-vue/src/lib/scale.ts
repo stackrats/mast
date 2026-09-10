@@ -30,11 +30,14 @@ export function snapScale(scale: number): number {
   return clampScale(Math.round(snapped * 100) / 100);
 }
 
-/** What a session gets before the user has expressed a preference. A tiling
- * compositor sizes the window itself, and usually smaller than the config asks
- * for, so it starts one step down. */
+/** What a session gets before the user has expressed a preference.
+ *
+ * A tiling compositor sizes the window itself, and usually a good deal smaller
+ * than the config asks for — 75% rather than one step down, measured against a
+ * real Hyprland workspace rather than guessed at. Still only a starting point:
+ * a stored preference wins outright. */
 export function defaultScale(tiling: boolean): number {
-  return tiling ? 0.9 : 1;
+  return tiling ? 0.75 : 1;
 }
 
 export function clampScale(scale: number): number {

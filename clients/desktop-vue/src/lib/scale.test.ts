@@ -14,8 +14,8 @@ import {
 describe("defaultScale", () => {
   // The whole point of detecting the compositor: a window the user did not
   // size is usually smaller than the one the config asks for.
-  it("starts a tiling session one step down", () => {
-    expect(defaultScale(true)).toBe(0.9);
+  it("starts a tiling session well below full size", () => {
+    expect(defaultScale(true)).toBe(0.75);
     expect(defaultScale(false)).toBe(1);
   });
 
