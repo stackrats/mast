@@ -562,6 +562,19 @@ pub fn run() {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // A resize the webview did not follow — see linux_env for the
+            // Hyprland float toggle that produces one. Deferred to idle so it
+            // runs after GTK has finished its own pass for this configure,
+            // rather than inside it.
+            #[cfg(target_os = "linux")]
+            if let tauri::WindowEvent::Resized(_) = event
+                && let Some(webview_window) = window.get_webview_window("main")
+            {
+                let handle = webview_window.clone();
+                let _ = webview_window.run_on_main_thread(move || {
+                    linux_env::reallocate_webview(&handle);
+                });
+            }
         })
         .setup(move |app| {
             if let Err(e) = tray::setup_tray(app) {

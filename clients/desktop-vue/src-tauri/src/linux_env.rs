@@ -42,6 +42,41 @@ fn set_default((key, value): (&str, &str)) {
     }
 }
 
+/// Force the webview to take the window's current size.
+///
+/// Under Hyprland, toggling a window from tiled to floating reconfigures the
+/// surface but leaves WebKit drawing at its old allocation — the content
+/// appears shifted, with the menubar off the top and the left edge clipped,
+/// until some later, real resize comes along. Fullscreen in and out fixes it,
+/// and so does dragging an edge, which is the tell: GTK short-circuits the
+/// allocation when it believes nothing changed, and WebKit never relayouts.
+///
+/// `queue_allocate` is GTK's answer to exactly that — re-run allocation even
+/// when the size request is unchanged. It is a no-op in cost when nothing was
+/// wrong, so it runs on every resize rather than trying to identify the one
+/// that needs it, which would mean relying on the compositor advertising its
+/// tiled state, which not all of them do. wry's own `set_bounds` does nothing
+/// for a main-window webview; it leaves the allocation to GTK, so this is the
+/// layer that has to ask.
+pub fn reallocate_webview(window: &tauri::WebviewWindow) {
+    use gtk::prelude::{ContainerExt, WidgetExt};
+
+    let Ok(gtk_window) = window.gtk_window() else {
+        return;
+    };
+    fn walk(widget: &gtk::Widget) {
+        widget.queue_allocate();
+        widget.queue_draw();
+        if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+            for child in container.children() {
+                walk(&child);
+            }
+        }
+    }
+    use gtk::glib::Cast;
+    walk(gtk_window.upcast_ref::<gtk::Widget>());
+}
+
 /// Whether this process is running under a hypervisor, judged from the DMI
 /// strings the firmware exposes. `systemd-detect-virt` would be authoritative
 /// but is a subprocess and not universally present; DMI is a file read and is
