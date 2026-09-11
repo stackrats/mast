@@ -1227,7 +1227,9 @@ mod docker_classification_tests {
 
     // The reason this exists at all: hyper reports a socket that is not there
     // and a socket we may not open with the same six words, so no amount of
-    // reading the message can separate them. These drive real sockets.
+    // reading the message can separate them. These drive real sockets — and
+    // so, like the probe they exercise, exist only where unix sockets do.
+    #[cfg(unix)]
     mod socket_probe {
         use super::*;
         use std::os::unix::net::UnixListener;
