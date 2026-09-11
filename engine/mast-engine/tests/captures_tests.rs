@@ -122,6 +122,7 @@ impl RuntimeConnector for FakeConnector {
                 context_name: Some("fake".into()),
                 endpoint: Some("unix:///fake.sock".into()),
                 error: None,
+                reason: None,
             },
         ))
     }

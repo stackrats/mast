@@ -13,6 +13,9 @@ import {
   type Theme,
 } from "../lib/prefs";
 import type { IntegrationSettings } from "../bindings";
+import { SCALE_MAX, SCALE_MIN } from "../lib/prefs";
+import { SCALE_SLIDER_STEP, defaultScale, scaleLabel, snapScale } from "../lib/scale";
+import { comboLabel } from "../lib/shortcuts";
 import { pickDirectory, pickFile } from "../lib/transport";
 import { useEngineStore } from "../stores/engine";
 import Button from "./ui/Button.vue";
@@ -166,6 +169,54 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
             {{ option.label }}
           </Button>
         </div>
+      </section>
+
+      <section class="space-y-2">
+        <h4 :class="headingClass">Interface size</h4>
+        <div class="flex items-center gap-3">
+          <input
+            :value="store.uiScale"
+            type="range"
+            :min="SCALE_MIN"
+            :max="SCALE_MAX"
+            :step="SCALE_SLIDER_STEP"
+            aria-label="Interface size"
+            class="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-slate-200 accent-slate-900 dark:bg-slate-700 dark:accent-slate-100"
+            @input="store.setUiScale(snapScale(Number(($event.target as HTMLInputElement).value)))"
+          />
+          <span
+            class="w-12 shrink-0 text-right text-xs tabular-nums text-slate-600 dark:text-slate-300"
+          >
+            {{ scaleLabel(store.uiScale) }}
+          </span>
+        </div>
+        <!-- Which of the two facts is true about the current number matters:
+             "90% because you chose it" and "90% because this compositor tiles"
+             look identical on screen and are not the same thing at all. Naming
+             the compositor makes a wrong guess a legible wrong guess rather
+             than a mystery shrinking of the app. -->
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          <template v-if="store.uiScaleIsDefault && store.sessionTiling">
+            Defaulting to {{ scaleLabel(store.uiScale) }} because
+            {{ store.sessionDesktop ?? "this session" }} tiles windows, so Mast rarely gets the size
+            it asks for. Pick any size above and it sticks.
+          </template>
+          <template v-else-if="store.uiScaleIsDefault">
+            Using the standard {{ scaleLabel(store.uiScale) }}. Also
+            {{ comboLabel(["mod", "+"]) }} and {{ comboLabel(["mod", "−"]) }} from anywhere.
+          </template>
+          <template v-else>
+            Set to {{ scaleLabel(store.uiScale) }}.
+            <button
+              type="button"
+              class="underline underline-offset-2 hover:text-slate-700 dark:hover:text-slate-200"
+              @click="store.resetUiScale()"
+            >
+              Use the default for this session
+            </button>
+            ({{ scaleLabel(defaultScale(store.sessionTiling)) }}).
+          </template>
+        </p>
       </section>
 
       <section class="space-y-2">

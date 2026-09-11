@@ -3,5 +3,11 @@
   "identifier": "default",
   "description": "Default capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "notification:default", "autostart:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "autostart:default",
+    "dialog:allow-open",
+    "core:webview:allow-set-webview-zoom"
+  ]
 }

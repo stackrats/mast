@@ -686,8 +686,14 @@ async function clearAppLog() {
   <div
     class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900"
   >
-    <div class="flex items-center justify-between gap-4">
-      <div class="min-w-0">
+    <!-- Wraps. The button group is fixed-width and used to sit beside the
+         title unconditionally, so in a narrow tile the title column was
+         handed whatever was left — about 120px — and the path broke
+         character by character down it. With `flex-wrap` and a minimum basis
+         the title column claims the whole first row when the two cannot
+         share one, and the buttons take the next. -->
+    <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <div class="min-w-0 flex-1 basis-56">
         <!-- nowrap + truncating title: late-arriving badges (git info lands
              after the first reconcile) may shorten the name but never re-wrap
              the header, so nothing below jumps. -->
@@ -727,7 +733,20 @@ async function clearAppLog() {
             </Badge>
           </Tooltip>
         </div>
-        <p class="mt-0.5 font-mono text-xs break-all text-slate-400">{{ project.path }}</p>
+        <!-- One line, clipped at the start: the tail of a path is the part
+             that names the project, and the head is the part everyone's
+             paths share. `break-all` wrapped it character by character. The
+             full path is a hover away. `dir="rtl"` puts the ellipsis at the
+             start; `text-left` keeps the text where a path belongs, since rtl
+             alone also flushes it right. `bdi` stops the punctuation being
+             reordered. -->
+        <p
+          class="mt-0.5 truncate text-left font-mono text-xs text-slate-400"
+          dir="rtl"
+          :title="project.path"
+        >
+          <bdi>{{ project.path }}</bdi>
+        </p>
       </div>
       <div class="flex shrink-0 gap-1.5">
         <template v-if="opRunning">
@@ -1637,7 +1656,9 @@ async function clearAppLog() {
         <p class="mt-4 text-xs font-medium text-slate-600 dark:text-slate-300">
           Extensions ({{ phpRt.extensions.length }})
         </p>
-        <div class="mt-1.5 grid max-h-[32vh] grid-cols-4 gap-x-3 gap-y-1 overflow-y-auto">
+        <div
+          class="mt-1.5 grid max-h-[32vh] grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto sm:grid-cols-3 lg:grid-cols-4"
+        >
           <span
             v-for="ext in phpRt.extensions"
             :key="ext"

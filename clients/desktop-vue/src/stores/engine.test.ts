@@ -617,3 +617,49 @@ describe("attention markers", () => {
     expect(store.attentionFor("p1")).toEqual(["went degraded"]);
   });
 });
+
+// One keystroke, two flags. Which one it flips is decided by how the sidebar
+// is laid out at that moment, and getting it backwards means ⌘B either does
+// nothing in a tiled window or quietly rewrites a preference the user set on
+// a full-size one.
+describe("toggleSidebar", () => {
+  it("docked, the toggle is a preference", () => {
+    const store = useEngineStore();
+    store.sidebarOpen = true;
+
+    store.toggleSidebar("inline");
+    expect(store.sidebarOpen).toBe(false);
+    store.toggleSidebar("inline");
+    expect(store.sidebarOpen).toBe(true);
+  });
+
+  it("floating, the toggle is a glance", () => {
+    const store = useEngineStore();
+    store.sidebarOverlay = false;
+
+    store.toggleSidebar("overlay");
+    expect(store.sidebarOverlay).toBe(true);
+    store.toggleSidebar("overlay");
+    expect(store.sidebarOverlay).toBe(false);
+  });
+
+  // The reason the two are separate flags at all: a window narrow enough to
+  // float the sidebar must not decide what the next wide one shows.
+  it("floating never touches the docked preference", () => {
+    const store = useEngineStore();
+    store.sidebarOpen = true;
+
+    store.toggleSidebar("overlay");
+    store.toggleSidebar("overlay");
+    store.toggleSidebar("overlay");
+    expect(store.sidebarOpen).toBe(true);
+  });
+
+  it("docked never leaves the floating panel armed", () => {
+    const store = useEngineStore();
+    store.sidebarOverlay = false;
+
+    store.toggleSidebar("inline");
+    expect(store.sidebarOverlay).toBe(false);
+  });
+});
