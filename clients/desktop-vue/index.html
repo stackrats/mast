@@ -73,10 +73,12 @@
       }
       #splash p {
         margin: 0;
-        /* Centred and held short. Left as flow text it wrapped after "LARAVEL"
-           and set the orphan hard against the left edge, which read as a
-           layout fault rather than a tagline. */
-        max-width: min(30ch, 82vw);
+        /* One line wherever one line fits. Only the window's width limits it,
+           so it wraps in a narrow tile and nowhere else — and when it does
+           wrap, `balance` splits it evenly and `text-align` keeps both halves
+           centred, rather than an orphan hard against the left edge. A
+           character cap here forced two lines into windows with room for one. */
+        max-width: 82vw;
         text-align: center;
         text-wrap: balance;
         font-family: "Inter", "Segoe UI", system-ui, sans-serif;
