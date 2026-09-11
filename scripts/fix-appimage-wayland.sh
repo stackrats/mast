@@ -26,6 +26,16 @@
 # has been applied. If that is fixed upstream this script turns into a no-op,
 # says so, and can be deleted.
 #
+# The same plugin also writes an AppRun hook that exports GDK_BACKEND=x11,
+# putting the app on XWayland under every Wayland desktop. It cites a Tauri
+# crash (tauri-apps/tauri#8541): a GSettings schema mismatch on Tauri 1.5 with
+# an AppImage built on Ubuntu 20.04, which the X11 backend sidestepped because
+# it reads Xsettings rather than GSettings. That does not apply to a 24.04
+# build. What XWayland costs on Hyprland is real, though: toggling a window
+# between tiled and floating displays the buffer at the wrong size until the
+# next real resize. The hook is rewritten to prefer Wayland and fall back to
+# X11, and to let a GDK_BACKEND the user has already exported win.
+#
 # Usage:
 #   scripts/fix-appimage-wayland.sh <AppImage> [more...]   strip and repack
 #   scripts/fix-appimage-wayland.sh --strip-only <AppDir>  strip in place
@@ -43,6 +53,11 @@ STRIP_LIBS=(
   libwayland-egl.so.1
   libwayland-server.so.0
 )
+
+# The hook the GTK plugin writes, and the line in it that forces X11.
+GTK_HOOK=apprun-hooks/linuxdeploy-plugin-gtk.sh
+GDK_FORCED_X11='export GDK_BACKEND=x11'
+GDK_PREFER_WAYLAND='export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}" # rewritten by fix-appimage-wayland.sh: native Wayland where it exists, X11 otherwise, and an exported value wins'
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*"; }
@@ -65,12 +80,31 @@ strip_appdir() {
   printf '%s' "$removed"
 }
 
+# Rewrites the GTK hook's forced-X11 line, if present. Echoes 1 if it changed
+# the file, 0 if there was nothing to change (already rewritten, or no hook).
+prefer_wayland() {
+  local hook="$1/$GTK_HOOK"
+  [[ -f "$hook" ]] || { printf '0'; return 0; }
+  if grep -qF "$GDK_FORCED_X11" "$hook"; then
+    # Whole-line replacement on the exact export, via awk rather than sed so
+    # the replacement's $ and " need no escaping.
+    awk -v from="$GDK_FORCED_X11" -v to="$GDK_PREFER_WAYLAND" \
+      'index($0, from) == 1 { print to; next } { print }' "$hook" > "$hook.tmp" \
+      && mv "$hook.tmp" "$hook"
+    printf '    rewrote %s\n' "$GTK_HOOK" >&2
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
 # --------------------------------------------------------------- modes -----
 if [[ "${1:-}" == "--strip-only" ]]; then
   [[ -n "${2:-}" ]] || die "usage: $0 --strip-only <AppDir>"
   [[ -d "$2" ]] || die "Not a directory: $2"
   n=$(strip_appdir "$2") || die "strip failed"
-  info "Removed $n file(s) from $2"
+  h=$(prefer_wayland "$2")
+  info "Removed $n file(s) from $2; hook rewritten: $h"
   exit 0
 fi
 
@@ -121,7 +155,8 @@ for IMG in "$@"; do
   [[ -d "$AD" ]] || die "No squashfs-root after extracting $IMG"
 
   removed=$(strip_appdir "$AD")
-  if (( removed == 0 )); then
+  rewrote=$(prefer_wayland "$AD")
+  if (( removed == 0 && rewrote == 0 )); then
     warn "  none of the target libraries were present — nothing to do."
     warn "  Either upstream fixed this, or the bundle layout changed."
     warn "  Verify before assuming the workaround is still needed."
@@ -145,8 +180,12 @@ for IMG in "$@"; do
   done
   find "$VERIFY/squashfs-root" -name 'libwebkit2gtk-4.1.so.0' | grep -q . \
     || die "libwebkit2gtk missing from the repacked AppImage — bad repack."
+  if [[ -f "$VERIFY/squashfs-root/$GTK_HOOK" ]]; then
+    grep -qF "$GDK_FORCED_X11" "$VERIFY/squashfs-root/$GTK_HOOK" \
+      && die "the GTK hook still forces GDK_BACKEND=x11 after the repack."
+  fi
 
-  info "  verified: $removed removed, WebKit intact, $(stat -c %s "$IMG") bytes"
+  info "  verified: $removed removed, hook rewritten: $rewrote, WebKit intact, $(stat -c %s "$IMG") bytes"
   rm -rf "$WORK"; trap - EXIT
 done
 

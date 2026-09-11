@@ -12,6 +12,8 @@
 #     tested on Arch and is innocent; removing them would be an unnecessary
 #     and riskier change
 #   * both AppDir layouts are handled (usr/lib and usr/lib/<triplet>)
+#   * the GTK plugin's hook stops forcing GDK_BACKEND=x11, prefers Wayland,
+#     and still lets a user's own exported GDK_BACKEND win
 #   * a second run is a clean no-op rather than an error
 #   * a missing AppDir fails loudly instead of silently succeeding
 #
@@ -42,6 +44,22 @@ make_appdir() {
   # The triplet directory is the other place the plugin has put them.
   printf 'stub' > "$root/usr/lib/x86_64-linux-gnu/libwayland-client.so.0"
   printf 'stub' > "$root/usr/bin/mast-desktop"
+  # The hook as linuxdeploy-plugin-gtk writes it: the forced-X11 line between
+  # unrelated exports that must come through untouched.
+  mkdir -p "$root/apprun-hooks"
+  cat > "$root/apprun-hooks/linuxdeploy-plugin-gtk.sh" <<'HOOK'
+#! /usr/bin/env bash
+export GTK_THEME="$APPIMAGE_GTK_THEME" # Custom themes are broken
+export GDK_BACKEND=x11 # Crash with Wayland backend on Wayland - We tested it without it and ended up with this: https://github.com/tauri-apps/tauri/issues/8541
+export XDG_DATA_DIRS="$APPDIR/usr/share:/usr/share:$XDG_DATA_DIRS" # g_get_system_data_dirs() from GLib
+HOOK
+}
+
+# Runs a hook the way AppRun does and prints the GDK_BACKEND it leaves behind,
+# given whatever the caller had exported beforehand.
+backend_after() {
+  local hook="$1"; shift
+  env -i "$@" bash -c "source '$hook'; printf '%s' \"\$GDK_BACKEND\""
 }
 
 present() { [[ -e "$1" ]]; }
@@ -84,6 +102,42 @@ present "$T/AppDir/usr/bin/mast-desktop" \
   && pass "application binary untouched" \
   || fail "application binary went missing"
 
+# ---------------------------------------------------------------- case 2b ---
+# The hook. What matters is what a shell ends up with after sourcing it, not
+# what the line looks like — so the rewritten hook is actually run.
+HOOK="$T/AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+if grep -qF 'export GDK_BACKEND=x11' "$HOOK"; then
+  fail "the hook still forces GDK_BACKEND=x11"
+else
+  pass "the forced-X11 line is gone"
+fi
+
+got=$(backend_after "$HOOK")
+if [[ "$got" == "wayland,x11" ]]; then
+  pass "with nothing exported, the hook prefers Wayland and falls back to X11"
+else
+  fail "expected GDK_BACKEND=wayland,x11 from a clean environment, got '$got'"
+fi
+
+# The escape hatch: someone whose Wayland session genuinely misbehaves can
+# export GDK_BACKEND=x11 themselves, and the hook must not overwrite it — which
+# is exactly what the original unconditional export did.
+got=$(backend_after "$HOOK" GDK_BACKEND=x11)
+if [[ "$got" == "x11" ]]; then
+  pass "an exported GDK_BACKEND=x11 survives the hook"
+else
+  fail "the hook overwrote the user's GDK_BACKEND (got '$got')"
+fi
+
+# The lines either side of the rewrite are untouched: the rewrite is a
+# whole-line replacement of one export, not a sed over the file.
+if grep -qF 'export GTK_THEME="$APPIMAGE_GTK_THEME"' "$HOOK" \
+   && grep -qF 'export XDG_DATA_DIRS="$APPDIR/usr/share' "$HOOK"; then
+  pass "neighbouring exports left alone"
+else
+  fail "the rewrite disturbed lines other than the GDK_BACKEND export"
+fi
+
 # ---------------------------------------------------------------- case 3 ----
 # Idempotency: re-running over an already-clean AppDir must succeed quietly,
 # because the release workflow may be re-run against the same artefacts.
@@ -91,6 +145,22 @@ if bash "$SCRIPT" --strip-only "$T/AppDir" >/dev/null 2>&1; then
   pass "second run is a clean no-op"
 else
   fail "second run should exit 0 on an already-stripped AppDir"
+fi
+# …and a second pass must not rewrite the already-rewritten line into
+# something else, or stack a second replacement onto it.
+if (( $(grep -c 'GDK_BACKEND' "$HOOK") == 1 )); then
+  pass "second run leaves exactly one GDK_BACKEND export"
+else
+  fail "second run changed the hook again"
+fi
+
+# An AppDir with no hook at all (a future plugin that stopped writing one) is
+# not an error: there is simply nothing to rewrite.
+rm -rf "$T/AppDir/apprun-hooks"
+if bash "$SCRIPT" --strip-only "$T/AppDir" >/dev/null 2>&1; then
+  pass "an AppDir without the hook is fine"
+else
+  fail "a missing hook should not be an error"
 fi
 
 # ---------------------------------------------------------------- case 4 ----

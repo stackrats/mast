@@ -185,14 +185,19 @@ jobs:
             --target ${{ matrix.target }} \
             --bundles ${{ matrix.bundles }} \
             --config ci-config.json
-      # Tauri drives linuxdeploy, which copies this runner's libwayland-* into
-      # the AppDir; AppRun then loads them ahead of the user's. On any host
-      # whose Mesa differs from Ubuntu's that kills EGL and the app aborts
-      # before drawing a window (reproduced on Arch/Omarchy against 0.7.0).
-      # Tauri exposes no library-exclusion setting, so strip them afterwards.
-      # The script verifies its own output and fails the build if the repack
-      # is bad. scripts/test-fix-appimage-wayland.sh guards the list in CI.
-      - name: Strip host-coupled Wayland libraries from the AppImage
+      # Tauri drives linuxdeploy, whose GTK plugin does two things the AppImage
+      # has to undo. It copies this runner's libwayland-* into the AppDir, and
+      # AppRun loads them ahead of the user's — on any host whose Mesa differs
+      # from Ubuntu's that kills EGL and the app aborts before drawing a window
+      # (reproduced on Arch/Omarchy against 0.7.0). And it writes a launch hook
+      # forcing GDK_BACKEND=x11, putting the app on XWayland under every Wayland
+      # desktop to dodge a Tauri 1.5 crash that a 24.04 build does not have;
+      # under Hyprland that costs a window displayed at the wrong size after
+      # every tiled/floating toggle. Tauri exposes no setting for either, so
+      # both are fixed afterwards. The script verifies its own output and fails
+      # the build if the repack is bad; scripts/test-fix-appimage-wayland.sh
+      # guards both behaviours in CI.
+      - name: Fix the AppImage for Wayland hosts
         if: runner.os == 'Linux'
         shell: bash
         run: |
