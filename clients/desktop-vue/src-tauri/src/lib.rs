@@ -580,6 +580,15 @@ pub fn run() {
             if let Err(e) = tray::setup_tray(app) {
                 tracing::warn!("tray unavailable: {e}");
             }
+            // No titlebar on a tiling desktop — see linux_env::wants_no_titlebar
+            // for why this is a per-window decision rather than an environment
+            // variable, and why it is gated.
+            #[cfg(target_os = "linux")]
+            if linux_env::wants_no_titlebar(session::desktop_name().as_deref())
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.set_decorations(false);
+            }
             if std::env::args().any(|arg| arg == "--minimized")
                 && let Some(window) = app.get_webview_window("main")
             {
