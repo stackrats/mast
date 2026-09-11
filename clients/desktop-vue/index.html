@@ -31,6 +31,9 @@
         align-items: center;
         justify-content: center;
         gap: 14px;
+        /* Never flush to the frame, however narrow the window gets. */
+        padding: 0 24px;
+        box-sizing: border-box;
       }
       /* The lockup sets the type size; the mark is sized in `em` from it, so
          both halves scale together at the breakpoints below. */
@@ -43,7 +46,11 @@
         font-family:
           "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", ui-monospace, SFMono-Regular, Menlo,
           Consolas, monospace;
-        font-size: 13px;
+        /* Scales with the window instead of stepping at breakpoints: a tiling
+           manager hands out widths that no set of breakpoints anticipates, and
+           the lockup is 25 characters wide, so a fixed size either overflows a
+           narrow window or floats in a wide one. */
+        font-size: clamp(7px, 2.2vw, 15px);
         color: #334155;
       }
       /* The mark is vectors, not glyphs. Drawn from block characters it only
@@ -57,40 +64,32 @@
         fill: currentColor;
         flex: none;
       }
-      /* The wordmark stays block glyphs, on a monospace family with tight,
-         uniform line boxes or the rows shear. */
-      #splash pre {
-        margin: 0;
-        font: inherit;
-        line-height: 1.05;
-        letter-spacing: 0;
-        white-space: pre;
-      }
+      /* Both halves are vectors now. The wordmark was block glyphs at a
+         monospace family, which sheared whenever the font's cell was not
+         exactly half as wide as it was tall — the same fault the menubar's
+         copy had, fixed there and left here. */
       html.dark #splash .lockup {
         color: #cbd5e1;
       }
       #splash p {
         margin: 0;
+        /* One line wherever one line fits. Only the window's width limits it,
+           so it wraps in a narrow tile and nowhere else — and when it does
+           wrap, `balance` splits it evenly and `text-align` keeps both halves
+           centred, rather than an orphan hard against the left edge. A
+           character cap here forced two lines into windows with room for one. */
+        max-width: 82vw;
+        text-align: center;
+        text-wrap: balance;
         font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-        font-size: 12px;
-        letter-spacing: 0.16em;
-        text-transform: uppercase;
+        font-size: clamp(11px, 1.7vw, 13px);
+        /* Sentence case, tracked lightly. The wide tracking and the uppercase
+           went together: caps need the air, mixed case reads as gappy with it. */
+        letter-spacing: 0.02em;
         color: #737373;
       }
       html.dark #splash p {
         color: #a3a3a3;
-      }
-      /* 54 columns wide, so it needs ~430px at 13px. Shrink rather than let
-         the rows wrap, which would destroy the shape. */
-      @media (max-width: 560px) {
-        #splash pre {
-          font-size: 9px;
-        }
-      }
-      @media (max-width: 380px) {
-        #splash pre {
-          font-size: 7px;
-        }
       }
     </style>
   </head>
@@ -130,15 +129,196 @@
               />
             </g>
           </svg>
-          <pre>
- ███╗   ███╗  █████╗  ███████╗ ████████╗
- ████╗ ████║ ██╔══██╗ ██╔════╝ ╚══██╔══╝
- ██╔████╔██║ ███████║ ███████╗    ██║
- ██║╚██╔╝██║ ██╔══██║ ╚════██║    ██║
- ██║ ╚═╝ ██║ ██║  ██║ ███████║    ██║
- ╚═╝     ╚═╝ ╚═╝  ╚═╝ ╚══════╝    ╚═╝</pre>
+          <svg
+            viewBox="0 0 1170 365"
+            fill="currentColor"
+            aria-hidden="true"
+            focusable="false"
+            preserveAspectRatio="xMidYMid meet"
+          >
+            <rect x="0" y="0" width="90" height="65" />
+            <rect x="210" y="0" width="90" height="65" />
+            <rect x="390" y="0" width="150" height="65" />
+            <rect x="630" y="0" width="210" height="65" />
+            <rect x="900" y="0" width="240" height="65" />
+            <rect x="90" y="25" width="23" height="5" />
+            <rect x="300" y="25" width="23" height="5" />
+            <rect x="540" y="25" width="23" height="5" />
+            <rect x="840" y="25" width="23" height="5" />
+            <rect x="1140" y="25" width="23" height="5" />
+            <rect x="108" y="25" width="5" height="40" />
+            <rect x="318" y="25" width="5" height="40" />
+            <rect x="558" y="25" width="5" height="40" />
+            <rect x="858" y="25" width="5" height="40" />
+            <rect x="1158" y="25" width="5" height="40" />
+            <rect x="90" y="35" width="13" height="5" />
+            <rect x="300" y="35" width="13" height="5" />
+            <rect x="540" y="35" width="13" height="5" />
+            <rect x="840" y="35" width="13" height="5" />
+            <rect x="1140" y="35" width="13" height="5" />
+            <rect x="98" y="35" width="5" height="30" />
+            <rect x="308" y="35" width="5" height="30" />
+            <rect x="548" y="35" width="5" height="30" />
+            <rect x="848" y="35" width="5" height="30" />
+            <rect x="1148" y="35" width="5" height="30" />
+            <rect x="848" y="65" width="5" height="30" />
+            <rect x="918" y="65" width="5" height="30" />
+            <rect x="1148" y="65" width="5" height="30" />
+            <rect x="858" y="65" width="5" height="40" />
+            <rect x="908" y="65" width="5" height="40" />
+            <rect x="1158" y="65" width="5" height="40" />
+            <rect x="0" y="65" width="120" height="65" />
+            <rect x="180" y="65" width="120" height="65" />
+            <rect x="308" y="65" width="5" height="65" />
+            <rect x="318" y="65" width="5" height="65" />
+            <rect x="360" y="65" width="60" height="65" />
+            <rect x="510" y="65" width="60" height="65" />
+            <rect x="630" y="65" width="60" height="65" />
+            <rect x="990" y="65" width="60" height="65" />
+            <rect x="120" y="90" width="23" height="5" />
+            <rect x="428" y="90" width="82" height="5" />
+            <rect x="570" y="90" width="23" height="5" />
+            <rect x="698" y="90" width="155" height="5" />
+            <rect x="918" y="90" width="72" height="5" />
+            <rect x="1058" y="90" width="95" height="5" />
+            <rect x="138" y="90" width="5" height="40" />
+            <rect x="428" y="90" width="5" height="40" />
+            <rect x="588" y="90" width="5" height="40" />
+            <rect x="698" y="90" width="5" height="40" />
+            <rect x="1058" y="90" width="5" height="40" />
+            <rect x="120" y="100" width="13" height="5" />
+            <rect x="438" y="100" width="72" height="5" />
+            <rect x="570" y="100" width="13" height="5" />
+            <rect x="708" y="100" width="155" height="5" />
+            <rect x="908" y="100" width="82" height="5" />
+            <rect x="1068" y="100" width="95" height="5" />
+            <rect x="128" y="100" width="5" height="30" />
+            <rect x="438" y="100" width="5" height="30" />
+            <rect x="578" y="100" width="5" height="30" />
+            <rect x="708" y="100" width="5" height="30" />
+            <rect x="1068" y="100" width="5" height="30" />
+            <rect x="0" y="130" width="60" height="65" />
+            <rect x="90" y="130" width="120" height="65" />
+            <rect x="240" y="130" width="60" height="65" />
+            <rect x="308" y="130" width="5" height="65" />
+            <rect x="318" y="130" width="5" height="65" />
+            <rect x="360" y="130" width="210" height="65" />
+            <rect x="578" y="130" width="5" height="65" />
+            <rect x="588" y="130" width="5" height="65" />
+            <rect x="630" y="130" width="210" height="65" />
+            <rect x="990" y="130" width="60" height="65" />
+            <rect x="1058" y="130" width="5" height="65" />
+            <rect x="1068" y="130" width="5" height="65" />
+            <rect x="68" y="155" width="22" height="5" />
+            <rect x="218" y="155" width="22" height="5" />
+            <rect x="840" y="155" width="23" height="5" />
+            <rect x="68" y="155" width="5" height="40" />
+            <rect x="218" y="155" width="5" height="40" />
+            <rect x="858" y="155" width="5" height="40" />
+            <rect x="78" y="165" width="12" height="5" />
+            <rect x="228" y="165" width="12" height="5" />
+            <rect x="840" y="165" width="13" height="5" />
+            <rect x="78" y="165" width="5" height="30" />
+            <rect x="228" y="165" width="5" height="30" />
+            <rect x="848" y="165" width="5" height="30" />
+            <rect x="108" y="195" width="5" height="30" />
+            <rect x="218" y="195" width="5" height="30" />
+            <rect x="648" y="195" width="5" height="30" />
+            <rect x="98" y="195" width="5" height="40" />
+            <rect x="228" y="195" width="5" height="40" />
+            <rect x="638" y="195" width="5" height="40" />
+            <rect x="0" y="195" width="60" height="65" />
+            <rect x="68" y="195" width="5" height="65" />
+            <rect x="78" y="195" width="5" height="65" />
+            <rect x="120" y="195" width="60" height="65" />
+            <rect x="240" y="195" width="60" height="65" />
+            <rect x="308" y="195" width="5" height="65" />
+            <rect x="318" y="195" width="5" height="65" />
+            <rect x="360" y="195" width="60" height="65" />
+            <rect x="510" y="195" width="60" height="65" />
+            <rect x="578" y="195" width="5" height="65" />
+            <rect x="588" y="195" width="5" height="65" />
+            <rect x="780" y="195" width="60" height="65" />
+            <rect x="848" y="195" width="5" height="65" />
+            <rect x="858" y="195" width="5" height="65" />
+            <rect x="990" y="195" width="60" height="65" />
+            <rect x="1058" y="195" width="5" height="65" />
+            <rect x="1068" y="195" width="5" height="65" />
+            <rect x="108" y="220" width="12" height="5" />
+            <rect x="188" y="220" width="35" height="5" />
+            <rect x="428" y="220" width="82" height="5" />
+            <rect x="648" y="220" width="132" height="5" />
+            <rect x="188" y="220" width="5" height="40" />
+            <rect x="428" y="220" width="5" height="40" />
+            <rect x="98" y="230" width="22" height="5" />
+            <rect x="198" y="230" width="35" height="5" />
+            <rect x="438" y="230" width="72" height="5" />
+            <rect x="638" y="230" width="142" height="5" />
+            <rect x="198" y="230" width="5" height="30" />
+            <rect x="438" y="230" width="5" height="30" />
+            <rect x="138" y="260" width="5" height="30" />
+            <rect x="188" y="260" width="5" height="30" />
+            <rect x="128" y="260" width="5" height="40" />
+            <rect x="198" y="260" width="5" height="40" />
+            <rect x="0" y="260" width="60" height="65" />
+            <rect x="68" y="260" width="5" height="65" />
+            <rect x="78" y="260" width="5" height="65" />
+            <rect x="240" y="260" width="60" height="65" />
+            <rect x="308" y="260" width="5" height="65" />
+            <rect x="318" y="260" width="5" height="65" />
+            <rect x="360" y="260" width="60" height="65" />
+            <rect x="428" y="260" width="5" height="65" />
+            <rect x="438" y="260" width="5" height="65" />
+            <rect x="510" y="260" width="60" height="65" />
+            <rect x="578" y="260" width="5" height="65" />
+            <rect x="588" y="260" width="5" height="65" />
+            <rect x="630" y="260" width="210" height="65" />
+            <rect x="848" y="260" width="5" height="65" />
+            <rect x="858" y="260" width="5" height="65" />
+            <rect x="990" y="260" width="60" height="65" />
+            <rect x="1058" y="260" width="5" height="65" />
+            <rect x="1068" y="260" width="5" height="65" />
+            <rect x="138" y="285" width="55" height="5" />
+            <rect x="128" y="295" width="75" height="5" />
+            <rect x="18" y="325" width="5" height="30" />
+            <rect x="68" y="325" width="5" height="30" />
+            <rect x="258" y="325" width="5" height="30" />
+            <rect x="308" y="325" width="5" height="30" />
+            <rect x="378" y="325" width="5" height="30" />
+            <rect x="428" y="325" width="5" height="30" />
+            <rect x="528" y="325" width="5" height="30" />
+            <rect x="578" y="325" width="5" height="30" />
+            <rect x="648" y="325" width="5" height="30" />
+            <rect x="848" y="325" width="5" height="30" />
+            <rect x="1008" y="325" width="5" height="30" />
+            <rect x="1058" y="325" width="5" height="30" />
+            <rect x="8" y="325" width="5" height="40" />
+            <rect x="78" y="325" width="5" height="40" />
+            <rect x="248" y="325" width="5" height="40" />
+            <rect x="318" y="325" width="5" height="40" />
+            <rect x="368" y="325" width="5" height="40" />
+            <rect x="438" y="325" width="5" height="40" />
+            <rect x="518" y="325" width="5" height="40" />
+            <rect x="588" y="325" width="5" height="40" />
+            <rect x="638" y="325" width="5" height="40" />
+            <rect x="858" y="325" width="5" height="40" />
+            <rect x="998" y="325" width="5" height="40" />
+            <rect x="1068" y="325" width="5" height="40" />
+            <rect x="18" y="350" width="55" height="5" />
+            <rect x="258" y="350" width="55" height="5" />
+            <rect x="378" y="350" width="55" height="5" />
+            <rect x="528" y="350" width="55" height="5" />
+            <rect x="648" y="350" width="205" height="5" />
+            <rect x="1008" y="350" width="55" height="5" />
+            <rect x="8" y="360" width="75" height="5" />
+            <rect x="248" y="360" width="75" height="5" />
+            <rect x="368" y="360" width="75" height="5" />
+            <rect x="518" y="360" width="75" height="5" />
+            <rect x="638" y="360" width="225" height="5" />
+            <rect x="998" y="360" width="75" height="5" />
+          </svg>
         </div>
-        <p>control tower for local Laravel Sail</p>
+        <p>Control tower for local Laravel Sail</p>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

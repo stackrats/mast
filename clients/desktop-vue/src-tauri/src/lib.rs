@@ -25,6 +25,9 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_specta::Event;
 
+#[cfg(target_os = "linux")]
+pub mod linux_env;
+mod session;
 mod tray;
 
 pub struct AppState {
@@ -66,6 +69,28 @@ struct DeepLinks(Mutex<Vec<String>>);
 
 /// Drain the links the app was launched with. Called once at startup, after
 /// the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+/// What the app can tell about the session it was launched into. Read once at
+/// startup by the frontend, to pick a default UI scale.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct SessionInfo {
+    /// The desktop identifier the session advertises, verbatim, or null when
+    /// it advertises none. Shown in Settings so a wrong guess is at least a
+    /// legible wrong guess.
+    pub desktop: Option<String>,
+    /// Whether that identifier names a window manager that tiles by default.
+    pub tiling: bool,
+}
+
+#[tauri::command]
+#[specta::specta]
+fn session_info() -> SessionInfo {
+    let desktop = session::desktop_name();
+    SessionInfo {
+        tiling: desktop.as_deref().is_some_and(session::is_tiling),
+        desktop,
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 fn take_deep_links(state: State<'_, DeepLinks>) -> Vec<String> {
@@ -416,6 +441,7 @@ async fn stop_log_stream(state: State<'_, AppState>, handle: u32) -> Result<(), 
 fn specta_builder() -> tauri_specta::Builder {
     tauri_specta::Builder::<tauri::Wry>::new()
         .commands(tauri_specta::collect_commands![
+            session_info,
             snapshot,
             start_patch_stream,
             dispatch_action,
@@ -536,10 +562,32 @@ pub fn run() {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // A resize the webview did not follow — see linux_env for the
+            // Hyprland float toggle that produces one. Deferred to idle so it
+            // runs after GTK has finished its own pass for this configure,
+            // rather than inside it.
+            #[cfg(target_os = "linux")]
+            if let tauri::WindowEvent::Resized(_) = event
+                && let Some(webview_window) = window.get_webview_window("main")
+            {
+                let handle = webview_window.clone();
+                let _ = webview_window.run_on_main_thread(move || {
+                    linux_env::reallocate_webview(&handle);
+                });
+            }
         })
         .setup(move |app| {
             if let Err(e) = tray::setup_tray(app) {
                 tracing::warn!("tray unavailable: {e}");
+            }
+            // No titlebar on a tiling desktop — see linux_env::wants_no_titlebar
+            // for why this is a per-window decision rather than an environment
+            // variable, and why it is gated.
+            #[cfg(target_os = "linux")]
+            if linux_env::wants_no_titlebar(session::desktop_name().as_deref())
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.set_decorations(false);
             }
             if std::env::args().any(|arg| arg == "--minimized")
                 && let Some(window) = app.get_webview_window("main")

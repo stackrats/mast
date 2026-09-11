@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use mast_contract::{DiscoveredProject, DockerStatus, PatchEvent, ServiceState};
+use mast_contract::{DiscoveredProject, DockerStatus, DockerUnavailable, PatchEvent, ServiceState};
 use mast_docker::{
     BollardAdapter, CommandError, ContainerObservation, DockerError, RuntimeAdapter,
     resolve_endpoint,
@@ -26,13 +26,15 @@ pub struct RealConnector;
 impl RuntimeConnector for RealConnector {
     async fn connect(&self) -> Result<(Arc<dyn RuntimeAdapter>, DockerStatus), DockerError> {
         let endpoint = resolve_endpoint().await?;
-        let adapter = BollardAdapter::connect(&endpoint)?;
-        adapter.ping().await?;
+        let adapter =
+            BollardAdapter::connect(&endpoint).map_err(|e| at_endpoint(e, &endpoint.host))?;
+        adapter.ping().await.map_err(|e| at_endpoint(e, &endpoint.host))?;
         let status = DockerStatus {
             available: true,
             context_name: Some(endpoint.context_name.clone()),
             endpoint: Some(endpoint.host.clone()),
             error: None,
+            reason: None,
         };
         Ok((Arc::new(adapter), status))
     }
@@ -72,11 +74,30 @@ async fn docker_loop(engine: Engine) {
                 }
                 // Stream ended: connection lost.
                 *engine.inner.adapter.lock().unwrap() = None;
-                engine.update_docker_status_unavailable("docker connection lost");
+                // The daemon answered once and then stopped. Whatever it is
+                // now, it is not "never installed".
+                let last_endpoint = engine.inner.state.lock().unwrap().docker.endpoint.clone();
+                engine.update_docker_status_unavailable(
+                    "docker connection lost",
+                    DockerUnavailable::NotRunning,
+                    last_endpoint,
+                );
             }
             Err(e) => {
                 *engine.inner.adapter.lock().unwrap() = None;
-                engine.update_docker_status_unavailable(&connect_error_text(&e));
+                // Name the endpoint even though we could not reach it.
+                // Diagnostics reports "could not reach the daemon at X", and
+                // "(unknown endpoint)" is the least useful thing it can say
+                // about a socket whose path we know perfectly well. Costs one
+                // CLI call per failed attempt, on a loop already sleeping
+                // between them; when the CLI itself is missing this resolves
+                // to None, which is the honest answer.
+                let endpoint = resolve_endpoint().await.ok().map(|ep| ep.host);
+                engine.update_docker_status_unavailable(
+                    &connect_error_text(&e),
+                    classify_unavailable(&e, endpoint.as_deref()),
+                    endpoint,
+                );
             }
         }
         tokio::time::sleep(backoff).await;
@@ -98,6 +119,121 @@ fn connect_error_text(e: &DockerError) -> String {
         }
         _ => e.to_string(),
     }
+}
+
+/// Attach the endpoint to a connection failure.
+///
+/// bollard reports what went wrong with the transport and never where. "Where"
+/// is the difference between a local daemon that is not running and a remote
+/// host that will not answer — the same failure, and opposite advice.
+fn at_endpoint(e: DockerError, host: &str) -> DockerError {
+    match e {
+        // Rewrap the payload, not the rendered error: `DockerError::Api`'s
+        // Display already prefixes "docker API error:", so wrapping the whole
+        // string printed it twice.
+        DockerError::Api(message) => DockerError::Api(format!("{message} (endpoint: {host})")),
+        other => DockerError::Api(format!("{other} (endpoint: {host})")),
+    }
+}
+
+/// Which of the four repairs the user is actually facing.
+///
+/// Only the missing-CLI case is structural; the rest have to be read out of the
+/// message, because bollard and hyper wrap the operating system's errno by the
+/// time it reaches us and the variant that survives says only "Connect". The
+/// substrings matched here are the ones the platforms actually emit — a socket
+/// that is not there, a connection nobody is listening for, a socket this user
+/// may not open.
+///
+/// Unknown text classifies as `Unreachable`, which is the honest answer: it is
+/// the bucket whose advice is "here is what went wrong, we cannot narrow it
+/// further", and clients show the raw error alongside it.
+fn classify_unavailable(e: &DockerError, endpoint: Option<&str>) -> DockerUnavailable {
+    if let DockerError::Command(CommandError::Spawn { source, .. }) = e {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return DockerUnavailable::NotInstalled;
+        }
+        if source.kind() == std::io::ErrorKind::PermissionDenied {
+            return DockerUnavailable::PermissionDenied;
+        }
+    }
+    let text = e.to_string().to_ascii_lowercase();
+    // Order matters: a permission failure on a socket path also mentions the
+    // path, so the narrower diagnosis has to be tested first.
+    if text.contains("permission denied") || text.contains("access is denied") {
+        return DockerUnavailable::PermissionDenied;
+    }
+    // `client error (connect)` is the one that matters and the one this first
+    // shipped without. hyper reports a refused connection with exactly that and
+    // nothing else — no errno, no path — so the earlier list, written against a
+    // plausible-looking string rather than an observed one, matched none of it
+    // and every stopped daemon on Linux was reported as "unreachable".
+    let refused = text.contains("client error (connect)")
+        || text.contains("error trying to connect")
+        || text.contains("no such file or directory")
+        || text.contains("connection refused")
+        || text.contains("cannot connect to the docker daemon")
+        || text.contains("is the docker daemon running")
+        || text.contains("the system cannot find the file specified");
+    if !refused {
+        return DockerUnavailable::Unreachable;
+    }
+    // The message has told us all it can. hyper reports a socket that is not
+    // there and a socket we may not open with the same six words — "client
+    // error (Connect)" — and no errno survives to distinguish them. Reading it
+    // harder cannot work, so ask the socket instead.
+    if let Some(path) = unix_socket_path(endpoint) {
+        return probe_unix_socket(std::path::Path::new(path));
+    }
+    // A refused remote endpoint is a network problem, and "start Docker" is
+    // useless advice for a host on the other end of a cable. Absent any
+    // endpoint at all we assume local, which is what almost every install is.
+    let remote = text.contains("tcp://")
+        || text.contains("ssh://")
+        || text.contains("http://")
+        || text.contains("https://");
+    if remote {
+        DockerUnavailable::Unreachable
+    } else {
+        DockerUnavailable::NotRunning
+    }
+}
+
+/// The filesystem path of a `unix://` endpoint, if that is what this is.
+fn unix_socket_path(endpoint: Option<&str>) -> Option<&str> {
+    endpoint?.strip_prefix("unix://").filter(|path| !path.is_empty())
+}
+
+/// Ask the socket directly what is wrong with it.
+///
+/// This is the authoritative answer where the error text is not: opening the
+/// socket returns a real errno, and the three that matter are distinct.
+/// Connecting succeeds when the daemon is there and it was the API call above
+/// that failed — a different problem again, and not one to advise "start
+/// Docker" for.
+///
+/// Cheap, and only on the failure path: a local socket connect that is
+/// immediately dropped, once per retry on a loop already sleeping between
+/// attempts.
+#[cfg(unix)]
+fn probe_unix_socket(path: &std::path::Path) -> DockerUnavailable {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixStream;
+    match UnixStream::connect(path) {
+        Ok(_) => DockerUnavailable::Unreachable,
+        Err(e) => match e.kind() {
+            ErrorKind::PermissionDenied => DockerUnavailable::PermissionDenied,
+            // Absent, or present with nobody listening — a stale socket file
+            // outlives the daemon that made it, and both mean "not running".
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused => DockerUnavailable::NotRunning,
+            _ => DockerUnavailable::Unreachable,
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn probe_unix_socket(_path: &std::path::Path) -> DockerUnavailable {
+    DockerUnavailable::NotRunning
 }
 
 /// Watch watched-directories and imported project roots (non-recursive) for
@@ -182,11 +318,22 @@ impl Engine {
         });
     }
 
-    pub(crate) fn update_docker_status_unavailable(&self, error: &str) {
+    pub(crate) fn update_docker_status_unavailable(
+        &self,
+        error: &str,
+        reason: DockerUnavailable,
+        endpoint: Option<String>,
+    ) {
         self.with_state(|st, events| {
-            if st.docker.available || st.docker.error.as_deref() != Some(error) {
+            if st.docker.available
+                || st.docker.error.as_deref() != Some(error)
+                || st.docker.reason != Some(reason)
+                || st.docker.endpoint != endpoint
+            {
                 st.docker.available = false;
                 st.docker.error = Some(error.to_string());
+                st.docker.reason = Some(reason);
+                st.docker.endpoint = endpoint;
                 events.push(PatchEvent::DockerStatusChanged { status: st.docker.clone() });
             }
         });
@@ -944,5 +1091,257 @@ mod tests {
         // Every other failure keeps its own words.
         let api = DockerError::Api("boom".into());
         assert_eq!(connect_error_text(&api), api.to_string());
+    }
+}
+
+#[cfg(test)]
+mod docker_classification_tests {
+    use super::*;
+
+    fn api(message: &str) -> DockerError {
+        DockerError::Api(message.to_string())
+    }
+
+    fn spawn(kind: std::io::ErrorKind) -> DockerError {
+        DockerError::Command(CommandError::Spawn {
+            argv0: "docker".into(),
+            source: std::io::Error::new(kind, "test"),
+        })
+    }
+
+    // The state of every machine that has never had Docker, and the one the
+    // retry loop can genuinely fix by itself once the user installs it.
+    #[test]
+    fn a_missing_cli_is_not_installed() {
+        assert_eq!(
+            classify_unavailable(&spawn(std::io::ErrorKind::NotFound), None),
+            DockerUnavailable::NotInstalled
+        );
+    }
+
+    // Verbatim from an Omarchy guest with dockerd stopped. Note what is NOT
+    // here: no errno, no socket path, no "is the daemon running". hyper reports
+    // a refused connection as "client error (Connect)" and stops.
+    //
+    // The first version of this test invented a "No such file or directory (os
+    // error 2)" suffix that reads plausibly and does not occur, so the
+    // classifier matched none of the real string and every stopped daemon was
+    // reported to the user as "Docker isn't reachable". A test written from a
+    // guess at the data cannot fail on the data being wrong.
+    const REAL_STOPPED_DAEMON: &str =
+        "docker API error: Error in the hyper legacy client: client error (Connect) \
+         (endpoint: unix:///var/run/docker.sock)";
+
+    #[test]
+    fn the_error_a_stopped_daemon_actually_produces_is_not_running() {
+        assert_eq!(
+            classify_unavailable(&api(REAL_STOPPED_DAEMON), None),
+            DockerUnavailable::NotRunning
+        );
+    }
+
+    #[test]
+    fn a_dead_socket_is_not_running() {
+        for message in [
+            "error trying to connect: Connection refused (os error 111) \
+             (endpoint: unix:///var/run/docker.sock)",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+             Is the docker daemon running?",
+            "The system cannot find the file specified. (os error 2) \
+             (endpoint: npipe:////./pipe/docker_engine)",
+        ] {
+            assert_eq!(
+                classify_unavailable(&api(message), None),
+                DockerUnavailable::NotRunning,
+                "{message}"
+            );
+        }
+    }
+
+    // The same transport failure against a remote host is not a stopped local
+    // daemon, and "start the Docker service" would send the reader to the wrong
+    // machine entirely.
+    #[test]
+    fn the_same_failure_against_a_remote_endpoint_is_unreachable() {
+        for endpoint in ["tcp://10.0.0.4:2375", "ssh://user@buildbox", "https://docker.example"] {
+            let message = format!(
+                "docker API error: Error in the hyper legacy client: client error (Connect) \
+                 (endpoint: {endpoint})"
+            );
+            assert_eq!(
+                classify_unavailable(&api(&message), None),
+                DockerUnavailable::Unreachable,
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_socket_is_a_permission_problem() {
+        for message in [
+            "error trying to connect: Permission denied (os error 13) \
+             (endpoint: unix:///var/run/docker.sock)",
+            "Got permission denied while trying to connect to the Docker daemon socket",
+            "Access is denied. (os error 5)",
+        ] {
+            assert_eq!(
+                classify_unavailable(&api(message), None),
+                DockerUnavailable::PermissionDenied,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            classify_unavailable(&spawn(std::io::ErrorKind::PermissionDenied), None),
+            DockerUnavailable::PermissionDenied
+        );
+    }
+
+    // A permission failure names the socket path too, so it also matches the
+    // not-running substrings. The narrower diagnosis has to win, or every
+    // group-membership problem is reported as a stopped daemon and the advice
+    // sends the user to restart a service that is already running.
+    #[test]
+    fn permission_wins_over_the_path_it_mentions() {
+        let both = api(
+            "error trying to connect to unix:///var/run/docker.sock: \
+             Permission denied (os error 13)",
+        );
+        assert_eq!(classify_unavailable(&both, None), DockerUnavailable::PermissionDenied);
+    }
+
+    // Not a catch-all for "we did not think about it": Unreachable's advice is
+    // "here is the raw error", which is the right answer when we cannot narrow
+    // it and the wrong one whenever we can.
+    #[test]
+    fn anything_unrecognised_is_unreachable() {
+        assert_eq!(
+            classify_unavailable(&api("certificate verify failed"), None),
+            DockerUnavailable::Unreachable
+        );
+        assert_eq!(classify_unavailable(&api(""), None), DockerUnavailable::Unreachable);
+        assert_eq!(
+            classify_unavailable(&DockerError::UnsupportedEndpoint("ssh://box".into()), None),
+            DockerUnavailable::Unreachable
+        );
+    }
+
+    // The reason this exists at all: hyper reports a socket that is not there
+    // and a socket we may not open with the same six words, so no amount of
+    // reading the message can separate them. These drive real sockets — and
+    // so, like the probe they exercise, exist only where unix sockets do.
+    #[cfg(unix)]
+    mod socket_probe {
+        use super::*;
+        use std::os::unix::net::UnixListener;
+
+        fn tempdir() -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "mast-socket-probe-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_socket_that_is_not_there_is_not_running() {
+            let dir = tempdir();
+            let missing = dir.join("docker.sock");
+            assert_eq!(probe_unix_socket(&missing), DockerUnavailable::NotRunning);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // The state that had Mast telling a user with a healthy daemon to
+        // start it: dockerd running, socket present, this process not in the
+        // group. Skipped as root, which bypasses the permission bits and would
+        // make the assertion meaningless rather than failing honestly.
+        #[test]
+        fn a_socket_we_may_not_open_is_a_permission_problem() {
+            if unsafe { libc_geteuid() } == 0 {
+                eprintln!("skipped: running as root, which ignores the mode bits");
+                return;
+            }
+            let dir = tempdir();
+            let path = dir.join("docker.sock");
+            let _listener = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            assert_eq!(probe_unix_socket(&path), DockerUnavailable::PermissionDenied);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // A socket that answers means the transport is fine and something
+        // above it failed — not a stopped daemon, and not advice to start one.
+        #[test]
+        fn a_socket_that_answers_is_neither() {
+            let dir = tempdir();
+            let path = dir.join("docker.sock");
+            let _listener = UnixListener::bind(&path).unwrap();
+            assert_eq!(probe_unix_socket(&path), DockerUnavailable::Unreachable);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // A stale socket file outlives the daemon that created it, so "the
+        // file exists" is not evidence that anything is listening.
+        #[test]
+        fn a_stale_socket_file_is_not_running() {
+            let dir = tempdir();
+            let path = dir.join("docker.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            drop(listener);
+            assert_eq!(probe_unix_socket(&path), DockerUnavailable::NotRunning);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn only_unix_endpoints_are_probed() {
+            assert_eq!(unix_socket_path(Some("unix:///var/run/docker.sock")), Some("/var/run/docker.sock"));
+            assert_eq!(unix_socket_path(Some("tcp://10.0.0.4:2375")), None);
+            assert_eq!(unix_socket_path(Some("unix://")), None);
+            assert_eq!(unix_socket_path(None), None);
+        }
+
+        // End to end through the classifier: the generic hyper message plus a
+        // real refused socket must come out as a permission problem, which is
+        // the case that shipped wrong.
+        #[test]
+        fn the_generic_message_over_a_refused_socket_is_permission_denied() {
+            if unsafe { libc_geteuid() } == 0 {
+                eprintln!("skipped: running as root");
+                return;
+            }
+            let dir = tempdir();
+            let path = dir.join("docker.sock");
+            let _listener = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            let endpoint = format!("unix://{}", path.display());
+            assert_eq!(
+                classify_unavailable(&api(REAL_STOPPED_DAEMON), Some(&endpoint)),
+                DockerUnavailable::PermissionDenied
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        unsafe extern "C" {
+            #[link_name = "geteuid"]
+            fn libc_geteuid() -> u32;
+        }
+    }
+
+    #[test]
+    fn classification_ignores_case() {
+        assert_eq!(
+            classify_unavailable(&api("PERMISSION DENIED"), None),
+            DockerUnavailable::PermissionDenied
+        );
+        assert_eq!(
+            classify_unavailable(&api("Connection Refused"), None),
+            DockerUnavailable::NotRunning
+        );
     }
 }

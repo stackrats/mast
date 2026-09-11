@@ -93,3 +93,17 @@ jobs:
         with:
           node-version: 24
       - run: bash scripts/verify-vanilla-fallback.sh
+
+  # linuxdeploy bundles the build machine's libwayland-* into the AppImage,
+  # which collides with the host's Mesa anywhere the two disagree — the app
+  # aborts with EGL_BAD_PARAMETER before drawing a window. Confirmed on Arch
+  # (Omarchy/Hyprland); release.yml strips those four files after bundling.
+  # This pins the list: too narrow and Arch breaks again, too wide and we
+  # start deleting libraries that were tested and found innocent.
+  # Synthetic AppDirs — no network, no appimagetool, runs in a second.
+  packaging:
+    name: Packaging — AppImage library exclusion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test-fix-appimage-wayland.sh

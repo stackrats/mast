@@ -11,7 +11,7 @@ defineProps<{ title: string; wide?: boolean }>();
     <DialogPortal>
       <DialogOverlay class="fixed inset-0 z-40 bg-slate-950/40 backdrop-blur-[2px]" />
       <DialogContent
-        class="fixed top-1/2 left-1/2 z-50 max-h-[85vh] w-full -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-2xl focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        class="fixed top-1/2 left-1/2 z-50 max-h-[85vh] w-[calc(100%-1.5rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-2xl focus:outline-none sm:p-5 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
         :class="wide ? 'max-w-2xl' : 'max-w-md'"
       >
         <div class="mb-3 flex items-center justify-between">

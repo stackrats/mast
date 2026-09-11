@@ -6,6 +6,9 @@
 
 
 export const commands = {
+async sessionInfo() : Promise<SessionInfo> {
+    return await TAURI_INVOKE("session_info");
+},
 async snapshot() : Promise<Result<EngineSnapshot, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("snapshot") };
@@ -234,10 +237,6 @@ async volumeSnapshots(project: ProjectId) : Promise<Result<VolumeSnapshot[], str
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Drain the links the app was launched with. Called once at startup, after
- * the frontend has subscribed to [`DeepLinkEvent`] for everything later.
- */
 async takeDeepLinks() : Promise<string[]> {
     return await TAURI_INVOKE("take_deep_links");
 },
@@ -689,7 +688,47 @@ export type DiagnosticsHistory = { runs: DiagnosticRunSummary[]; repairs: Repair
  * A candidate found under a watched directory, not yet imported.
  */
 export type DiscoveredProject = { path: string; name: string; isSail: boolean }
-export type DockerStatus = { available: boolean; contextName: string | null; endpoint: string | null; error: string | null }
+export type DockerStatus = { available: boolean; contextName: string | null; endpoint: string | null; 
+/**
+ * The underlying error, verbatim. Kept for diagnostics — clients show
+ * `reason` and keep this behind a disclosure.
+ */
+error: string | null; 
+/**
+ * What kind of failure `error` describes. `None` while docker is
+ * available.
+ */
+reason: DockerUnavailable | null }
+/**
+ * Why docker could not be reached, in the terms a person can act on.
+ * 
+ * Four separate repairs hide behind one raw connection error: install it,
+ * start it, be allowed to talk to it, or fix the network between you and it.
+ * The error string names none of them — "Error in the hyper legacy client:
+ * client error (Connect)" is true and useless — so the classification is made
+ * once here rather than guessed at by every client that renders it.
+ */
+export type DockerUnavailable = 
+/**
+ * No docker CLI on PATH. The usual state of a machine that has never had
+ * Docker, and the first thing a newcomer hits.
+ */
+"notInstalled" | 
+/**
+ * Docker is installed but its daemon is not answering — not started, or
+ * stopped since.
+ */
+"notRunning" | 
+/**
+ * The endpoint is there and refused this user. On Linux that is almost
+ * always group membership.
+ */
+"permissionDenied" | 
+/**
+ * Everything else: a remote endpoint that will not answer, TLS trouble, a
+ * context pointing somewhere that no longer exists.
+ */
+"unreachable"
 /**
  * One minimal typed state change. `seq` values are contiguous per engine;
  * a gap observed by a client means it must resynchronize via snapshot.
@@ -1209,6 +1248,23 @@ memoryBytes: number; memoryLimitBytes: number;
  * machine" and "a third of the way to being OOM-killed".
  */
 memoryLimited: boolean }
+/**
+ * Drain the links the app was launched with. Called once at startup, after
+ * the frontend has subscribed to [`DeepLinkEvent`] for everything later.
+ * What the app can tell about the session it was launched into. Read once at
+ * startup by the frontend, to pick a default UI scale.
+ */
+export type SessionInfo = { 
+/**
+ * The desktop identifier the session advertises, verbatim, or null when
+ * it advertises none. Shown in Settings so a wrong guess is at least a
+ * legible wrong guess.
+ */
+desktop: string | null; 
+/**
+ * Whether that identifier names a window manager that tiles by default.
+ */
+tiling: boolean }
 export type SnapshotDelta = { projectName: string; changes: string[] }
 export type SnapshotFileHash = { path: string; sha256: string }
 export type SnapshotMemberState = { project: ProjectId; projectName: string; gitBranch: string | null; gitCommit: string | null; gitDirty: boolean | null; 
