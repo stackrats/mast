@@ -25,6 +25,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_specta::Event;
 
+#[cfg(target_os = "linux")]
+pub mod linux_env;
 mod session;
 mod tray;
 
