@@ -82,9 +82,10 @@
         text-align: center;
         text-wrap: balance;
         font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-        font-size: clamp(9px, 1.6vw, 12px);
-        letter-spacing: 0.16em;
-        text-transform: uppercase;
+        font-size: clamp(11px, 1.7vw, 13px);
+        /* Sentence case, tracked lightly. The wide tracking and the uppercase
+           went together: caps need the air, mixed case reads as gappy with it. */
+        letter-spacing: 0.02em;
         color: #737373;
       }
       html.dark #splash p {
@@ -317,7 +318,7 @@
             <rect x="998" y="360" width="75" height="5" />
           </svg>
         </div>
-        <p>control tower for local Laravel Sail</p>
+        <p>Control tower for local Laravel Sail</p>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
