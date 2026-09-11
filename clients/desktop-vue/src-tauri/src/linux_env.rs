@@ -11,6 +11,7 @@ use std::path::Path;
 /// Names GTK and WebKit read at init, and the value each is given.
 pub const OVERLAY_SCROLLING: (&str, &str) = ("GTK_OVERLAY_SCROLLING", "0");
 pub const DMABUF_RENDERER: (&str, &str) = ("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+pub const CLIENT_SIDE_DECORATIONS: (&str, &str) = ("GTK_CSD", "0");
 
 /// Set what this session needs. Called once, first thing.
 pub fn prepare() {
@@ -21,6 +22,19 @@ pub fn prepare() {
     // layout element that arrived from somewhere else. This is a look the app
     // chose, not a workaround, so it applies everywhere.
     set_default(OVERLAY_SCROLLING);
+
+    // Native Wayland GTK draws its own titlebar — the "Mast" bar with
+    // minimise, maximise and close — because the compositor does not. On a
+    // desktop that floats windows that bar is how the window is moved and
+    // closed, and it stays. On one that tiles it is a strip of dead space the
+    // window manager already covers with its own keybindings, and every
+    // tiling user turns it off. GTK_CSD=0 asks the compositor to decorate
+    // instead, which the tiling ones answer with their usual thin border and
+    // nothing else. Only there: a compositor with no server-side decorations
+    // would leave the window with none at all.
+    if wants_server_decorations(crate::session::desktop_name().as_deref()) {
+        set_default(CLIENT_SIDE_DECORATIONS);
+    }
 
     // Toggling a window between tiled and floating on Hyprland, inside a VM,
     // left the webview black with the process alive and the status bar still
@@ -75,6 +89,13 @@ pub fn reallocate_webview(window: &tauri::WebviewWindow) {
     }
     use gtk::glib::Cast;
     walk(gtk_window.upcast_ref::<gtk::Widget>());
+}
+
+/// Whether to hand window decoration to the compositor. Exactly the tiling
+/// ones: they all support server-side decoration through xdg-decoration and
+/// all draw at most a border, and none of their users want a titlebar.
+pub fn wants_server_decorations(desktop: Option<&str>) -> bool {
+    desktop.is_some_and(crate::session::is_tiling)
 }
 
 /// Whether this process is running under a hypervisor, judged from the DMI
@@ -152,6 +173,18 @@ mod tests {
         ] {
             assert!(!dmi_names_hypervisor(name), "{name:?} must not read as a hypervisor");
         }
+    }
+
+    // The titlebar goes only where a compositor is known to draw its own
+    // border instead. A floating desktop that cannot decorate server-side
+    // would leave the window with no way to move or close it by pointer.
+    #[test]
+    fn hands_decoration_to_tiling_compositors_only() {
+        assert!(wants_server_decorations(Some("Hyprland")));
+        assert!(wants_server_decorations(Some("sway")));
+        assert!(!wants_server_decorations(Some("GNOME")));
+        assert!(!wants_server_decorations(Some("KDE")));
+        assert!(!wants_server_decorations(None));
     }
 
     #[test]
