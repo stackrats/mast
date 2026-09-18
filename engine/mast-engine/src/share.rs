@@ -47,6 +47,7 @@ impl Engine {
         }
 
         let (id, handle) = self.new_operation();
+        *handle.project.lock().unwrap() = Some(project.clone());
         let engine = self.clone();
         tokio::spawn(async move {
             engine.emit_op(&handle, id, OperationEventKind::Started);

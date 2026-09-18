@@ -41,7 +41,7 @@ watch(open, (isOpen) => {
     terminal.value = store.integrations.terminal ?? "";
     editor.value = store.integrations.editor ?? "";
     browser.value = store.integrations.browser ?? "";
-    autoPortRemap.value = store.integrations.autoPortRemap;
+    autoPortRemap.value = store.integrations.autoPortRemap ?? true;
     toolsSaved.value = false;
     clearTimeout(savedTimer);
     theme.value = loadTheme();
@@ -221,6 +221,10 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
 
       <section class="space-y-2">
         <h4 :class="headingClass">Watched directories</h4>
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          Removing a directory also removes its projects from Mast unless another watched directory
+          covers them. Project files stay on disk.
+        </p>
         <div class="flex gap-2">
           <Input v-model="newDirectory" placeholder="/home/you/code" @keyup.enter="addDirectory" />
           <Tooltip text="Choose a directory.">
@@ -250,6 +254,8 @@ const headingClass = "text-xs font-semibold text-slate-400 dark:text-slate-500";
               <Button
                 variant="ghost"
                 size="iconSm"
+                :aria-label="`Remove directory ${directory}`"
+                :disabled="store.readOnly || store.busy > 0"
                 @click="store.run({ type: 'removeWatchedDirectory', path: directory })"
               >
                 <X class="h-3.5 w-3.5" />

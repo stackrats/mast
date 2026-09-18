@@ -3,7 +3,7 @@
 //! generic streamed-subprocess runner feeds command output into that history.
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +17,12 @@ use crate::{Engine, Redactor};
 
 pub(crate) struct OpHandle {
     pub(crate) cancel: CancellationToken,
+    /// Project ownership survives dispatch so removing a project can stop its
+    /// managed commands before dropping it from the dashboard.
+    pub(crate) project: Mutex<Option<mast_contract::ProjectId>>,
+    /// Remote cleanup can fail after cancellation was requested. That is a
+    /// failure, not confirmation that the command has stopped.
+    pub(crate) cancel_failed: AtomicBool,
     /// Full history so late subscribers replay from the first event.
     pub(crate) events: Mutex<Vec<OperationEvent>>,
     pub(crate) events_tx: broadcast::Sender<(usize, OperationEvent)>,
@@ -35,6 +41,8 @@ impl Engine {
         let (events_tx, _) = broadcast::channel(64);
         let handle = Arc::new(OpHandle {
             cancel: CancellationToken::new(),
+            project: Mutex::new(None),
+            cancel_failed: AtomicBool::new(false),
             events: Mutex::new(Vec::new()),
             events_tx,
             signatures: Mutex::new(Vec::new()),
@@ -84,7 +92,8 @@ impl Engine {
                 // A cancelled command comes back as an error. Report it as the
                 // cancellation it was — otherwise every cancel reads as
                 // "internal error: cancelled".
-                Err(_) if handle.cancel.is_cancelled() => {
+                Err(_) if handle.cancel.is_cancelled()
+                    && !handle.cancel_failed.load(Ordering::Relaxed) => {
                     engine.emit_op(&handle, id, OperationEventKind::Cancelled)
                 }
                 Err(e) => {

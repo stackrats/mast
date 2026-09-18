@@ -105,6 +105,12 @@ function projectStatus(id: string): ProjectStatus {
   return store.projects.find((p) => p.id === id)?.status ?? "stopped";
 }
 
+function loadingLabel(id: string): string {
+  if (!store.hasRunningOp(id)) return "Starting";
+  const operation = store.operations[id];
+  return operation.cancelling ? "Cancelling" : operation.label;
+}
+
 // --- filter: type-to-narrow, offered whenever there is anything to narrow.
 const filter = ref("");
 const filterable = computed(() => store.projects.length > 0);
@@ -416,8 +422,10 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
                      for. The spinner replaces it rather than joining it: one
                      glyph per row, and it is the one that is still true. -->
                 <Loader2
-                  v-if="store.hasRunningOp(ws.id)"
+                  v-if="store.hasRunningOp(ws.id) || ws.status === 'starting'"
                   class="ml-auto mr-5 h-3 w-3 shrink-0 animate-spin text-amber-500"
+                  role="status"
+                  :aria-label="loadingLabel(ws.id)"
                 />
                 <!-- The word, one hover away: colour alone excludes anyone who
                      cannot tell these hues apart. -->
@@ -461,8 +469,13 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
                     @click="store.selection = { kind: 'project', id: member.project }"
                   >
                     <Loader2
-                      v-if="store.hasRunningOp(member.project)"
+                      v-if="
+                        store.hasRunningOp(member.project) ||
+                        projectStatus(member.project) === 'starting'
+                      "
                       class="h-3 w-3 shrink-0 animate-spin text-amber-500"
+                      role="status"
+                      :aria-label="loadingLabel(member.project)"
                     />
                     <Tooltip v-else :text="projectStatus(member.project)">
                       <span
@@ -534,8 +547,10 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
                   <span class="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
                 </Tooltip>
                 <Loader2
-                  v-if="store.hasRunningOp(project.id)"
+                  v-if="store.hasRunningOp(project.id) || project.status === 'starting'"
                   class="ml-auto h-3 w-3 shrink-0 animate-spin text-amber-500"
+                  role="status"
+                  :aria-label="loadingLabel(project.id)"
                 />
                 <Tooltip v-else :text="project.status">
                   <span

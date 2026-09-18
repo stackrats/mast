@@ -3391,3 +3391,248 @@ async fn dragged_orderings_persist_for_projects_and_workspaces() {
     // Naming only "two" pulls it first; "one" keeps its place after.
     assert_eq!(snap.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["two", "one"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_watched_directory_prunes_projects_but_preserves_other_watches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let code = tmp.path().join("code");
+    let removed = make_project(&code, "removed");
+    let kept = make_project(&code, "kept");
+    let unrelated = make_project(tmp.path(), "code-other");
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    engine.start();
+    for path in [&code, &kept] {
+        run_action(&engine, Action::AddWatchedDirectory { path: path.to_string_lossy().into() }).await;
+    }
+    for path in [&removed, &kept, &unrelated] {
+        run_action(&engine, Action::ImportProject { path: path.to_string_lossy().into() }).await;
+    }
+    let removed_id = mast_contract::ProjectId(mast_project::project_id(&removed));
+    let kept_id = mast_contract::ProjectId(mast_project::project_id(&kept));
+    run_action(&engine, Action::SaveWorkspace {
+        id: None, name: "suite".into(), members: vec![
+            mast_contract::WorkspaceMember { project: removed_id.clone(), depends_on: vec![] },
+            mast_contract::WorkspaceMember { project: kept_id.clone(), depends_on: vec![removed_id] },
+        ],
+    }).await;
+    run_action(&engine, Action::RemoveWatchedDirectory { path: code.to_string_lossy().into() }).await;
+    let snap = engine.snapshot();
+    assert_eq!(snap.projects.len(), 2);
+    assert!(snap.projects.iter().all(|p| p.name != "removed"));
+    assert_eq!(snap.workspaces[0].members.len(), 1);
+    assert_eq!(snap.workspaces[0].members[0].project, kept_id);
+    assert!(snap.workspaces[0].members[0].depends_on.is_empty());
+    assert!(snap.discovered.is_empty());
+    let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
+    assert_eq!(store.load_projects().unwrap().len(), 2);
+    assert_eq!(store.load_settings().unwrap().watched_directories, vec![kept]);
+    assert!(removed.join("compose.yaml").exists(), "removing a watch must never delete project files");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renamed_project_reports_missing_path_and_recovers_when_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "original");
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    wait_until(&engine, "resolved", |s| s.projects[0].compose_project_name.is_some()).await;
+    let moved = tmp.path().join("renamed");
+    std::fs::rename(&project, &moved).unwrap();
+    run_action(&engine, Action::RefreshNow).await;
+    let snap = wait_until(&engine, "missing directory", |s| {
+        s.projects[0].resolution_error.as_deref().is_some_and(|error| error.contains("project directory is missing"))
+    }).await;
+    assert_eq!(snap.projects[0].status, ProjectStatus::Failed);
+    assert!(snap.projects[0].services.is_empty());
+    assert!(snap.projects[0].processes.is_empty());
+    std::fs::rename(&moved, &project).unwrap();
+    run_action(&engine, Action::RefreshNow).await;
+    wait_until(&engine, "restored directory", |s| {
+        s.projects[0].compose_project_name.is_some() && s.projects[0].status == ProjectStatus::Stopped
+    }).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_project_cancels_its_running_command_before_forgetting_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "command-owner");
+    std::fs::write(project.join("serve.sh"), "#!/bin/sh\necho ready\nexec sleep 60\n").unwrap();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let id = engine.snapshot().projects[0].id.clone();
+    run_action(&engine, Action::SetProjectCommands { id: id.clone(), commands: vec![
+        mast_contract::ProjectCommand {
+            name: "sleep".into(), command: "sh serve.sh".into(),
+            auto_start: false, cwd: None, after: None, ready_when: None,
+            auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+        },
+    ] }).await;
+    let operation = engine.dispatch(Action::RunProjectCommand { id: id.clone(), name: "sleep".into() }).unwrap();
+    let mut events = engine.operation_events(operation).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.next().await {
+            if matches!(event.kind, OperationEventKind::Output { ref line, .. } if line == "ready") {
+                return;
+            }
+        }
+        panic!("command never became ready");
+    }).await.unwrap();
+    run_action(&engine, Action::RemoveProject { id }).await;
+    assert!(engine.snapshot().projects.is_empty());
+    let terminal = events.filter(|e| std::future::ready(e.kind.is_terminal())).next().await.unwrap();
+    assert!(matches!(terminal.kind, OperationEventKind::Cancelled));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "slow-shutdown");
+    let script = project.join("serve.sh");
+    // Shells can defer traps while running a foreground command. Start the
+    // child before readiness and use interruptible `wait`, then keep cleanup
+    // pending until the assertions explicitly release it.
+    std::fs::write(&script,
+        "#!/bin/sh\ntrap 'echo stopping; while [ ! -f release-stop ]; do sleep 0.05; done; exit 0' TERM\nsleep 60 &\nchild=$!\necho ready\nwait \"$child\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let id = engine.snapshot().projects[0].id.clone();
+    run_action(&engine, Action::SetProjectCommands { id: id.clone(), commands: vec![
+        mast_contract::ProjectCommand {
+            name: "serve".into(), command: "./serve.sh".into(),
+            auto_start: false, cwd: None, after: None, ready_when: None,
+            auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+        },
+    ] }).await;
+    let running = engine.dispatch(Action::RunProjectCommand { id: id.clone(), name: "serve".into() }).unwrap();
+    let mut output = engine.operation_events(running).unwrap();
+    async fn wait_line(events: &mut BoxStream<'static, mast_contract::OperationEvent>, text: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.next().await {
+                if matches!(&event.kind, OperationEventKind::Output { line, .. } if line == text) {
+                    return;
+                }
+                assert!(!event.kind.is_terminal(), "command exited before {text}: {:?}", event.kind);
+            }
+            panic!("command output closed before {text}");
+        }).await.unwrap();
+    }
+    wait_line(&mut output, "ready").await;
+    let removing = engine.dispatch(Action::RemoveProject { id: id.clone() }).unwrap();
+    wait_line(&mut output, "stopping").await;
+
+    for action in [
+        Action::RunProjectCommand { id: id.clone(), name: "serve".into() },
+        Action::StartProject { id: id.clone() },
+        Action::RemoveProject { id: id.clone() },
+    ] {
+        assert!(matches!(engine.dispatch(action), Err(ErrorInfo::Conflict { .. })));
+    }
+    std::fs::write(project.join("release-stop"), "").unwrap();
+    let mut removed = engine.operation_events(removing).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = removed.next().await {
+            if event.kind.is_terminal() {
+                assert!(matches!(event.kind, OperationEventKind::Completed));
+                return;
+            }
+        }
+        panic!("removal ended without a terminal event");
+    }).await.unwrap();
+    assert!(engine.snapshot().projects.is_empty());
+
+    // The reservation ends with the operation; importing the same path must
+    // not inherit its old project's removal lock.
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    run_action(&engine, Action::SetProjectCommands { id, commands: vec![] }).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_sail_cleanup_must_succeed_before_a_later_command_can_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "cleanup-retry");
+    std::fs::write(project.join(".env"), "APP_USER=sail\n").unwrap();
+    std::fs::create_dir_all(project.join("vendor/bin")).unwrap();
+    let sail = project.join("vendor/bin/sail");
+    std::fs::write(&sail,
+        "#!/bin/sh\nif [ \"$4\" = root ]; then\n  [ -f allow-cleanup ] && exit 0\n  echo 'cleanup deliberately blocked' >&2\n  exit 1\nfi\necho launched >> launches.txt\necho ready\nexec sleep 60\n",
+    ).unwrap();
+    std::fs::set_permissions(&sail, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let project_id = engine.snapshot().projects[0].id.clone();
+    let command = mast_contract::ProjectCommand {
+        name: "dev".into(), command: "sail npm run dev".into(),
+        auto_start: false, cwd: None, after: None, ready_when: None,
+        auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+    };
+    run_action(&engine, Action::SetProjectCommands { id: project_id.clone(), commands: vec![command.clone()] }).await;
+    let running = engine.dispatch(Action::RunProjectCommand { id: project_id.clone(), name: "dev".into() }).unwrap();
+    let mut events = engine.operation_events(running).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.next().await.expect("command stays open");
+            if matches!(&event.kind, OperationEventKind::Output { line, .. } if line == "ready") { break; }
+            assert!(!event.kind.is_terminal(), "command must start before cancellation");
+        }
+    }).await.unwrap();
+    engine.cancel(running).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.next().await.expect("terminal event arrives");
+            if event.kind.is_terminal() {
+                assert!(matches!(event.kind, OperationEventKind::Failed { .. }), "failed cleanup must not be reported as a successful Stop");
+                break;
+            }
+        }
+    }).await.unwrap();
+
+    let failure = run_action_capture_failure(&engine, Action::RunProjectCommand {
+        id: project_id.clone(), name: "dev".into(),
+    }).await.unwrap();
+    assert!(failure.contains("cleanup deliberately blocked"), "{failure}");
+    assert_eq!(std::fs::read_to_string(project.join("launches.txt")).unwrap(), "launched\n");
+
+    // Even editing the command does not bypass its old process's cleanup.
+    let replacement = mast_contract::ProjectCommand { command: "touch recovered.txt".into(), ..command };
+    run_action(&engine, Action::SetProjectCommands { id: project_id.clone(), commands: vec![replacement] }).await;
+    std::fs::write(project.join("allow-cleanup"), "").unwrap();
+    run_action(&engine, Action::RunProjectCommand { id: project_id, name: "dev".into() }).await;
+    assert!(project.join("recovered.txt").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compose_resolution_errors_emit_project_updates_without_other_state_changes() {
+    if !compose_cli_available().await { return; }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "resolution-patch");
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let before = wait_until(&engine, "model resolved", |s| {
+        s.projects.first().is_some_and(|p| !p.services.is_empty() && p.resolution_error.is_none())
+    }).await;
+    let mut patches = engine.subscribe(Some(before.seq));
+    std::fs::write(project.join("compose.yaml"), "services: [\n").unwrap();
+    run_action(&engine, Action::RefreshNow).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(item) = patches.next().await {
+            if let SubscriptionItem::Patch { patch } = item
+                && let mast_contract::PatchEvent::ProjectUpdated { project } = patch.event
+                && project.resolution_error.is_some()
+            {
+                return;
+            }
+        }
+        panic!("patch stream ended without the resolution error");
+    }).await.expect("a resolution error must update live clients, not just snapshots");
+}

@@ -46,6 +46,7 @@ import {
 import type {
   LaravelLogReport,
   PhpRuntimeReport,
+  ProcessState,
   ProjectCommand,
   ProjectSummary,
   ProxyCa,
@@ -53,11 +54,11 @@ import type {
 } from "../bindings";
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
-import { statusBadgeVariant } from "../lib/status";
+import { processStatus, statusBadgeVariant, statusDot } from "../lib/status";
 import { stripAnsi } from "../lib/ansi";
 import { formatElapsed, useElapsed } from "../lib/elapsed";
 import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
-import { commandKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
+import { commandKey, processKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import CatalogDialog from "./CatalogDialog.vue";
 import DataSnapshotsDialog from "./DataSnapshotsDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
@@ -81,6 +82,9 @@ const store = useEngineStore();
 const op = computed(() => store.operations[project.id]);
 const processes = computed(() => project.processes ?? []);
 const opRunning = computed(() => op.value != null && op.value.terminal === null);
+const hasRepairs = computed(() =>
+  store.failedProjectOperations(project.id).some(([, operation]) => operation.fixes.length > 0),
+);
 
 /** Nothing that changes this project may be touched while an operation is in
  * flight. Two reasons, and the second is the sharp one: the store keys one
@@ -165,14 +169,30 @@ function serviceVerb(
   });
 }
 
-// Process output streams into the same op panel as lifecycle verbs — for a
-// dev server that panel doubles as its live log.
+// Each daemon has its own slot: its launch remains active while it runs and
+// must not keep the project header spinning or lock every lifecycle button.
 function processVerb(process: string, title: string, type: "startProcess" | "stopProcess") {
-  void store.runLifecycle(project.id, `${type === "startProcess" ? "start" : "stop"} ${title}`, {
+  const key = processKey(project.id, process);
+  if (locked.value || (type === "startProcess" && store.hasRunningOp(key))) return;
+  void store.runLifecycle(key, `${type === "startProcess" ? "start" : "stop"} ${title}`, {
     type,
     id: project.id,
     process,
   });
+}
+
+function processView(process: ProcessState) {
+  const operation = store.operations[processKey(project.id, process.id)];
+  const status = processStatus(process.running, operation);
+  const pending = status === "starting" || status === "stopping";
+  return {
+    operation,
+    status,
+    pending,
+    active: process.running || operation?.terminal === null,
+    dot: pending ? undefined : statusDot[status],
+    error: operation?.terminal === "failed" ? operation.error : null,
+  };
 }
 
 const rowLabelClass = "text-[11px] font-medium tracking-wide text-slate-400";
@@ -562,7 +582,17 @@ function commandRunning(name: string): boolean {
   const view = commandOp(name);
   return view != null && view.terminal === null;
 }
+function commandPending(name: string): boolean {
+  const view = commandOp(name);
+  return !!view && (!!view.cancelling || !!view.restarting || (!view.terminal && view.id < 0));
+}
+function commandDot(name: string): string | undefined {
+  if (commandPending(name)) return undefined;
+  if (commandRunning(name)) return "bg-emerald-500";
+  return commandOp(name)?.terminal === "failed" ? "bg-red-500" : "bg-slate-300 dark:bg-slate-600";
+}
 function runCommand(cmd: ProjectCommand) {
+  if (locked.value || commandRunning(cmd.name) || commandPending(cmd.name)) return;
   void store.runLifecycle(commandKey(project.id, cmd.name), cmd.name, {
     type: "runProjectCommand",
     id: project.id,
@@ -571,6 +601,9 @@ function runCommand(cmd: ProjectCommand) {
 }
 function stopCommand(cmd: ProjectCommand) {
   void store.cancelLifecycle(commandKey(project.id, cmd.name));
+}
+function restartCommand(cmd: ProjectCommand) {
+  void store.restartCommand(project.id, cmd.name);
 }
 async function saveCommands(list: ProjectCommand[]) {
   await store.run({ type: "setProjectCommands", id: project.id, commands: list });
@@ -706,9 +739,10 @@ async function clearAppLog() {
                reading guaranteed to be wrong. Say what is happening instead. -->
           <Badge v-if="opRunning" variant="warning" class="shrink-0">
             <Loader2 class="h-3 w-3 animate-spin" />
-            {{ op.label }}
+            {{ op.cancelling ? "cancelling" : op.label }}
           </Badge>
           <Badge v-else :variant="statusBadgeVariant[project.status]" class="shrink-0">
+            <Loader2 v-if="project.status === 'starting'" class="h-3 w-3 animate-spin" />
             {{ project.status }}
           </Badge>
           <Tooltip
@@ -750,8 +784,13 @@ async function clearAppLog() {
       </div>
       <div class="flex shrink-0 gap-1.5">
         <template v-if="opRunning">
-          <Button variant="destructive" size="sm" @click="store.cancelLifecycle(project.id)">
-            <X class="h-3.5 w-3.5" /> Cancel
+          <Button
+            variant="destructive"
+            size="sm"
+            :disabled="op?.cancelling"
+            @click="store.cancelLifecycle(project.id)"
+          >
+            <X class="h-3.5 w-3.5" /> {{ op?.cancelling ? "Cancelling…" : "Cancel" }}
           </Button>
         </template>
         <template v-else-if="!store.readOnly">
@@ -892,17 +931,14 @@ async function clearAppLog() {
       </Tooltip>
       <Tooltip
         :text="
-          op?.terminal === 'failed' && op.fixes.length > 0
+          hasRepairs
             ? 'A one-click fix for the last failure is waiting in here.'
             : 'Run the diagnostic checks scoped to this project\'s findings and fixes.'
         "
       >
         <Button variant="ghost" size="sm" @click="emit('diagnose')">
           <Stethoscope class="h-3.5 w-3.5" /> Diagnose
-          <TriangleAlert
-            v-if="op?.terminal === 'failed' && op.fixes.length > 0"
-            class="h-3 w-3 text-amber-500"
-          />
+          <TriangleAlert v-if="hasRepairs" class="h-3 w-3 text-amber-500" />
         </Button>
       </Tooltip>
     </div>
@@ -1183,16 +1219,21 @@ async function clearAppLog() {
       <div class="flex items-center gap-1.5">
         <p :class="rowLabelClass">Processes</p>
         <Hint
-          text="Laravel daemons that run INSIDE the app container (detected from composer.json and .env). A green dot means it is running right now — even if you started it from a terminal. Start/stop from the chip menu."
+          text="Laravel daemons inside the app container. Green means running, amber means starting or stopping, and red means the last attempt failed. Processes started here restart when application code changes."
         />
       </div>
       <div class="mt-1.5 flex flex-wrap gap-2">
         <DropdownMenuRoot v-for="proc in processes" :key="proc.id">
           <DropdownMenuTrigger as-child>
             <Chip
-              :dot="proc.running ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'"
-              :tip="processHints[proc.id] ?? proc.title"
+              :dot="processView(proc).dot"
+              :tip="`${processHints[proc.id] ?? proc.title} ${processView(proc).status}${processView(proc).error ? `: ${processView(proc).error}` : ''}`"
+              :aria-label="`${proc.title}: ${processView(proc).status}`"
             >
+              <Loader2
+                v-if="processView(proc).pending"
+                class="h-3 w-3 shrink-0 animate-spin text-amber-500"
+              />
               {{ proc.title }}
               <ChevronDown class="h-3 w-3 text-slate-400" />
             </Chip>
@@ -1200,23 +1241,56 @@ async function clearAppLog() {
           <DropdownMenuPortal>
             <DropdownMenuContent :class="menuContentClass" :side-offset="4" align="start">
               <DropdownMenuItem
-                v-if="!proc.running"
+                v-if="!processView(proc).active"
                 :class="menuItemClass"
-                :disabled="locked || project.status !== 'running'"
+                :disabled="locked || !tinkerReady"
                 @select="processVerb(proc.id, proc.title, 'startProcess')"
               >
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Start{{
-                  project.status !== "running" ? " (start the project first)" : ""
+                  !tinkerReady ? " (start the project first)" : ""
                 }}
               </DropdownMenuItem>
               <DropdownMenuItem
                 v-else
                 :class="menuItemClass"
-                :disabled="locked"
+                :disabled="locked || processView(proc).status === 'stopping'"
                 @select="processVerb(proc.id, proc.title, 'stopProcess')"
               >
-                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
+                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
+                {{ processView(proc).status === "stopping" ? "Stopping…" : "Stop" }}
               </DropdownMenuItem>
+              <p
+                v-if="processView(proc).error"
+                class="max-w-72 px-2 py-1.5 text-xs text-red-700 dark:text-red-300"
+              >
+                {{ processView(proc).error }}
+              </p>
+              <template v-if="processView(proc).operation">
+                <DropdownMenuSeparator :class="menuSeparatorClass" />
+                <DropdownMenuItem
+                  :class="menuItemClass"
+                  @select="
+                    store.setLogsOpen(true);
+                    store.logsTab = 'output';
+                  "
+                >
+                  <ScrollText class="h-3.5 w-3.5 text-slate-400" /> View output
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="processView(proc).error && processView(proc).operation!.id >= 0"
+                  :class="menuItemClass"
+                  @select="store.showOperationCommand(processView(proc).operation!.id)"
+                >
+                  <ScrollText class="h-3.5 w-3.5 text-slate-400" /> Show the command that failed
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="processView(proc).error && processView(proc).operation!.fixes.length"
+                  :class="menuItemClass"
+                  @select="emit('diagnose')"
+                >
+                  <Wrench class="h-3.5 w-3.5 text-amber-500" /> Fix available — open Diagnose
+                </DropdownMenuItem>
+              </template>
             </DropdownMenuContent>
           </DropdownMenuPortal>
         </DropdownMenuRoot>
@@ -1235,7 +1309,8 @@ async function clearAppLog() {
         <DropdownMenuRoot v-for="cmd in commands" :key="cmd.name">
           <DropdownMenuTrigger as-child>
             <Chip
-              :dot="commandRunning(cmd.name) ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'"
+              :dot="commandDot(cmd.name)"
+              :aria-busy="commandPending(cmd.name)"
               :tip="
                 cmd.command +
                 (cmd.cwd ? ` · in ${cmd.cwd}` : '') +
@@ -1247,6 +1322,10 @@ async function clearAppLog() {
                 (cmd.fromManifest ? ' · shared via mast.yml' : '')
               "
             >
+              <Loader2
+                v-if="commandPending(cmd.name)"
+                class="h-3 w-3 animate-spin text-amber-500"
+              />
               {{ cmd.name }}
               <span v-if="cmd.autoStart" class="text-[10px] text-slate-400">auto</span>
               <span v-if="cmd.fromManifest" class="text-[10px] text-slate-400">shared</span>
@@ -1278,13 +1357,31 @@ async function clearAppLog() {
               <DropdownMenuItem
                 v-if="!commandRunning(cmd.name)"
                 :class="menuItemClass"
-                :disabled="locked"
+                :disabled="locked || commandPending(cmd.name)"
                 @select="runCommand(cmd)"
               >
                 <Play class="h-3.5 w-3.5 text-slate-400" /> Run
               </DropdownMenuItem>
-              <DropdownMenuItem v-else :class="menuItemClass" @select="stopCommand(cmd)">
-                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" /> Stop
+              <DropdownMenuItem
+                v-else
+                :class="menuItemClass"
+                :disabled="
+                  store.readOnly ||
+                  commandOp(cmd.name)?.cancelling ||
+                  commandOp(cmd.name)?.restarting
+                "
+                @select="stopCommand(cmd)"
+              >
+                <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
+                {{ commandOp(cmd.name)?.cancelling ? "Stopping…" : "Stop" }}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                :class="menuItemClass"
+                :disabled="locked || commandPending(cmd.name)"
+                @select="restartCommand(cmd)"
+              >
+                <RotateCw class="h-3.5 w-3.5 text-slate-400" />
+                {{ commandOp(cmd.name)?.restarting ? "Restarting…" : "Restart" }}
               </DropdownMenuItem>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
               <!-- A shared command's definition lives in the repo's mast.yml;
@@ -1303,7 +1400,7 @@ async function clearAppLog() {
                      key nothing is listening to any more. -->
                 <DropdownMenuItem
                   :class="menuItemClass"
-                  :disabled="locked || commandRunning(cmd.name)"
+                  :disabled="locked || commandRunning(cmd.name) || commandPending(cmd.name)"
                   @select="openCommandDialog(cmd)"
                 >
                   <Pencil class="h-3.5 w-3.5 text-slate-400" /> Edit
@@ -1323,7 +1420,7 @@ async function clearAppLog() {
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   :class="menuItemClass"
-                  :disabled="locked"
+                  :disabled="locked || commandRunning(cmd.name) || commandPending(cmd.name)"
                   @select="saveCommands(commands.filter((c) => c.name !== cmd.name))"
                 >
                   <Trash2 class="h-3.5 w-3.5 text-slate-400" /> Delete
@@ -2087,9 +2184,13 @@ async function clearAppLog() {
     >
       <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
         {{ op.label }}
-        <span v-if="opRunning" class="text-amber-600"> running… {{ formatElapsed(elapsed) }} </span>
-        <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700">cancelled</span>
-        <span v-else class="text-red-700">failed: {{ op.error }}</span>
+        <span v-if="opRunning" class="text-amber-600 dark:text-amber-400">
+          {{ op.cancelling ? "cancelling…" : "running…" }} {{ formatElapsed(elapsed) }}
+        </span>
+        <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700 dark:text-amber-300"
+          >cancelled</span
+        >
+        <span v-else class="text-red-700 dark:text-red-300">failed: {{ op.error }}</span>
       </p>
       <!-- One line, truncated: enough to tell a build that is working from
            one that has stopped, without the panel and without ever growing
