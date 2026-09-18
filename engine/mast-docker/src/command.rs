@@ -272,18 +272,87 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SIG_TERM: i32 = libc::SIGTERM;
 #[cfg(unix)]
 const SIG_KILL: i32 = libc::SIGKILL;
-// Non-unix: cancellation relies on kill_on_drop (Windows adapter TODO —
-// Job Objects for group kill); the numbers are only passed to a no-op.
-#[cfg(not(unix))]
-const SIG_TERM: i32 = 15;
-#[cfg(not(unix))]
-const SIG_KILL: i32 = 9;
 
 #[cfg(unix)]
 fn kill_group(pid: i32, signal: i32) {
     // Negative pid targets the whole process group (compose spawns children).
     unsafe {
         libc::kill(-pid, signal);
+    }
+}
+
+/// Keep the child owned by the caller throughout shutdown: a detached waiter
+/// would prevent kill_on_drop from terminating it when a deadline expires.
+async fn wait_for_killed_child(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process did not exit after termination",
+            )
+        })?
+        .map(|_| ())
+}
+
+#[cfg(unix)]
+async fn terminate_streaming_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    grace: Option<Duration>,
+) -> std::io::Result<()> {
+    if let Some(grace) = grace {
+        kill_group(pid as i32, SIG_TERM);
+        if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+            return status.map(|_| ());
+        }
+    }
+    kill_group(pid as i32, SIG_KILL);
+    wait_for_killed_child(child).await
+}
+
+#[cfg(windows)]
+fn windows_system_binary(relative: &str) -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join(relative)
+}
+
+#[cfg(windows)]
+async fn terminate_streaming_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    _grace: Option<Duration>,
+) -> std::io::Result<()> {
+    // Windows has no SIGTERM equivalent for CREATE_NO_WINDOW children. Kill
+    // the owned process tree before closing its handle; this also stops shell
+    // grandchildren that would survive Child::kill alone.
+    let mut taskkill = tokio::process::Command::new(windows_system_binary("taskkill.exe"));
+    taskkill
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(5), taskkill.status()).await;
+    match result {
+        Ok(Ok(status)) if status.success() => wait_for_killed_child(child).await,
+        _ => {
+            // A natural exit racing cancellation is already complete. Otherwise
+            // still stop the direct child, but report that descendant cleanup
+            // could not be confirmed so callers cannot mistake it for success.
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            child.start_kill()?;
+            wait_for_killed_child(child).await?;
+            Err(std::io::Error::other(
+                "failed to terminate the command's Windows process tree",
+            ))
+        }
     }
 }
 
@@ -328,7 +397,8 @@ impl From<Duration> for StreamBudget {
 
 /// Run `argv` in its own process group, streaming stdout/stderr lines into
 /// `lines`. Cancellation SIGTERMs the group, escalating to SIGKILL after
-/// `grace`. Lines longer than 8 KiB are truncated.
+/// `grace`. Windows terminates the owned process tree with taskkill. Lines
+/// longer than 8 KiB are truncated.
 pub async fn run_streaming(
     argv: &[String],
     cwd: Option<&Path>,
@@ -396,10 +466,7 @@ async fn run_streaming_inner(
 
     let mut child =
         cmd.spawn().map_err(|source| CommandError::Spawn { argv0: argv0.clone(), source })?;
-    // Only the signalling path below wants it; elsewhere kill_on_drop is all
-    // there is (see SIG_TERM).
-    #[cfg(unix)]
-    let pid = child.id().unwrap_or(0) as i32;
+    let pid = child.id().expect("newly spawned process has an id");
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -434,14 +501,6 @@ async fn run_streaming_inner(
     }
     drop(lines);
 
-    let mut wait = tokio::spawn(async move { child.wait().await });
-    let escalate = |first: i32| async move {
-        #[cfg(unix)]
-        kill_group(pid, first);
-        #[cfg(not(unix))]
-        let _ = first;
-    };
-
     let expires = tokio::time::Instant::now() + budget.overall;
     loop {
         // Recomputed every pass: output that arrived while we were parked
@@ -452,18 +511,15 @@ async fn run_streaming_inner(
             None => expires,
         };
         tokio::select! {
-            status = &mut wait => {
+            status = child.wait() => {
                 let status = status
-                    .map_err(|e| CommandError::Io { argv0: argv0.clone(), source: std::io::Error::other(e) })?
                     .map_err(|source| CommandError::Io { argv0: argv0.clone(), source })?;
                 return Ok(CommandOutcome::Exited(status.code().unwrap_or(-1)));
             }
             _ = cancel.cancelled() => {
-                escalate(SIG_TERM).await;
-                if tokio::time::timeout(grace, &mut wait).await.is_err() {
-                    escalate(SIG_KILL).await;
-                    let _ = wait.await;
-                }
+                terminate_streaming_child(&mut child, pid, Some(grace))
+                    .await
+                    .map_err(|source| CommandError::Io { argv0: argv0.clone(), source })?;
                 return Ok(CommandOutcome::Cancelled);
             }
             _ = tokio::time::sleep_until(deadline) => {
@@ -475,8 +531,9 @@ async fn run_streaming_inner(
                     // It spoke while we were waiting — this deadline is stale.
                     continue;
                 }
-                escalate(SIG_KILL).await;
-                let _ = wait.await;
+                terminate_streaming_child(&mut child, pid, None)
+                    .await
+                    .map_err(|source| CommandError::Io { argv0: argv0.clone(), source })?;
                 return Err(if now < expires {
                     CommandError::Stalled {
                         argv0,
@@ -644,6 +701,143 @@ mod tests {
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome, CommandOutcome::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(5), "cancel was not prompt");
+    }
+
+    #[cfg(windows)]
+    struct WindowsTestTree(Vec<u32>);
+
+    #[cfg(windows)]
+    impl Drop for WindowsTestTree {
+        fn drop(&mut self) {
+            use std::os::windows::process::CommandExt;
+
+            // Also clean up when an assertion fails in the regression itself.
+            for pid in &self.0 {
+                let _ = std::process::Command::new(windows_system_binary("taskkill.exe"))
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn assert_windows_tree_shutdown(cancel_running: bool) {
+        // Both processes are native Windows processes. Waiting for their IDs
+        // proves cancellation reaches a running tree rather than only winning
+        // a race before the command has started.
+        let script = concat!(
+            "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') ",
+            "-ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command',",
+            "'Start-Sleep -Seconds 300' -WindowStyle Hidden -PassThru; ",
+            "Write-Output ('MAST_TREE_READY {0} {1}' -f $PID,$child.Id); ",
+            "Start-Sleep -Seconds 300"
+        );
+        let argv = vec![
+            windows_system_binary(r"WindowsPowerShell\v1.0\powershell.exe")
+                .to_string_lossy()
+                .into_owned(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script.into(),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let budget = Duration::from_secs(if cancel_running { 60 } else { 10 });
+        let handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_streaming(
+                    &argv,
+                    None,
+                    &[],
+                    tx,
+                    cancel,
+                    budget,
+                    Duration::from_millis(100),
+                )
+                .await
+            })
+        };
+        let mut processes = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(line) = rx.recv().await {
+                if let Some(ids) = line.line.strip_prefix("MAST_TREE_READY ") {
+                    return WindowsTestTree(
+                        ids.split_whitespace()
+                            .map(|id| id.parse().unwrap())
+                            .collect(),
+                    );
+                }
+            }
+            panic!("the Windows process tree never became ready");
+        })
+        .await
+        .expect("Windows process startup is bounded");
+        assert_eq!(processes.0.len(), 2);
+        if cancel_running {
+            cancel.cancel();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("shutdown must finish instead of waiting forever")
+            .unwrap();
+        if cancel_running {
+            assert_eq!(result.unwrap(), CommandOutcome::Cancelled);
+        } else {
+            assert!(
+                matches!(result, Err(CommandError::Timeout { .. })),
+                "{result:?}"
+            );
+        }
+        for pid in &processes.0 {
+            let pid_field = format!("\"{pid}\"");
+            let output = run_command(
+                &[
+                    windows_system_binary("tasklist.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "/FI".into(),
+                    format!("PID eq {pid}"),
+                    "/FO".into(),
+                    "CSV".into(),
+                    "/NH".into(),
+                ],
+                None,
+                &[],
+                Duration::from_secs(10),
+                16 * 1024,
+            )
+            .await
+            .unwrap();
+            assert!(output.success(), "tasklist failed: {output:?}");
+            assert!(
+                !output
+                    .stdout
+                    .split(',')
+                    .any(|field| field.trim() == pid_field),
+                "process {pid} survived shutdown: {}",
+                output.stdout
+            );
+        }
+        processes.0.clear();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_kills_the_windows_process_tree() {
+        assert_windows_tree_shutdown(true).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_kills_the_windows_process_tree() {
+        assert_windows_tree_shutdown(false).await;
     }
 
     #[test]

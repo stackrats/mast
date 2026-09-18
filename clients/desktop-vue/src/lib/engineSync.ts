@@ -8,7 +8,7 @@
 
 import type { EnginePatch, EngineSnapshot, SubscriptionItem } from "../bindings";
 
-export type SyncPhase = "idle" | "syncing" | "live";
+export type SyncPhase = "idle" | "syncing" | "live" | "error";
 
 export interface PatchTransport {
   snapshot(): Promise<EngineSnapshot>;
@@ -20,6 +20,7 @@ export interface EngineStateSink {
   reset(snapshot: EngineSnapshot): void;
   apply(patch: EnginePatch): void;
   phase?(phase: SyncPhase): void;
+  error?(error: unknown): void;
 }
 
 export class EngineSync {
@@ -31,6 +32,7 @@ export class EngineSync {
   private streamId = 0;
   private buffer: EnginePatch[] = [];
   private syncing = false;
+  private resyncPending = false;
 
   constructor(
     private transport: PatchTransport,
@@ -39,9 +41,10 @@ export class EngineSync {
 
   /** Feed every incoming PatchStreamItem event here, tagged with its stream. */
   handleItem(streamId: number, item: SubscriptionItem): void {
-    if (streamId !== this.streamId) return; // superseded generation
+    if (streamId !== this.streamId || this.phase === "error") return; // superseded generation
     if (item.type === "resyncRequired") {
-      void this.resync();
+      if (this.syncing) this.resyncPending = true;
+      else this.resyncInBackground();
       return;
     }
     if (this.syncing) {
@@ -56,9 +59,27 @@ export class EngineSync {
     this.syncing = true;
     this.setPhase("syncing");
     this.buffer = [];
+    this.resyncPending = false;
     this.streamId += 1;
-    await this.transport.startPatchStream(this.streamId, null);
-    const snapshot = await this.transport.snapshot();
+    let snapshot: EngineSnapshot;
+    try {
+      await this.transport.startPatchStream(this.streamId, null);
+      snapshot = await this.transport.snapshot();
+    } catch (error) {
+      this.syncing = false;
+      this.buffer = [];
+      this.setPhase("error");
+      this.sink.error?.(error);
+      throw error;
+    }
+    // A stream can overflow while the snapshot is in flight. Its snapshot
+    // need not contain the lost changes, and the backend has closed that
+    // stream, so publishing it as live would leave the UI permanently stale.
+    if (this.resyncPending) {
+      this.syncing = false;
+      await this.resync();
+      return;
+    }
     this.sink.reset(snapshot);
     this.seq = snapshot.seq;
     const buffered = this.buffer;
@@ -81,12 +102,18 @@ export class EngineSync {
   private applyLive(patch: EnginePatch): boolean {
     if (patch.seq <= this.seq) return true; // duplicate/overlap with snapshot
     if (patch.seq !== this.seq + 1) {
-      void this.resync();
+      this.resyncInBackground();
       return false;
     }
     this.sink.apply(patch);
     this.seq = patch.seq;
     return true;
+  }
+
+  private resyncInBackground(): void {
+    // connect reports errors to the sink; consume the rejected promise from
+    // event-driven retries rather than leaving an unhandled rejection.
+    void this.resync().catch(() => {});
   }
 
   private setPhase(phase: SyncPhase): void {

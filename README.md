@@ -176,6 +176,8 @@ Requirements and notes:
 
 Mast automatically discovers Laravel Sail and Docker Compose projects from the directories you configure.
 
+Removing a watched directory also removes its imported projects from Mast unless another watched directory covers them. Managed commands stop before removal; project files remain on disk. A moved or missing project folder shows a path error until it is restored or its new location is imported.
+
 Every project shows its services, application processes, saved commands, and live container state.
 
 <img src="docs/media/project.png" alt="Project pane showing live CPU and memory alongside service, runtime, process, and command chips for a running Sail project" width="900">
@@ -215,6 +217,7 @@ Mast can automatically start:
 - Reverb
 - Horizon
 - Queue workers
+- Scheduler
 - Saved project commands
 
 These processes remain attached to the project they belong to rather than disappearing into another terminal window.
@@ -222,6 +225,10 @@ These processes remain attached to the project they belong to rather than disapp
 Saved commands can also run somewhere else: give one a working directory like `../frontend` and your separate frontend's dev server lives on the same card — streamed, stoppable, and startable together with the backend it belongs to.
 
 ### Keep them alive, keep them current
+
+Queue workers, Horizon, the scheduler, and Reverb started through Mast restart when application code or configuration changes. Mast waits for the old process to stop inside its container before starting its replacement. Dependency directories, generated caches, and logs do not trigger these restarts.
+
+Saved command menus include **Restart**, which waits for the current command to stop before running it again. Starting, stopping, and restarting commands show a pending indicator, and failed commands show a red status dot.
 
 A command can **auto-restart**: any exit you didn't ask for relaunches it, with backoff, and a crash loop stops instead of hammering the same failure. Add **restart-on-change** globs — `app/** config/**` — and the command is stopped and relaunched when matching files change, which is exactly what a queue worker needs: it never sees new code until it restarts. Supervisor semantics, locally, with the output still streaming into the same panel.
 

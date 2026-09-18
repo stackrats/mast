@@ -2,7 +2,7 @@
 // across components; a status has to look the same everywhere or the colour
 // stops carrying meaning.
 
-import type { ProjectStatus } from "../bindings";
+import type { Action, ProjectStatus } from "../bindings";
 
 export type StatusBadgeVariant = "secondary" | "warning" | "success" | "destructive";
 
@@ -23,3 +23,24 @@ export const statusDot: Record<ProjectStatus, string> = {
   degraded: "bg-orange-400",
   failed: "bg-red-500",
 };
+
+export type ProcessStatus = "stopped" | "starting" | "stopping" | "running" | "failed";
+
+/** A daemon's launch operation lasts as long as the daemon. Observation,
+ * rather than operation completion, tells us when to stop its spinner. */
+export function processStatus(
+  running: boolean,
+  operation?: {
+    actionType?: Action["type"];
+    terminal: "completed" | "failed" | "cancelled" | null;
+    cancelling?: boolean;
+  },
+): ProcessStatus {
+  if (operation?.terminal === null) {
+    if (operation.cancelling || operation.actionType === "stopProcess") return "stopping";
+    if (!running) return "starting";
+  }
+  // A failed launch/stop must not hide a daemon observed running externally.
+  if (running) return "running";
+  return operation?.terminal === "failed" ? "failed" : "stopped";
+}

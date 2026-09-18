@@ -1,4 +1,5 @@
 import { acceptHMRUpdate, defineStore } from "pinia";
+import { watch } from "vue";
 
 import type {
   Action,
@@ -82,6 +83,7 @@ export interface OperationView {
   token: number;
   id: OperationId;
   label: string;
+  actionType?: Action["type"];
   /** Wall-clock start, for the elapsed readout. A cold image build runs for
    * tens of minutes, and "how long has this been going" is the question the
    * user actually has while watching it. */
@@ -93,6 +95,9 @@ export interface OperationView {
    * silent, exactly when it is at its busiest. */
   received: number;
   terminal: "completed" | "failed" | "cancelled" | null;
+  /** Cancellation is not complete until the process sends its terminal event. */
+  cancelling?: boolean;
+  restarting?: boolean;
   error: string | null;
   /** A one-click repair the engine matched to this operation's failure —
    * rendered as a Fix button whose preview says what will change. */
@@ -132,9 +137,34 @@ const READY_SETTLE_MS = 3_000;
 const READY_TIMEOUT_MS = 5 * 60_000;
 const READY_POLL_MS = 250;
 
+/** Wait on reactive operation state, including removal or replacement. A lost
+ * transport must report a timeout instead of leaving controls busy forever. */
+function waitForOperation(ready: () => boolean): Promise<void> {
+  if (ready()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const stop = watch(ready, (done) => {
+      if (!done) return;
+      clearTimeout(timer);
+      stop();
+      resolve();
+    });
+    const timer = setTimeout(() => {
+      stop();
+      reject(
+        new Error("Timed out waiting for the command to stop. Check its output before retrying."),
+      );
+    }, 30_000);
+  });
+}
+
 /** Operations-map key for a user-defined project command (M7.5). */
 export function commandKey(project: string, name: string): string {
   return `${project}:cmd:${name}`;
+}
+
+/** Artisan daemons stay alive independently of project lifecycle actions. */
+export function processKey(project: string, process: string): string {
+  return `${project}:process:${process}`;
 }
 
 /** Share-tunnel operations get their own op slot: the tunnel runs
@@ -275,6 +305,16 @@ export const useEngineStore = defineStore("engine", {
       };
     },
 
+    /** Project and daemon failures share the project's diagnostic repair list. */
+    failedProjectOperations(state) {
+      return (project: ProjectId) =>
+        Object.entries(state.operations).filter(
+          ([key, operation]) =>
+            operation.terminal === "failed" &&
+            (key === project || key.startsWith(processKey(project, ""))),
+        );
+    },
+
     /** Alert titles a project accumulated while unwatched, oldest first —
      * empty for a project with nothing to catch up on. */
     attentionFor(state) {
@@ -285,6 +325,14 @@ export const useEngineStore = defineStore("engine", {
   actions: {
     /** Fold a full snapshot into state (resync entry point). */
     applySnapshot(snapshot: EngineSnapshot) {
+      const removedProjects = this.projects
+        .filter((project) => !snapshot.projects.some((next) => next.id === project.id))
+        .map((project) => project.id);
+      for (const workspace of this.workspaces) {
+        if (!snapshot.workspaces.some((next) => next.id === workspace.id)) {
+          delete this.operations[workspace.id];
+        }
+      }
       this.projects = sortProjects(snapshot.projects);
       this.docker = snapshot.docker;
       this.readOnly = snapshot.readOnly;
@@ -292,6 +340,29 @@ export const useEngineStore = defineStore("engine", {
       this.watchedDirectories = snapshot.watchedDirectories;
       this.discovered = snapshot.discovered;
       this.workspaces = snapshot.workspaces;
+      this.forgetProjectViews(removedProjects);
+      this.reconcileSelection();
+    },
+
+    /** Removed projects must not leave live-looking controls or streams behind. */
+    forgetProjectViews(ids: ProjectId[]) {
+      for (const id of ids) {
+        for (const key of Object.keys(this.operations)) {
+          if (key === id || key.startsWith(`${id}:`)) delete this.operations[key];
+        }
+        delete this.attention[id];
+      }
+      if (this.logs && ids.includes(this.logs.project)) void this.closeLogs();
+    },
+
+    reconcileSelection() {
+      const selection = this.selection;
+      if (
+        (selection.kind === "project" && !this.projects.some((p) => p.id === selection.id)) ||
+        (selection.kind === "workspace" && !this.workspaces.some((w) => w.id === selection.id))
+      ) {
+        this.selection = { kind: "home" };
+      }
     },
 
     /** Fold one patch into state; observed transitions drive notifications
@@ -319,7 +390,13 @@ export const useEngineStore = defineStore("engine", {
           this.integrations = event.integrations;
           break;
         case "workspacesChanged":
+          for (const workspace of this.workspaces) {
+            if (!event.workspaces.some((next) => next.id === workspace.id)) {
+              delete this.operations[workspace.id];
+            }
+          }
           this.workspaces = event.workspaces;
+          this.reconcileSelection();
           break;
         default: {
           const wasRunning = new Map(this.projects.map((p) => [p.id, p.status === "running"]));
@@ -327,6 +404,10 @@ export const useEngineStore = defineStore("engine", {
             this.projects.map((p) => [p.id, p.status === "degraded" || p.status === "failed"]),
           );
           this.projects = applyPatchEvent(this.projects, event);
+          if (event.type === "projectRemoved") {
+            this.forgetProjectViews([event.id]);
+            this.reconcileSelection();
+          }
           for (const p of this.projects) {
             const unhealthy = p.status === "degraded" || p.status === "failed";
             if (unhealthy && wasUnhealthy.get(p.id) === false) {
@@ -348,21 +429,34 @@ export const useEngineStore = defineStore("engine", {
     },
 
     async connect() {
-      if (sync) return;
-      sync = new EngineSync(tauriPatchTransport, {
-        reset: (snapshot) => this.applySnapshot(snapshot),
-        apply: (patch) => this.applyPatch(patch),
-        phase: (phase) => {
-          this.phase = phase;
-          this.resyncs = sync?.resyncs ?? 0;
-        },
-      });
-      const s = sync;
-      await onPatchStreamItem((streamId, item) => s.handleItem(streamId, item));
+      if (sync && sync.phase !== "error") return;
+      this.error = null;
       try {
-        await s.connect();
+        if (!sync) {
+          sync = new EngineSync(tauriPatchTransport, {
+            reset: (snapshot) => this.applySnapshot(snapshot),
+            apply: (patch) => this.applyPatch(patch),
+            phase: (phase) => {
+              this.phase = phase;
+              this.resyncs = sync?.resyncs ?? 0;
+            },
+            error: (error) => {
+              this.error = error instanceof Error ? error.message : String(error);
+            },
+          });
+          const s = sync;
+          try {
+            await onPatchStreamItem((streamId, item) => s.handleItem(streamId, item));
+          } catch (error) {
+            sync = null;
+            throw error;
+          }
+        }
+        await sync.connect();
       } catch (e) {
+        this.phase = "error";
         this.error = e instanceof Error ? e.message : String(e);
+        return;
       }
       await this.connectHistory();
       await this.connectCaptures();
@@ -387,6 +481,8 @@ export const useEngineStore = defineStore("engine", {
     upsertHistory(entry: HistoryEntry) {
       const at = this.history.findIndex((existing) => existing.id === entry.id);
       if (at >= 0) {
+        // The backlog can arrive after a completion event from the live stream.
+        if (this.history[at].outcome.type !== "running" && entry.outcome.type === "running") return;
         this.history[at] = entry;
         return;
       }
@@ -603,6 +699,7 @@ export const useEngineStore = defineStore("engine", {
         token,
         id: -1,
         label,
+        actionType: action.type,
         startedAt: Date.now(),
         lines: [],
         received: 0,
@@ -622,6 +719,7 @@ export const useEngineStore = defineStore("engine", {
         const id = await dispatchAction(action, (event) => {
           const op = current();
           if (!op) return; // superseded by a newer operation
+          op.id = event.operation;
           switch (event.kind.type) {
             case "output":
               pushBounded(
@@ -674,8 +772,13 @@ export const useEngineStore = defineStore("engine", {
         const op = current();
         if (op) op.id = id;
       } catch (e) {
-        if (current()) delete this.operations[project];
-        this.error = e instanceof Error ? e.message : String(e);
+        const op = current();
+        if (!op) return;
+        const error = e instanceof Error ? e.message : String(e);
+        op.terminal = "failed";
+        op.error = error;
+        this.error = error;
+        this.pushActivity(`✗ ${label} failed: ${error}`, true);
       }
     },
 
@@ -693,6 +796,15 @@ export const useEngineStore = defineStore("engine", {
           return;
         }
       }
+      // A dependency can take minutes. The project may have stopped, vanished,
+      // or had this command disabled while we were waiting.
+      const latest = this.projects.find((p) => p.id === project);
+      if (
+        latest?.status !== "running" ||
+        !latest.commands?.some((c) => c.name === cmd.name && c.autoStart) ||
+        this.hasRunningOp(key)
+      )
+        return;
       await this.runLifecycle(key, cmd.name, {
         type: "runProjectCommand",
         id: project,
@@ -718,6 +830,12 @@ export const useEngineStore = defineStore("engine", {
       let seen = -1;
       let quietSince = Date.now();
       while (Date.now() < until) {
+        const currentProject = this.projects.find((p) => p.id === project);
+        if (
+          currentProject?.status !== "running" ||
+          !currentProject.commands?.some((command) => command.name === name)
+        )
+          return false;
         const op = this.operations[key];
         // Absent is "not yet", not "never": the command it waits for is very
         // likely being dispatched in the same tick. The timeout is what stops
@@ -797,22 +915,67 @@ export const useEngineStore = defineStore("engine", {
       delete this.operations[key];
     },
 
-    async cancelLifecycle(project: ProjectId): Promise<void> {
+    async cancelLifecycle(project: ProjectId): Promise<boolean> {
       const op = this.operations[project];
-      if (!op || op.terminal || op.id < 0) return;
+      if (!op || op.terminal) return true;
+      const token = op.token;
+      const current = () => this.operations[project]?.token === token;
+      op.cancelling = true;
       try {
-        await cancelOperation(op.id);
+        // A click can beat the invoke reply. Wait for the operation id rather
+        // than dropping Stop while its command is still being dispatched.
+        await waitForOperation(() => !current() || op.id >= 0 || op.terminal !== null);
+        if (!current()) return false;
+        if (!op.terminal) {
+          await cancelOperation(op.id);
+          await waitForOperation(() => !current() || op.terminal !== null);
+        }
+        // A failed terminal during Stop means cleanup could not establish
+        // that the old process exited. Restart must not launch a duplicate.
+        return current() && op.terminal !== "failed";
       } catch (e) {
-        this.error = e instanceof Error ? e.message : String(e);
+        if (current()) this.error = e instanceof Error ? e.message : String(e);
+        return false;
+      } finally {
+        if (current()) op.cancelling = false;
+      }
+    },
+
+    /** Stop the old process completely before launching its replacement. */
+    async restartCommand(project: ProjectId, name: string): Promise<void> {
+      const key = commandKey(project, name);
+      const previous = this.operations[key];
+      if (previous?.restarting || previous?.cancelling) return;
+      const stillConfigured = () =>
+        this.projects.some((p) => p.id === project && p.commands?.some((cmd) => cmd.name === name));
+      if (!stillConfigured() || this.readOnly || this.hasRunningOp(project)) return;
+      if (previous) previous.restarting = true;
+      try {
+        if (!(await this.cancelLifecycle(key))) return;
+        // A directory/project/command may disappear while cancellation waits,
+        // or another action may replace the slot. Neither should resurrect it.
+        if (!stillConfigured() || this.readOnly || this.hasRunningOp(project)) return;
+        if (this.operations[key]?.token !== previous?.token) return;
+        await this.runLifecycle(key, name, { type: "runProjectCommand", id: project, name });
+      } finally {
+        if (previous && this.operations[key]?.token === previous.token) previous.restarting = false;
       }
     },
 
     async openLogs(project: ProjectId, service: string): Promise<void> {
-      await this.closeLogs();
+      const previous = this.logs;
       const token = ++nextToken;
       this.logs = { token, project, service, handle: null, lines: [] };
       const current = (): LogView | null =>
         this.logs && this.logs.token === token ? this.logs : null;
+      if (previous?.handle != null) {
+        try {
+          await stopLogStream(previous.handle);
+        } catch {
+          // Stream teardown is best-effort.
+        }
+      }
+      if (!current()) return;
       try {
         const handle = await streamServiceLogs(project, service, 100, (line) => {
           const view = current();
@@ -822,8 +985,9 @@ export const useEngineStore = defineStore("engine", {
         if (view) view.handle = handle;
         else await stopLogStream(handle); // panel closed while the stream opened
       } catch (e) {
+        if (!current()) return;
         this.error = e instanceof Error ? e.message : String(e);
-        if (current()) this.logs = null;
+        this.logs = null;
       }
     },
 

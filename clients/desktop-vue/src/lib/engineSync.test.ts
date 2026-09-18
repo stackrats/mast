@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type {
   EnginePatch,
@@ -153,6 +153,69 @@ describe("EngineSync protocol", () => {
     sync.handleItem(1, patchItem(statusPatch(11))); // contiguous: applied
     expect(sink.applied).toEqual([11]);
     expect(sync.seq).toBe(11);
+  });
+
+  it("replaces a stream that overflows while its snapshot is loading", async () => {
+    const transport = new FakeTransport([snap(5), snap(8)]);
+    const sink = new RecordingSink();
+    const sync = new EngineSync(transport, sink);
+    transport.onStart = (id) => {
+      if (id === 1) sync.handleItem(id, { type: "resyncRequired" });
+    };
+
+    await sync.connect();
+
+    expect(transport.streams.map((stream) => stream.id)).toEqual([1, 2]);
+    expect(sink.resets).toEqual([8]);
+    expect(sync.resyncs).toBe(1);
+    expect(sync.phase).toBe("live");
+    sync.handleItem(2, patchItem(statusPatch(9)));
+    expect(sink.applied).toEqual([9]);
+  });
+
+  it.each(["startPatchStream", "snapshot"] as const)(
+    "leaves a failed %s retryable and ignores its stale stream",
+    async (method) => {
+      const transport = new FakeTransport([snap(10)]);
+      const sink = new RecordingSink();
+      const error = vi.fn();
+      const sync = new EngineSync(transport, {
+        reset: (s) => sink.reset(s),
+        apply: (p) => sink.apply(p),
+        error,
+      });
+      vi.spyOn(transport, method).mockRejectedValueOnce(new Error("offline"));
+
+      await expect(sync.connect()).rejects.toThrow("offline");
+      expect(sync.phase).toBe("error");
+      expect(error).toHaveBeenCalledOnce();
+      sync.handleItem(1, patchItem(statusPatch(1)));
+      expect(sink.applied).toEqual([]);
+
+      await sync.connect();
+      expect(sync.phase).toBe("live");
+      expect(sync.seq).toBe(10);
+    },
+  );
+
+  it("reports a failed background resync without leaving the UI connecting forever", async () => {
+    const transport = new FakeTransport([snap(10)]);
+    const sink = new RecordingSink();
+    const error = vi.fn();
+    const sync = new EngineSync(transport, {
+      reset: (s) => sink.reset(s),
+      apply: (p) => sink.apply(p),
+      error,
+    });
+    await sync.connect();
+    vi.spyOn(transport, "snapshot").mockRejectedValueOnce(new Error("offline"));
+
+    sync.handleItem(1, patchItem(statusPatch(12)));
+    await vi.waitFor(() => expect(sync.phase).toBe("error"));
+    expect(error).toHaveBeenCalledOnce();
+
+    await sync.connect();
+    expect(sync.phase).toBe("live");
   });
 });
 

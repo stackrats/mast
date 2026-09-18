@@ -42,6 +42,22 @@ pub const PROCESSES: &[ProcessDef] = &[
     },
 ];
 
+/// Application code and boot inputs held in memory by artisan daemons.
+/// Generated caches/logs and dependency trees must not trigger restart loops.
+pub const RESTART_PATTERNS: &[&str] = &[
+    "app/**",
+    "config/**",
+    "routes/**",
+    "database/**",
+    "resources/views/**",
+    "bootstrap/app.php",
+    "bootstrap/providers.php",
+    ".env",
+    "composer.json",
+    "composer.lock",
+    "artisan",
+];
+
 pub fn process_def(id: &str) -> Option<&'static ProcessDef> {
     PROCESSES.iter().find(|def| def.id == id)
 }
@@ -114,6 +130,19 @@ pub const DEV_STACK_PATTERNS: &[&str] = &[
 /// an already-stopped process is a no-op, not a failure.
 pub fn kill_script(pattern: &str) -> String {
     kill_script_matching(&[pattern])
+}
+
+/// Signal the old daemon and wait for it to release its sockets before a
+/// replacement starts. Zombies have already exited and must not delay us.
+pub fn stop_script(pattern: &str) -> String {
+    let kill = kill_script(pattern);
+    let signal = kill.trim_end_matches("; exit 0").replace(
+        "kill \"$pid\" 2>/dev/null",
+        "kill \"$pid\" 2>/dev/null; stopped=\"$stopped $pid\"",
+    );
+    format!(
+        r#"stopped=""; {signal}; remaining=10; while [ "$remaining" -gt 0 ]; do alive=""; for pid in $stopped; do [ -r "/proc/$pid/stat" ] || continue; state=$(cat "/proc/$pid/stat" 2>/dev/null); case "${{state##*) }}" in Z*|X*|"") continue;; esac; kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done; [ -z "$alive" ] && exit 0; stopped="$alive"; remaining=$((remaining - 1)); sleep 1; done; echo "process did not stop within 10 seconds:$stopped" >&2; exit 1"#
+    )
 }
 
 /// [`kill_script`] over several patterns in one pass — a single /proc walk
@@ -272,6 +301,27 @@ mod tests {
         // Self-exclusion: the killer's own cmdline matches the pattern.
         assert!(script.contains(r#"[ "$pid" = "$$" ] && continue"#), "{script}");
         assert!(script.ends_with("exit 0"), "{script}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_script_waits_for_graceful_shutdown() {
+        let marker = format!("mast-delayed-stop-test-{}", std::process::id());
+        let mut daemon = std::process::Command::new("sh")
+            .args(["-c", "trap 'sleep 1; exit 0' TERM; while :; do sleep 0.05; done"])
+            .arg(&marker)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let status =
+            std::process::Command::new("sh").args(["-c", &stop_script(&marker)]).status().unwrap();
+        assert!(status.success(), "stop script failed: {status:?}");
+        let exited = daemon.try_wait().unwrap();
+        if exited.is_none() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(exited.is_some(), "stop returned before the daemon exited");
     }
 
     /// The real thing, on the host: a decoy process matching the pattern is

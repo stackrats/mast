@@ -275,9 +275,13 @@ async fn file_watcher_loop(engine: Engine, hint_tx: mpsc::Sender<()>) {
                             ok = false;
                         }
                     }
-                    if ok || !desired.is_empty() {
-                        _debouncer = Some(new_debouncer);
+                    _debouncer = Some(new_debouncer);
+                    // Retain successful watches, but retry missing paths on
+                    // the next pass (renames and temporarily absent mounts).
+                    if ok {
                         watched = desired;
+                    } else {
+                        watched.clear();
                     }
                 }
                 Err(e) => tracing::warn!("file watcher unavailable: {e}"),
@@ -346,7 +350,8 @@ async fn reconcile(engine: &Engine) {
     // ---- discovery (blocking fs) ----
     let directories: Vec<PathBuf> =
         engine.inner.state.lock().unwrap().watched_directories.clone();
-    let candidates = tokio::task::spawn_blocking(move || mast_project::scan_directories(&directories))
+    let scan_directories = directories.clone();
+    let candidates = tokio::task::spawn_blocking(move || mast_project::scan_directories(&scan_directories))
         .await
         .unwrap_or_default();
 
@@ -378,7 +383,11 @@ async fn reconcile(engine: &Engine) {
     let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
     // The committed mast.yml's contribution (commands + its own warnings).
     let mut manifests: HashMap<String, crate::manifest::Manifest> = HashMap::new();
+    let mut missing_directories = Vec::new();
     for (id, dir) in &project_dirs {
+        if !dir.is_dir() {
+            missing_directories.push(id.clone());
+        }
         let env = process_env.clone();
         let dir = dir.clone();
         let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php, manifest) =
@@ -560,7 +569,7 @@ async fn reconcile(engine: &Engine) {
                 is_sail: c.is_sail,
             })
             .collect();
-        if st.discovered != discovered {
+        if st.watched_directories == directories && st.discovered != discovered {
             st.discovered = discovered.clone();
             events.push(PatchEvent::DiscoveryChanged { discovered });
         }
@@ -571,6 +580,9 @@ async fn reconcile(engine: &Engine) {
         let crash_notices = engine.inner.crash_notices.lock().unwrap().clone();
         for entry in st.projects.values_mut() {
             let id = entry.record.id.clone();
+            // Diff against the previous summary, including resolution errors.
+            // Mutating entry.summary before this copy hid error-only patches.
+            let mut summary = entry.summary.clone();
             if let Some(redactor) = redactors.get(&id) {
                 entry.redactor = redactor.clone();
             }
@@ -587,18 +599,18 @@ async fn reconcile(engine: &Engine) {
                             entry.model = Some(model.clone());
                             entry.compose_fingerprint =
                                 fingerprints.get(&id).copied().flatten();
-                            entry.summary.resolution_error = None;
+                            summary.resolution_error = None;
                         }
                         Some(Err(e)) => {
-                            entry.summary.resolution_error = Some(entry.redactor.redact(e));
+                            summary.resolution_error = Some(entry.redactor.redact(e));
                         }
-                        None => entry.summary.resolution_error = None,
+                        None => summary.resolution_error = None,
                     }
                 }
                 Some(Err(e)) => {
                     entry.invocation = None;
                     entry.model = None;
-                    entry.summary.resolution_error = Some(entry.redactor.redact(e));
+                    summary.resolution_error = Some(entry.redactor.redact(e));
                 }
                 None => {}
             }
@@ -610,7 +622,6 @@ async fn reconcile(engine: &Engine) {
                 entry.host_ports = merge_host_ports(env_ports, port_keys, entry.model.as_ref());
             }
 
-            let mut summary = entry.summary.clone();
             summary.compose_project_name =
                 entry.invocation.as_ref().map(|i| i.project_name.clone());
             summary.is_sail = entry
@@ -693,6 +704,16 @@ async fn reconcile(engine: &Engine) {
                 summary.status = derive_status(&summary.services);
             }
 
+            if missing_directories.contains(&id) {
+                summary.resolution_error = Some(format!(
+                    "project directory is missing: {} — restore it or import its new location",
+                    entry.record.path.display()
+                ));
+                summary.services.clear();
+                summary.processes.clear();
+                summary.status = mast_contract::ProjectStatus::Failed;
+            }
+
             if entry.summary != summary {
                 entry.summary = summary.clone();
                 events.push(PatchEvent::ProjectUpdated { project: summary });
@@ -707,6 +728,9 @@ async fn reconcile(engine: &Engine) {
         }
         capture_requests
     });
+    for project in missing_directories {
+        engine.cancel_project_operations(&mast_contract::ProjectId(project), None);
+    }
     // Off the lock: read each dead container's tail before anything removes
     // it. Detached, because a reconcile must not wait on docker logs.
     //
@@ -857,7 +881,9 @@ fn merge_host_ports(
 /// same-name projects in different directories).
 fn observation_belongs_to(observation: &ContainerObservation, project_dir: &str) -> bool {
     observation.working_dir.as_deref() == Some(project_dir)
-        || observation.config_files.iter().any(|f| f.starts_with(project_dir))
+        || observation.config_files.iter().any(|f| {
+            std::path::Path::new(f).starts_with(std::path::Path::new(project_dir))
+        })
 }
 
 /// Union of declared services (resolved model) and observed containers.
@@ -954,6 +980,20 @@ mod tests {
         CommandError, DockerError, build_services, connect_error_text, merge_host_ports,
         parse_git_status,
     };
+
+    #[test]
+    fn container_association_respects_directory_boundaries() {
+        let mut observed = mast_docker::ContainerObservation {
+            id: "container".into(), name: "app".into(), project: "app".into(),
+            service: "app".into(), config_files: vec!["/code/app-other/compose.yaml".into()],
+            working_dir: Some("/code/app-other".into()), state: "running".into(),
+            health: None, exit_code: None, config_hash: None, networks: Vec::new(),
+            published_ports: Vec::new(),
+        };
+        assert!(!super::observation_belongs_to(&observed, "/code/app"));
+        observed.config_files = vec!["/code/app/compose.yaml".into()];
+        assert!(super::observation_belongs_to(&observed, "/code/app"));
+    }
 
     fn model(services: &[(&str, &[u16])]) -> mast_compose::ResolvedModel {
         mast_compose::ResolvedModel {
