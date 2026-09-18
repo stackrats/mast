@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { CircleStop, Network, Pencil, Play, Trash2, TriangleAlert, X } from "lucide-vue-next";
+import {
+  CircleStop,
+  Loader2,
+  Network,
+  Pencil,
+  Play,
+  Trash2,
+  TriangleAlert,
+  X,
+} from "lucide-vue-next";
 
 import type { ProjectId, WorkspaceSummary } from "../bindings";
 import { statusBadgeVariant } from "../lib/status";
@@ -70,7 +79,12 @@ function projectName(id: string): string {
         <h1 class="truncate text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100">
           {{ workspace.name }}
         </h1>
-        <Badge :variant="statusBadgeVariant[workspace.status]" class="shrink-0">
+        <Badge v-if="opRunning" variant="warning" class="shrink-0">
+          <Loader2 class="h-3 w-3 animate-spin" />
+          {{ op?.cancelling ? "cancelling" : op?.label }}
+        </Badge>
+        <Badge v-else :variant="statusBadgeVariant[workspace.status]" class="shrink-0">
+          <Loader2 v-if="workspace.status === 'starting'" class="h-3 w-3 animate-spin" />
           {{ workspace.status }}
         </Badge>
         <Hint
@@ -79,8 +93,12 @@ function projectName(id: string): string {
       </div>
       <div v-if="!store.readOnly" class="flex gap-2">
         <template v-if="opRunning">
-          <Button variant="destructive" @click="store.cancelLifecycle(workspace.id)">
-            <X class="h-3.5 w-3.5" /> Cancel
+          <Button
+            variant="destructive"
+            :disabled="op?.cancelling"
+            @click="store.cancelLifecycle(workspace.id)"
+          >
+            <X class="h-3.5 w-3.5" /> {{ op?.cancelling ? "Cancelling…" : "Cancel" }}
           </Button>
         </template>
         <template v-else>
@@ -151,9 +169,13 @@ function projectName(id: string): string {
     >
       <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
         {{ op.label }}
-        <span v-if="opRunning" class="text-amber-600">running…</span>
-        <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700">cancelled</span>
-        <span v-else class="text-red-700">failed: {{ op.error }}</span>
+        <span v-if="opRunning" class="text-amber-600 dark:text-amber-400">{{
+          op.cancelling ? "cancelling…" : "running…"
+        }}</span>
+        <span v-else-if="op.terminal === 'cancelled'" class="text-amber-700 dark:text-amber-300"
+          >cancelled</span
+        >
+        <span v-else class="text-red-700 dark:text-red-300">failed: {{ op.error }}</span>
       </p>
     </div>
 

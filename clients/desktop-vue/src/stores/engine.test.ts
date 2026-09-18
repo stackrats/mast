@@ -2,8 +2,14 @@ import { computed } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { LogCapture, OperationEvent } from "../bindings";
-import { useEngineStore } from "./engine";
+import type {
+  EngineSnapshot,
+  HistoryEntry,
+  LogCapture,
+  OperationEvent,
+  ProjectSummary,
+} from "../bindings";
+import { processKey, useEngineStore } from "./engine";
 
 // The store must work against Pinia's reactive proxies — the regression this
 // suite guards (op/log views compared by object identity dropped every event).
@@ -39,19 +45,216 @@ vi.mock("../lib/transport", () => ({
   stopUsageStream: vi.fn(async () => {}),
 }));
 
-import { dispatchAction, streamServiceLogs, stopLogStream } from "../lib/transport";
+import {
+  cancelOperation,
+  dispatchAction,
+  streamServiceLogs,
+  stopLogStream,
+} from "../lib/transport";
 import { notify } from "../lib/notify";
 
 const dispatchMock = vi.mocked(dispatchAction);
 const streamLogsMock = vi.mocked(streamServiceLogs);
 const stopLogsMock = vi.mocked(stopLogStream);
 
+describe("command cancellation and restart", () => {
+  const key = "p1:cmd:dev";
+  const action = { type: "runProjectCommand", id: "p1", name: "dev" } as const;
+  const cancelMock = vi.mocked(cancelOperation);
+
+  function commandStore() {
+    const store = useEngineStore();
+    store.projects = [{ id: "p1", commands: [{ name: "dev" }] }] as never;
+    return store;
+  }
+
+  it("waits for the old process to finish and ignores repeated Restart clicks", async () => {
+    const events: ((event: OperationEvent) => void)[] = [];
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      events.push(onEvent);
+      return events.length;
+    });
+    const store = commandStore();
+    await store.runLifecycle(key, "dev", action);
+
+    const restarting = store.restartCommand("p1", "dev");
+    await vi.waitFor(() => expect(cancelMock).toHaveBeenCalledWith(1));
+    await store.restartCommand("p1", "dev");
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(store.operations[key].cancelling).toBe(true);
+    expect(store.operations[key].restarting).toBe(true);
+
+    events[0]({ operation: 1, kind: { type: "cancelled" } });
+    await restarting;
+    expect(dispatchMock).toHaveBeenCalledTimes(2);
+    expect(store.operations[key].id).toBe(2);
+    expect(store.operations[key].terminal).toBeNull();
+    expect(store.operations[key].restarting).toBeFalsy();
+  });
+
+  it("honors Stop even when it is clicked before dispatch supplies an id", async () => {
+    let resolveDispatch!: (id: number) => void;
+    let emit!: (event: OperationEvent) => void;
+    dispatchMock.mockImplementation((_action, onEvent) => {
+      emit = onEvent;
+      return new Promise((resolve) => {
+        resolveDispatch = resolve;
+      });
+    });
+    const store = commandStore();
+    const starting = store.runLifecycle(key, "dev", action);
+    const stopping = store.cancelLifecycle(key);
+    expect(cancelMock).not.toHaveBeenCalled();
+    expect(store.operations[key].cancelling).toBe(true);
+    resolveDispatch(17);
+    await starting;
+    await vi.waitFor(() => expect(cancelMock).toHaveBeenCalledWith(17));
+    emit({ operation: 17, kind: { type: "cancelled" } });
+    expect(await stopping).toBe(true);
+    expect(store.operations[key].cancelling).toBe(false);
+  });
+
+  it("keeps the existing process tracked when cancellation fails", async () => {
+    dispatchMock.mockResolvedValue(1);
+    cancelMock.mockRejectedValueOnce(new Error("transport disconnected"));
+    const store = commandStore();
+    await store.runLifecycle(key, "dev", action);
+    await store.restartCommand("p1", "dev");
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(store.error).toBe("transport disconnected");
+    expect(store.operations[key].terminal).toBeNull();
+    expect(store.operations[key].restarting).toBe(false);
+    expect(store.operations[key].cancelling).toBe(false);
+  });
+
+  it("does not restart a project removed during cancellation", async () => {
+    dispatchMock.mockResolvedValue(1);
+    const store = commandStore();
+    await store.runLifecycle(key, "dev", action);
+    const restarting = store.restartCommand("p1", "dev");
+    await vi.waitFor(() => expect(cancelMock).toHaveBeenCalledWith(1));
+    store.applyPatch({ seq: 1, event: { type: "projectRemoved", id: "p1" } });
+    await restarting;
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(store.operations[key]).toBeUndefined();
+  });
+
+  it("does not restart when the old command fails to stop inside its container", async () => {
+    let emit!: (event: OperationEvent) => void;
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      emit = onEvent;
+      return 1;
+    });
+    const store = commandStore();
+    await store.runLifecycle(key, "dev", action);
+    const restarting = store.restartCommand("p1", "dev");
+    await vi.waitFor(() => expect(cancelMock).toHaveBeenCalledWith(1));
+    emit({ operation: 1, kind: { type: "failed", error: "container command did not stop" } });
+    await restarting;
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(store.operations[key].terminal).toBe("failed");
+    expect(store.operations[key].error).toBe("container command did not stop");
+  });
+
+  it("does not replace an operation started while cancellation was pending", async () => {
+    dispatchMock.mockResolvedValue(1);
+    const store = commandStore();
+    await store.runLifecycle(key, "dev", action);
+    const restarting = store.restartCommand("p1", "dev");
+    await vi.waitFor(() => expect(cancelMock).toHaveBeenCalledWith(1));
+    dispatchMock.mockResolvedValue(2);
+    await store.runLifecycle(key, "dev", action);
+    await restarting;
+    expect(dispatchMock).toHaveBeenCalledTimes(2);
+    expect(store.operations[key].id).toBe(2);
+  });
+
+  it("reports a missing terminal event without launching a second process", async () => {
+    vi.useFakeTimers();
+    try {
+      dispatchMock.mockResolvedValue(1);
+      const store = commandStore();
+      await store.runLifecycle(key, "dev", action);
+      const restarting = store.restartCommand("p1", "dev");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await restarting;
+      expect(dispatchMock).toHaveBeenCalledTimes(1);
+      expect(store.error).toContain("Timed out");
+      expect(store.operations[key].cancelling).toBe(false);
+      expect(store.operations[key].restarting).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 beforeEach(() => {
   setActivePinia(createPinia());
   vi.clearAllMocks();
 });
 
+function summary(id: string): ProjectSummary {
+  return {
+    id,
+    name: id,
+    path: `/code/${id}`,
+    status: "running",
+    composeProjectName: id,
+    isSail: true,
+    services: [],
+    resolutionError: null,
+    warnings: [],
+  };
+}
+
+function snapshot(projects: ProjectSummary[]): EngineSnapshot {
+  return {
+    protocolVersion: 1,
+    seq: 1,
+    readOnly: false,
+    docker: { available: true, contextName: "default", endpoint: null, error: null, reason: null },
+    integrations: { terminal: null, editor: null, autoPortRemap: true },
+    watchedDirectories: [],
+    discovered: [],
+    projects,
+    workspaces: [],
+  };
+}
+
 describe("runLifecycle", () => {
+  it("keeps a failed dispatch visible as a finished failure", async () => {
+    dispatchMock.mockRejectedValueOnce(new Error("dispatch unavailable"));
+    const store = useEngineStore();
+
+    await store.runLifecycle("p1", "start", { type: "startProject", id: "p1" });
+
+    expect(store.hasRunningOp("p1")).toBe(false);
+    expect(store.operations.p1.terminal).toBe("failed");
+    expect(store.operations.p1.error).toBe("dispatch unavailable");
+    expect(store.activity.at(-1)?.line).toContain("dispatch unavailable");
+  });
+
+  it("ignores dispatch failures from a superseded operation", async () => {
+    let rejectFirst!: (error: Error) => void;
+    dispatchMock.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectFirst = reject;
+        }),
+    );
+    dispatchMock.mockResolvedValueOnce(2);
+    const store = useEngineStore();
+    const first = store.runLifecycle("p1", "start", { type: "startProject", id: "p1" });
+    await store.runLifecycle("p1", "stop", { type: "stopProject", id: "p1" });
+
+    rejectFirst(new Error("old request failed"));
+    await first;
+
+    expect(store.error).toBeNull();
+    expect(store.operations.p1.id).toBe(2);
+    expect(store.operations.p1.terminal).toBeNull();
+  });
+
   it("records output and terminal events on the reactive view", async () => {
     let emit: ((event: OperationEvent) => void) | null = null;
     dispatchMock.mockImplementation(async (_action, onEvent) => {
@@ -121,6 +324,22 @@ describe("runLifecycle", () => {
 });
 
 describe("hasRunningOp", () => {
+  it("does not lock the project while a Laravel daemon remains supervised", async () => {
+    dispatchMock.mockResolvedValueOnce(7);
+    const store = useEngineStore();
+    const key = processKey("p1", "horizon");
+
+    await store.runLifecycle(key, "start Horizon", {
+      type: "startProcess",
+      id: "p1",
+      process: "horizon",
+    });
+
+    expect(store.hasRunningOp(key)).toBe(true);
+    expect(store.hasRunningOp("p1")).toBe(false);
+    expect(store.operations[key].actionType).toBe("startProcess");
+  });
+
   it("is true only between dispatch and the terminal event", async () => {
     let emit: ((event: OperationEvent) => void) | null = null;
     dispatchMock.mockImplementation(async (_action, onEvent) => {
@@ -346,6 +565,49 @@ describe("command ordering", () => {
 });
 
 describe("logs", () => {
+  it("keeps the latest service when an earlier stream teardown is slow", async () => {
+    streamLogsMock.mockResolvedValueOnce(1).mockResolvedValueOnce(3);
+    const store = useEngineStore();
+    await store.openLogs("p1", "api");
+
+    let finishStop!: () => void;
+    stopLogsMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishStop = resolve;
+        }),
+    );
+    const older = store.openLogs("p1", "queue");
+    await store.openLogs("p1", "redis");
+    finishStop();
+    await older;
+
+    expect(store.logs?.service).toBe("redis");
+    expect(store.logs?.handle).toBe(3);
+    expect(streamLogsMock.mock.calls.map((call) => call[1])).toEqual(["api", "redis"]);
+  });
+
+  it("does not reopen logs closed during the previous stream's teardown", async () => {
+    streamLogsMock.mockResolvedValueOnce(1);
+    const store = useEngineStore();
+    await store.openLogs("p1", "api");
+
+    let finishStop!: () => void;
+    stopLogsMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishStop = resolve;
+        }),
+    );
+    const opening = store.openLogs("p1", "queue");
+    await store.closeLogs();
+    finishStop();
+    await opening;
+
+    expect(store.logs).toBeNull();
+    expect(streamLogsMock).toHaveBeenCalledTimes(1);
+  });
+
   it("appends streamed lines to the reactive view", async () => {
     let emit: ((line: { service: string; message: string; stderr: boolean }) => void) | null = null;
     streamLogsMock.mockImplementation(async (_p, _s, _tail, onLine) => {
@@ -382,6 +644,81 @@ describe("logs", () => {
     await opening;
     expect(store.logs).toBeNull();
     expect(stopLogsMock).toHaveBeenCalledWith(5);
+  });
+});
+
+describe("removed project views", () => {
+  it.each(["patch", "snapshot"])(
+    "cleans selection, operations, attention and logs after a %s",
+    async (source) => {
+      let emit!: (event: OperationEvent) => void;
+      dispatchMock.mockImplementationOnce(async (_action, onEvent) => {
+        emit = onEvent;
+        return 7;
+      });
+      streamLogsMock.mockResolvedValueOnce(9);
+      const store = useEngineStore();
+      store.projects = [summary("p1"), summary("p2")];
+      store.selection = { kind: "project", id: "p1" };
+      store.attention.p1 = ["failed"];
+      store.attention.p2 = ["recovered"];
+      await store.runLifecycle("p1:cmd:dev", "dev", {
+        type: "runProjectCommand",
+        id: "p1",
+        name: "dev",
+      });
+      await store.openLogs("p1", "app");
+
+      if (source === "patch")
+        store.applyPatch({ seq: 1, event: { type: "projectRemoved", id: "p1" } });
+      else store.applySnapshot(snapshot([summary("p2")]));
+
+      expect(store.selection).toEqual({ kind: "home" });
+      expect(store.operations["p1:cmd:dev"]).toBeUndefined();
+      expect(store.attention.p1).toBeUndefined();
+      expect(store.attention.p2).toEqual(["recovered"]);
+      expect(store.logs).toBeNull();
+      expect(stopLogsMock).toHaveBeenCalledWith(9);
+      const activityCount = store.activity.length;
+      emit({ operation: 7, kind: { type: "output", line: "old output", stderr: false } });
+      expect(store.activity).toHaveLength(activityCount);
+    },
+  );
+
+  it("returns home when the selected workspace disappears", () => {
+    const store = useEngineStore();
+    store.selection = { kind: "workspace", id: "removed" };
+    store.applyPatch({ seq: 1, event: { type: "workspacesChanged", workspaces: [] } });
+    expect(store.selection).toEqual({ kind: "home" });
+  });
+
+  it("stops waiting to auto-start a command when its project disappears", async () => {
+    const store = useEngineStore();
+    store.projects = [
+      {
+        ...summary("p1"),
+        commands: [
+          { name: "build", command: "vp build", autoStart: true },
+          { name: "dev", command: "vp dev", autoStart: true, after: "build" },
+        ],
+      },
+    ];
+    const pending = store.autoStartCommand("p1", store.projects[0].commands![1]);
+    store.applyPatch({ seq: 1, event: { type: "projectRemoved", id: "p1" } });
+
+    await pending;
+
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("history ordering", () => {
+  it("does not revive a completed command when an older backlog arrives", () => {
+    const store = useEngineStore();
+    const finished = { id: 1, outcome: { type: "exited", status: 0 } } as HistoryEntry;
+    store.upsertHistory(finished);
+    store.upsertHistory({ ...finished, outcome: { type: "running" } });
+    expect(store.history[0].outcome).toEqual({ type: "exited", status: 0 });
   });
 });
 

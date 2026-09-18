@@ -652,7 +652,7 @@ impl Engine {
 
     /// Start a Laravel app process: `sail artisan …` (terminal parity) for
     /// sail projects, `docker compose exec -T <app> php artisan …` otherwise.
-    /// Streams until the process exits or the operation is cancelled.
+    /// Watches application code until the process exits or is stopped.
     pub(crate) async fn start_process(
         &self,
         handle: &Arc<OpHandle>,
@@ -664,14 +664,15 @@ impl Engine {
             ErrorInfo::InvalidInput { message: format!("unknown process {process}") }
         })?;
         let (invocation, dir, redactor) = self.process_context(project)?;
+        let _run = crate::supervise::ProcessRun::register(self, project, process, op)?;
         let app_service = app_service_of(&dir);
         let argv = match &invocation.runner {
-            mast_compose::Runner::Sail { script } => {
+            mast_compose::Runner::Sail { script } if cfg!(unix) => {
                 let mut argv = vec![script.to_string_lossy().into_owned(), "artisan".into()];
                 argv.extend(def.artisan.iter().map(|s| s.to_string()));
                 argv
             }
-            mast_compose::Runner::DockerCompose => {
+            _ => {
                 let mut tail = vec!["php".to_string(), "artisan".to_string()];
                 tail.extend(def.artisan.iter().map(|s| s.to_string()));
                 compose_exec_argv(&invocation, &app_service, &tail)
@@ -682,11 +683,13 @@ impl Engine {
             op,
             OperationEventKind::Output { line: format!("$ {}", argv.join(" ")), stderr: false },
         );
-        // Processes run until stopped; a week ≈ unbounded.
-        self.run_streamed_command(handle, op, &argv, Some(&dir), &redactor, Duration::from_secs(7 * 24 * 3600))
-            .await?;
+        let container = self.process_container_id(project, &app_service);
+        let stop_argv = process_stop_argv(&invocation, &app_service, def, container.as_deref());
+        let result = self
+            .supervise_process(handle, op, def, &argv, &stop_argv, &dir, &redactor)
+            .await;
         self.hint();
-        Ok(())
+        result
     }
 
     /// Stop a Laravel app process by cmdline match inside the app container —
@@ -702,35 +705,61 @@ impl Engine {
         let def = mast_laravel::processes::process_def(process).ok_or_else(|| {
             ErrorInfo::InvalidInput { message: format!("unknown process {process}") }
         })?;
-        let (invocation, dir, _redactor) = self.process_context(project)?;
+        let (invocation, dir, _) = self.process_context(project)?;
         let app_service = app_service_of(&dir);
-        let tail = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            mast_laravel::processes::kill_script(def.pattern),
-        ];
-        let argv = compose_exec_argv(&invocation, &app_service, &tail);
-        let out = mast_docker::run_command(&argv, Some(&dir), &[], Duration::from_secs(15), 64 * 1024)
+        let container = self.process_container_id(project, &app_service);
+        let stop_argv = process_stop_argv(&invocation, &app_service, def, container.as_deref());
+        // End the supervisor before signalling the daemon, otherwise an
+        // overlapping file change could immediately bring it back.
+        let (_stopping, active) = crate::supervise::ProcessRun::stopping(self, project, process, op);
+        let cleaned = if let Some(active) = active {
+            self.cancel(active)?;
+            let mut events = self.operation_events(active)?;
+            tokio::time::timeout(Duration::from_secs(25), async {
+                while let Some(event) = events.next().await {
+                    match event.kind {
+                        OperationEventKind::Cancelled => return Ok(true),
+                        OperationEventKind::Completed => return Ok(false),
+                        OperationEventKind::Failed { error } => {
+                            handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(ErrorInfo::Internal { message: error });
+                        }
+                        _ => {}
+                    }
+                }
+                Err(ErrorInfo::Internal {
+                    message: "process operation ended without a terminal event".into(),
+                })
+            })
             .await
-            .map_err(internal_err)?;
-        if !out.success() {
-            let detail = if out.stderr.trim().is_empty() {
-                format!("exec exited with status {}", out.status)
-            } else {
-                out.stderr.trim().to_string()
-            };
-            return Err(ErrorInfo::Internal { message: format!("stop failed: {detail}") });
+            .map_err(|_| ErrorInfo::Internal {
+                message: format!("{} is still stopping", def.title),
+            })??
+        } else {
+            false
+        };
+        if !cleaned
+            && let Err(error) = run_process_stop(&stop_argv, &dir).await
+        {
+            handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(error);
         }
         self.emit_op(
             handle,
             op,
             OperationEventKind::Output {
-                line: format!("{} signalled to stop", def.title),
+                line: format!("{} stopped", def.title),
                 stderr: false,
             },
         );
         self.hint();
         Ok(())
+    }
+
+    fn process_container_id(&self, project: &ProjectId, app_service: &str) -> Option<String> {
+        self.inner.state.lock().unwrap().projects.get(&project.0)
+            .and_then(|entry| entry.summary.services.iter().find(|service| service.name == app_service))
+            .and_then(|service| service.container_id.clone())
     }
 
     /// Run one user-defined command (M7.5): whitespace-split argv, no shell;
@@ -762,7 +791,15 @@ impl Engine {
         };
         let command = cmd.command.clone();
         let cwd = cmd.cwd.clone();
+        // A terminal failure can still have a live container process behind
+        // it. Retrying Run must finish that exact process family's cleanup
+        // before a replacement is allowed to start.
+        if let Err(error) = self.retry_failed_command_cleanup(project, name).await {
+            handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(error);
+        }
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
+        let mut stop_argv = None;
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
         }
@@ -803,28 +840,32 @@ impl Engine {
                         .into(),
                 });
             }
-            #[cfg(unix)]
-            {
-                argv[0] = script.to_string_lossy().into_owned();
-            }
-            // Windows cannot execute the bash wrapper (CreateProcess error
-            // 193) — map the command onto what the wrapper would have run:
-            // compose verbs pass through the resolved invocation, everything
-            // else execs in the app service (sail's own dispatch for
-            // artisan/php/composer/npm).
-            #[cfg(not(unix))]
-            {
-                let invocation = invocation.ok_or_else(|| ErrorInfo::InvalidInput {
-                    message: "project not resolved yet".into(),
-                })?;
-                argv = sail_fallback_argv(&invocation, &app_service_of(&path), &argv[1..])
-                    .ok_or_else(|| ErrorInfo::InvalidInput {
-                        message: "sail needs a subcommand".into(),
+            let app_service = app_service_of(&path);
+            let container = self.process_container_id(project, &app_service);
+            if let Some(managed) = crate::custom_command::prepare(
+                &path, invocation.as_ref(), &app_service, container.as_deref(), &argv[1..], op,
+            )? {
+                argv = managed.argv;
+                stop_argv = Some(managed.stop_argv);
+            } else {
+                #[cfg(unix)]
+                {
+                    argv[0] = script.to_string_lossy().into_owned();
+                }
+                // Windows cannot execute the bash wrapper. Compose verbs
+                // use the resolved invocation, as Sail's passthrough does.
+                #[cfg(not(unix))]
+                {
+                    let invocation = invocation.ok_or_else(|| ErrorInfo::InvalidInput {
+                        message: "project not resolved yet".into(),
                     })?;
+                    argv = sail_fallback_argv(&invocation, &app_service, &argv[1..])
+                        .ok_or_else(|| ErrorInfo::InvalidInput {
+                            message: "sail needs a subcommand".into(),
+                        })?;
+                }
             }
         }
-        #[cfg(unix)]
-        let _ = invocation;
         self.emit_op(
             handle,
             op,
@@ -837,8 +878,17 @@ impl Engine {
                 stderr: false,
             },
         );
-        if cmd.auto_restart || !cmd.restart_when_changed.is_empty() {
-            return self.supervise_command(handle, op, &cmd, &argv, &run_dir, &redactor).await;
+        if cmd.auto_restart || !cmd.restart_when_changed.is_empty() || stop_argv.is_some() {
+            let result = self.supervise_command(handle, op, &cmd, &argv, &run_dir, &redactor, stop_argv.as_deref()).await;
+            if handle.cancel_failed.load(std::sync::atomic::Ordering::Relaxed)
+                && let Some(argv) = stop_argv
+            {
+                self.inner.failed_command_cleanup.lock().unwrap().insert(
+                    (project.0.clone(), name.to_string()),
+                    crate::custom_command::FailedCleanup { argv, dir: run_dir, operation: op },
+                );
+            }
+            return result;
         }
         // A week ≈ unbounded: dev servers run until the user stops them.
         self.run_streamed_command(handle, op, &argv, Some(&run_dir), &redactor, Duration::from_secs(7 * 24 * 3600))
@@ -1752,6 +1802,44 @@ fn sail_fallback_argv(
     Some(compose_exec_argv(invocation, app_service, &exec_tail))
 }
 
+fn process_stop_argv(
+    invocation: &ComposeInvocation,
+    app_service: &str,
+    def: &mast_laravel::processes::ProcessDef,
+    container: Option<&str>,
+) -> Vec<String> {
+    let tail = vec!["sh".into(), "-c".into(), mast_laravel::processes::stop_script(def.pattern)];
+    // Retain the observed container identity: the project may be moved or
+    // removed while running, invalidating its cwd and all Compose file paths.
+    if let Some(container) = container {
+        let mut argv = vec!["docker".into(), "exec".into(), container.into()];
+        argv.extend(tail);
+        return argv;
+    }
+    compose_exec_argv(invocation, app_service, &tail)
+}
+
+pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<(), ErrorInfo> {
+    let out = mast_docker::run_command(
+        argv,
+        dir.is_dir().then_some(dir),
+        &[],
+        Duration::from_secs(15),
+        64 * 1024,
+    )
+    .await
+    .map_err(internal_err)?;
+    if !out.success() {
+        let detail = if out.stderr.trim().is_empty() {
+            format!("exec exited with status {}", out.status)
+        } else {
+            out.stderr.trim().to_string()
+        };
+        return Err(ErrorInfo::Internal { message: format!("stop failed: {detail}") });
+    }
+    Ok(())
+}
+
 /// `docker compose <files/profiles> exec -T <service> <tail…>` — the exact
 /// resolved invocation, non-interactive.
 pub(crate) fn compose_exec_argv(
@@ -1776,6 +1864,21 @@ pub(crate) fn compose_exec_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_shutdown_keeps_container_identity_when_project_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let invocation = mast_compose::resolve_invocation(dir.path(), &Default::default()).unwrap();
+        let argv = process_stop_argv(
+            &invocation,
+            "app",
+            &mast_laravel::processes::PROCESSES[0],
+            Some("original-container"),
+        );
+        assert_eq!(&argv[..5], ["docker", "exec", "original-container", "sh", "-c"]);
+        assert!(!argv.iter().any(|arg| arg.contains("compose.yaml")));
+    }
 
     #[test]
     fn app_service_comes_from_env_with_sail_default() {
