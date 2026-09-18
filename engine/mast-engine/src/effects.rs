@@ -1274,25 +1274,18 @@ mod docker_classification_tests {
         use super::*;
         use std::os::unix::net::UnixListener;
 
-        fn tempdir() -> std::path::PathBuf {
-            let dir = std::env::temp_dir().join(format!(
-                "mast-socket-probe-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
+        fn tempdir() -> tempfile::TempDir {
+            // macOS runner TMPDIR paths can consume most of sockaddr_un's
+            // path limit before a fixture name is appended. Use a short,
+            // private directory and retain its guard through each probe.
+            tempfile::Builder::new().prefix("mast-sp-").tempdir_in("/tmp").unwrap()
         }
 
         #[test]
         fn a_socket_that_is_not_there_is_not_running() {
             let dir = tempdir();
-            let missing = dir.join("docker.sock");
+            let missing = dir.path().join("docker.sock");
             assert_eq!(probe_unix_socket(&missing), DockerUnavailable::NotRunning);
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         // The state that had Mast telling a user with a healthy daemon to
@@ -1306,12 +1299,11 @@ mod docker_classification_tests {
                 return;
             }
             let dir = tempdir();
-            let path = dir.join("docker.sock");
+            let path = dir.path().join("docker.sock");
             let _listener = UnixListener::bind(&path).unwrap();
             std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
                 .unwrap();
             assert_eq!(probe_unix_socket(&path), DockerUnavailable::PermissionDenied);
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         // A socket that answers means the transport is fine and something
@@ -1319,10 +1311,9 @@ mod docker_classification_tests {
         #[test]
         fn a_socket_that_answers_is_neither() {
             let dir = tempdir();
-            let path = dir.join("docker.sock");
+            let path = dir.path().join("docker.sock");
             let _listener = UnixListener::bind(&path).unwrap();
             assert_eq!(probe_unix_socket(&path), DockerUnavailable::Unreachable);
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         // A stale socket file outlives the daemon that created it, so "the
@@ -1330,11 +1321,10 @@ mod docker_classification_tests {
         #[test]
         fn a_stale_socket_file_is_not_running() {
             let dir = tempdir();
-            let path = dir.join("docker.sock");
+            let path = dir.path().join("docker.sock");
             let listener = UnixListener::bind(&path).unwrap();
             drop(listener);
             assert_eq!(probe_unix_socket(&path), DockerUnavailable::NotRunning);
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         #[test]
@@ -1355,7 +1345,7 @@ mod docker_classification_tests {
                 return;
             }
             let dir = tempdir();
-            let path = dir.join("docker.sock");
+            let path = dir.path().join("docker.sock");
             let _listener = UnixListener::bind(&path).unwrap();
             std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
                 .unwrap();
@@ -1364,7 +1354,6 @@ mod docker_classification_tests {
                 classify_unavailable(&api(REAL_STOPPED_DAEMON), Some(&endpoint)),
                 DockerUnavailable::PermissionDenied
             );
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         unsafe extern "C" {
