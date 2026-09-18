@@ -665,6 +665,12 @@ impl Engine {
         })?;
         let (invocation, dir, redactor) = self.process_context(project)?;
         let _run = crate::supervise::ProcessRun::register(self, project, process, op)?;
+        if let Err(error) = self.retry_failed_cleanup(
+            project, crate::custom_command::CleanupTarget::Process(process.to_string()),
+        ).await {
+            handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(error);
+        }
         let app_service = app_service_of(&dir);
         let argv = match &invocation.runner {
             mast_compose::Runner::Sail { script } if cfg!(unix) => {
@@ -688,6 +694,12 @@ impl Engine {
         let result = self
             .supervise_process(handle, op, def, &argv, &stop_argv, &dir, &redactor)
             .await;
+        if handle.cancel_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.failed_cleanup.lock().unwrap().insert(
+                (project.0.clone(), crate::custom_command::CleanupTarget::Process(process.to_string())),
+                crate::custom_command::FailedCleanup { argv: stop_argv, dir, operation: op },
+            );
+        }
         self.hint();
         result
     }
@@ -705,10 +717,6 @@ impl Engine {
         let def = mast_laravel::processes::process_def(process).ok_or_else(|| {
             ErrorInfo::InvalidInput { message: format!("unknown process {process}") }
         })?;
-        let (invocation, dir, _) = self.process_context(project)?;
-        let app_service = app_service_of(&dir);
-        let container = self.process_container_id(project, &app_service);
-        let stop_argv = process_stop_argv(&invocation, &app_service, def, container.as_deref());
         // End the supervisor before signalling the daemon, otherwise an
         // overlapping file change could immediately bring it back.
         let (_stopping, active) = crate::supervise::ProcessRun::stopping(self, project, process, op);
@@ -738,11 +746,31 @@ impl Engine {
         } else {
             false
         };
-        if !cleaned
-            && let Err(error) = run_process_stop(&stop_argv, &dir).await
-        {
-            handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(error);
+        if !cleaned {
+            // Retry the original container identity before resolving current
+            // project metadata: a moved directory must not prevent Stop.
+            let target = crate::custom_command::CleanupTarget::Process(process.to_string());
+            let retried = match self.retry_failed_cleanup(project, target.clone()).await {
+                Ok(retried) => retried,
+                Err(error) => {
+                    handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            if !retried {
+                let (invocation, dir, _) = self.process_context(project)?;
+                let app_service = app_service_of(&dir);
+                let container = self.process_container_id(project, &app_service);
+                let stop_argv = process_stop_argv(&invocation, &app_service, def, container.as_deref());
+                if let Err(error) = run_process_stop(&stop_argv, &dir).await {
+                    handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.inner.failed_cleanup.lock().unwrap().insert(
+                        (project.0.clone(), target),
+                        crate::custom_command::FailedCleanup { argv: stop_argv, dir, operation: op },
+                    );
+                    return Err(error);
+                }
+            }
         }
         self.emit_op(
             handle,
@@ -794,7 +822,9 @@ impl Engine {
         // A terminal failure can still have a live container process behind
         // it. Retrying Run must finish that exact process family's cleanup
         // before a replacement is allowed to start.
-        if let Err(error) = self.retry_failed_command_cleanup(project, name).await {
+        if let Err(error) = self.retry_failed_cleanup(
+            project, crate::custom_command::CleanupTarget::Command(name.to_string()),
+        ).await {
             handle.cancel_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(error);
         }
@@ -883,8 +913,8 @@ impl Engine {
             if handle.cancel_failed.load(std::sync::atomic::Ordering::Relaxed)
                 && let Some(argv) = stop_argv
             {
-                self.inner.failed_command_cleanup.lock().unwrap().insert(
-                    (project.0.clone(), name.to_string()),
+                self.inner.failed_cleanup.lock().unwrap().insert(
+                    (project.0.clone(), crate::custom_command::CleanupTarget::Command(name.to_string())),
                     crate::custom_command::FailedCleanup { argv, dir: run_dir, operation: op },
                 );
             }
@@ -1864,6 +1894,91 @@ pub(crate) fn compose_exec_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_daemon_cleanup_blocks_start_and_is_retried_by_stop_and_removal() {
+        use crate::custom_command::{CleanupTarget, FailedCleanup};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join("vendor/bin")).unwrap();
+        std::fs::write(project_dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let sail = project_dir.join("vendor/bin/sail");
+        std::fs::write(&sail, "#!/bin/sh\necho started >> starts\n").unwrap();
+        std::fs::set_permissions(&sail, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let engine = Engine::new(
+            crate::EngineConfig::default(),
+            crate::EngineDeps {
+                connector: Arc::new(crate::RealConnector),
+                store: mast_project::MetadataStore::open(dir.path().join("meta")).unwrap(),
+                process_env: Default::default(),
+                runner: Arc::new(crate::RealLifecycleRunner),
+                ownership: crate::acquire_ownership(Some(dir.path().join("lock"))),
+            },
+        );
+        engine.import_project_at(project_dir).await.unwrap();
+        let project = engine.snapshot().projects[0].id.clone();
+        let path = {
+            let mut state = engine.inner.state.lock().unwrap();
+            let entry = state.projects.get_mut(&project.0).unwrap();
+            entry.invocation = Some(mast_compose::resolve_invocation(&entry.record.path, &Default::default()).unwrap());
+            entry.record.path.clone()
+        };
+        let (old_op, old_handle) = engine.new_operation();
+        let pending = FailedCleanup {
+            argv: ["sh", "-c", "if [ -f allow-cleanup ]; then echo process >> cleanups; else echo 'old daemon still running' >&2; exit 1; fi"]
+                .map(String::from).to_vec(),
+            dir: path.clone(), operation: old_op,
+        };
+        assert!(run_process_stop(&pending.argv, &pending.dir).await.is_err());
+        old_handle.cancel_failed.store(true, Ordering::Relaxed);
+        let process_key = (project.0.clone(), CleanupTarget::Process("queue".into()));
+        let command_key = (project.0.clone(), CleanupTarget::Command("queue".into()));
+        let (command_op, _) = engine.new_operation();
+        {
+            let mut failed = engine.inner.failed_cleanup.lock().unwrap();
+            failed.insert(process_key.clone(), pending.clone());
+            failed.insert(command_key.clone(), FailedCleanup {
+                argv: ["sh", "-c", "echo command >> cleanups"].map(String::from).to_vec(),
+                dir: path.clone(), operation: command_op,
+            });
+        }
+        let (op, handle) = engine.new_operation();
+        let error = engine.start_process(&handle, op, &project, "queue").await.unwrap_err();
+        assert!(error.to_string().contains("old daemon still running"), "{error}");
+        assert!(!path.join("starts").exists(), "failed cleanup must block a new daemon");
+        assert!(engine.inner.failed_cleanup.lock().unwrap().contains_key(&process_key));
+
+        std::fs::write(path.join("allow-cleanup"), "").unwrap();
+        let (op, handle) = engine.new_operation();
+        engine.start_process(&handle, op, &project, "queue").await.unwrap();
+        assert_eq!(std::fs::read_to_string(path.join("starts")).unwrap(), "started\n");
+        assert!(!old_handle.cancel_failed.load(Ordering::Relaxed));
+        assert!(!engine.inner.failed_cleanup.lock().unwrap().contains_key(&process_key));
+        assert!(engine.inner.failed_cleanup.lock().unwrap().contains_key(&command_key));
+
+        // Stop can use remembered container cleanup even after the current
+        // project can no longer resolve (for example, after a directory move).
+        engine.inner.failed_cleanup.lock().unwrap().insert(process_key.clone(), pending.clone());
+        engine.inner.state.lock().unwrap().projects.get_mut(&project.0).unwrap().invocation = None;
+        let (op, handle) = engine.new_operation();
+        engine.stop_process(&handle, op, &project, "queue").await.unwrap();
+        assert!(!engine.inner.failed_cleanup.lock().unwrap().contains_key(&process_key));
+
+        // Removing a project retries both namespaces, including a command
+        // whose name happens to be the same as a built-in process.
+        engine.inner.failed_cleanup.lock().unwrap().insert(process_key, pending);
+        let (op, _) = engine.new_operation();
+        engine.remove_projects(&[project], op).await.unwrap();
+        assert!(engine.inner.failed_cleanup.lock().unwrap().is_empty());
+        assert!(engine.snapshot().projects.is_empty());
+        let cleanups = std::fs::read_to_string(path.join("cleanups")).unwrap();
+        assert_eq!(cleanups.lines().filter(|line| *line == "process").count(), 3);
+        assert_eq!(cleanups.lines().filter(|line| *line == "command").count(), 1);
+    }
 
     #[test]
     fn daemon_shutdown_keeps_container_identity_when_project_moves() {

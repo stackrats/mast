@@ -179,7 +179,9 @@ pub(crate) struct Inner {
     /// Removal reservations also block commands that do not take lifecycle
     /// locks. Held across cancellation so new processes cannot escape removal.
     removing_projects: Mutex<HashSet<String>>,
-    pub(crate) failed_command_cleanup: Mutex<HashMap<(String, String), custom_command::FailedCleanup>>,
+    pub(crate) failed_cleanup: Mutex<
+        HashMap<(String, custom_command::CleanupTarget), custom_command::FailedCleanup>,
+    >,
     /// Interrupted operations found in the journal at startup (crash
     /// recovery); surfaced as project warnings until the next lifecycle op.
     pub(crate) crash_notices: Mutex<HashMap<String, String>>,
@@ -376,7 +378,7 @@ impl Engine {
                 hint_tx: Mutex::new(None),
                 busy_projects: Mutex::new(HashSet::new()),
                 removing_projects: Mutex::new(HashSet::new()),
-                failed_command_cleanup: Mutex::new(HashMap::new()),
+                failed_cleanup: Mutex::new(HashMap::new()),
                 crash_notices: Mutex::new(crash_notices),
                 history: Mutex::new(VecDeque::new()),
                 history_tx,
@@ -1466,7 +1468,7 @@ impl Engine {
             }
         }
         for project in projects {
-            self.retry_project_command_cleanup(project).await?;
+            self.retry_project_cleanup(project).await?;
         }
         self.with_state(|st, events| {
             let removing = |id: &str| projects.iter().any(|p| p.0 == id);
