@@ -3493,8 +3493,11 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "slow-shutdown");
     let script = project.join("serve.sh");
+    // Shells can defer traps while running a foreground command. Start the
+    // child before readiness and use interruptible `wait`, then keep cleanup
+    // pending until the assertions explicitly release it.
     std::fs::write(&script,
-        "#!/bin/sh\ntrap 'echo stopping; sleep 1; exit 0' TERM\necho ready\nwhile :; do sleep 60; done\n",
+        "#!/bin/sh\ntrap 'echo stopping; while [ ! -f release-stop ]; do sleep 0.05; done; exit 0' TERM\nsleep 60 &\nchild=$!\necho ready\nwait \"$child\"\n",
     ).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
@@ -3515,7 +3518,7 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
                 if matches!(&event.kind, OperationEventKind::Output { line, .. } if line == text) {
                     return;
                 }
-                assert!(!event.kind.is_terminal(), "command exited before {text}");
+                assert!(!event.kind.is_terminal(), "command exited before {text}: {:?}", event.kind);
             }
             panic!("command output closed before {text}");
         }).await.unwrap();
@@ -3531,6 +3534,7 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
     ] {
         assert!(matches!(engine.dispatch(action), Err(ErrorInfo::Conflict { .. })));
     }
+    std::fs::write(project.join("release-stop"), "").unwrap();
     let mut removed = engine.operation_events(removing).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(event) = removed.next().await {
