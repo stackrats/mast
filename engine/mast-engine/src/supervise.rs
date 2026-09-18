@@ -441,6 +441,7 @@ fn watch(
                     continue;
                 }
                 for path in &event.paths {
+                    let path = mast_compose::strip_verbatim(path.clone());
                     let Ok(rel) = path.strip_prefix(&dir) else {
                         continue;
                     };
@@ -591,6 +592,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn application_file_changes_reach_the_watcher_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        let (changes, mut received) = mpsc::unbounded_channel();
+        let _watcher = watch(dir.path(), &["app/**".into()], changes).unwrap();
+        // The callback forwards one matching path per batch. FSEvents may
+        // report the containing directory first; either path must restart
+        // the daemon, so do not require the batch to select the filename.
+        let mut observed = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                std::fs::write(dir.path().join("app/Job.php"), "<?php // changed").unwrap();
+                tokio::select! {
+                    changed = received.recv() => {
+                        let changed = changed.expect("watch remains active");
+                        let matches = Path::new("app/Job.php").starts_with(&changed);
+                        observed.push(changed);
+                        if matches {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(WATCH_DEBOUNCE * 2) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "file writes must notify the watcher; received {observed:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn code_changes_are_received_when_watching_a_symlink_alias() {
@@ -601,17 +635,30 @@ mod tests {
         std::os::unix::fs::symlink(&source, &alias).unwrap();
         let (changes, mut received) = mpsc::unbounded_channel();
         let _watcher = watch(&alias, &["app/**".into()], changes).unwrap();
-        std::fs::write(source.join("app/Job.php"), "<?php // changed").unwrap();
-        tokio::time::timeout(Duration::from_secs(8), async {
+        let mut observed = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let changed = received.recv().await.expect("watch remains active");
-                if Path::new(&changed) == Path::new("app/Job.php") {
-                    break;
+                std::fs::write(source.join("app/Job.php"), "<?php // changed").unwrap();
+                tokio::select! {
+                    changed = received.recv() => {
+                        let changed = changed.expect("watch remains active");
+                        // A directory notification is a valid code change,
+                        // just as in the platform-neutral regression above.
+                        let matches = Path::new("app/Job.php").starts_with(&changed);
+                        observed.push(changed);
+                        if matches {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(WATCH_DEBOUNCE * 2) => {}
                 }
             }
         })
-        .await
-        .expect("changes through the canonical path reach the alias watch");
+        .await;
+        assert!(
+            result.is_ok(),
+            "canonical changes must notify the alias watch; received {observed:?}"
+        );
     }
 
     #[cfg(unix)]

@@ -21,51 +21,50 @@ pub(crate) struct FailedCleanup {
     pub(crate) operation: OperationId,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CleanupTarget {
+    Command(String),
+    Process(String),
+}
+
 impl crate::Engine {
-    pub(crate) async fn retry_failed_command_cleanup(
+    /// Returns whether a remembered cleanup was completed. Command names and
+    /// built-in process names have separate identities even when both match.
+    pub(crate) async fn retry_failed_cleanup(
         &self,
         project: &ProjectId,
-        name: &str,
-    ) -> Result<(), ErrorInfo> {
-        let key = (project.0.clone(), name.to_string());
-        let pending = self
-            .inner
-            .failed_command_cleanup
-            .lock()
-            .unwrap()
-            .get(&key)
-            .cloned();
+        target: CleanupTarget,
+    ) -> Result<bool, ErrorInfo> {
+        let key = (project.0.clone(), target);
+        let pending = self.inner.failed_cleanup.lock().unwrap().get(&key).cloned();
         let Some(pending) = pending else {
-            return Ok(());
+            return Ok(false);
         };
         crate::project_ops::run_process_stop(&pending.argv, &pending.dir).await?;
-        let mut failed = self.inner.failed_command_cleanup.lock().unwrap();
+        let mut failed = self.inner.failed_cleanup.lock().unwrap();
         if failed.get(&key) == Some(&pending) {
             failed.remove(&key);
             if let Some(handle) = self.inner.ops.lock().unwrap().get(&pending.operation.0) {
                 handle.cancel_failed.store(false, Ordering::Relaxed);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Removal also retries a previous failed Stop, including commands whose
     /// definitions have since changed or disappeared from the manifest.
-    pub(crate) async fn retry_project_command_cleanup(
-        &self,
-        project: &ProjectId,
-    ) -> Result<(), ErrorInfo> {
-        let names = self
+    pub(crate) async fn retry_project_cleanup(&self, project: &ProjectId) -> Result<(), ErrorInfo> {
+        let targets = self
             .inner
-            .failed_command_cleanup
+            .failed_cleanup
             .lock()
             .unwrap()
             .keys()
             .filter(|(id, _)| id == &project.0)
-            .map(|(_, name)| name.clone())
+            .map(|(_, target)| target.clone())
             .collect::<Vec<_>>();
-        for name in names {
-            self.retry_failed_command_cleanup(project, &name).await?;
+        for target in targets {
+            self.retry_failed_cleanup(project, target).await?;
         }
         Ok(())
     }
