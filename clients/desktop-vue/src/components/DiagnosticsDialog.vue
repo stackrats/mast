@@ -74,22 +74,23 @@ const counts = computed(() => {
   };
 });
 
-// Fixes the engine matched to this project's last FAILED operation. Every
+// Fixes the engine matched to this project's failed lifecycle/daemon operations. Every
 // repair lives here — the card shows only a hint icon on Diagnose — so the
 // failure's fix and the proactive findings read as one list.
 const opFixes = computed<DiagnosticFinding[]>(() => {
   if (!scope) return [];
-  const op = store.operations[scope.id];
-  if (!op || op.terminal !== "failed") return [];
-  return op.fixes.map((f) => ({
-    check: "operation-failure",
-    severity: "error" as const,
-    title: f.repair.title,
-    detail: `matched to the failure of: ${op.label}`,
-    project: f.project,
-    projectName: scope.name,
-    repair: f.repair,
-  }));
+  const projectName = scope.name;
+  return store.failedProjectOperations(scope.id).flatMap(([, op]) =>
+    op.fixes.map((f) => ({
+      check: "operation-failure",
+      severity: "error" as const,
+      title: f.repair.title,
+      detail: `matched to the failure of: ${op.label}`,
+      project: f.project,
+      projectName,
+      repair: f.repair,
+    })),
+  );
 });
 
 async function openRepair(finding: DiagnosticFinding) {
@@ -143,13 +144,14 @@ async function apply() {
     // A fix that came from the failed operation clears that operation once
     // applied — same behavior the old inline Fix button had.
     if (scope) {
-      const op = store.operations[scope.id];
-      if (
-        op?.fixes.some(
-          (f) => f.repair.id === finding.repair?.id && f.repair.arg === finding.repair?.arg,
-        )
-      ) {
-        store.dismissOperation(scope.id);
+      for (const [key, op] of store.failedProjectOperations(scope.id)) {
+        if (
+          op.fixes.some(
+            (f) => f.repair.id === finding.repair?.id && f.repair.arg === finding.repair?.arg,
+          )
+        ) {
+          store.dismissOperation(key);
+        }
       }
     }
     closeRepair();

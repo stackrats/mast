@@ -259,11 +259,16 @@ function editWorkspace(ws: WorkspaceSummary) {
 
           <WorkspaceDetail
             v-if="selectedWorkspace"
+            :key="selectedWorkspace.id"
             :workspace="selectedWorkspace"
             @edit="editWorkspace(selectedWorkspace)"
           />
           <div v-else-if="selectedProject" class="mx-auto max-w-4xl">
-            <ProjectCard :project="selectedProject" @diagnose="openDiagnostics(selectedProject)" />
+            <ProjectCard
+              :key="selectedProject.id"
+              :project="selectedProject"
+              @diagnose="openDiagnostics(selectedProject)"
+            />
           </div>
           <HomePane v-else @open-settings="settingsOpen = true" />
         </main>
@@ -281,8 +286,11 @@ function editWorkspace(ws: WorkspaceSummary) {
         </Button>
         <div class="ml-auto flex items-center gap-3">
           <UsageReadout />
+          <Button v-if="store.phase === 'error'" variant="ghost" size="sm" @click="store.connect()">
+            Reconnect
+          </Button>
           <span
-            v-if="store.phase !== 'live'"
+            v-else-if="store.phase !== 'live'"
             class="rounded-full bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700 dark:bg-amber-900/60 dark:text-amber-300"
           >
             connecting…

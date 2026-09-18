@@ -6,6 +6,7 @@
 
 pub mod captures;
 mod commands;
+mod custom_command;
 mod db_repair;
 mod diagnostics;
 mod effects;
@@ -168,11 +169,17 @@ pub(crate) struct Inner {
     pub state: Mutex<EngineState>,
     patches_tx: broadcast::Sender<EnginePatch>,
     pub(crate) ops: Mutex<HashMap<u64, Arc<OpHandle>>>,
+    /// Built-in Laravel supervisors, keyed by project and process name.
+    pub(crate) process_runs: Mutex<HashMap<(String, String), OperationId>>,
     pub(crate) next_op: AtomicU64,
     pub adapter: Mutex<Option<Arc<dyn RuntimeAdapter>>>,
     pub hint_tx: Mutex<Option<mpsc::Sender<()>>>,
     /// Per-project operation locks: no concurrent lifecycle ops on a project.
     pub(crate) busy_projects: Mutex<HashSet<String>>,
+    /// Removal reservations also block commands that do not take lifecycle
+    /// locks. Held across cancellation so new processes cannot escape removal.
+    removing_projects: Mutex<HashSet<String>>,
+    pub(crate) failed_command_cleanup: Mutex<HashMap<(String, String), custom_command::FailedCleanup>>,
     /// Interrupted operations found in the journal at startup (crash
     /// recovery); surfaced as project warnings until the next lifecycle op.
     pub(crate) crash_notices: Mutex<HashMap<String, String>>,
@@ -211,6 +218,22 @@ pub(crate) struct Inner {
 #[derive(Clone)]
 pub struct Engine {
     pub(crate) inner: Arc<Inner>,
+}
+
+struct ProjectRemovalReservation {
+    engine: Engine,
+    projects: Vec<String>,
+}
+
+impl Drop for ProjectRemovalReservation {
+    fn drop(&mut self) {
+        let mut removing = self.engine.inner.removing_projects.lock().unwrap();
+        let mut busy = self.engine.inner.busy_projects.lock().unwrap();
+        for project in &self.projects {
+            removing.remove(project);
+            busy.remove(project);
+        }
+    }
 }
 
 fn commands_to_contract(record: &ProjectRecord) -> Vec<mast_contract::ProjectCommand> {
@@ -347,10 +370,13 @@ impl Engine {
                 }),
                 patches_tx,
                 ops: Mutex::new(HashMap::new()),
+                process_runs: Mutex::new(HashMap::new()),
                 next_op: AtomicU64::new(0),
                 adapter: Mutex::new(None),
                 hint_tx: Mutex::new(None),
                 busy_projects: Mutex::new(HashSet::new()),
+                removing_projects: Mutex::new(HashSet::new()),
+                failed_command_cleanup: Mutex::new(HashMap::new()),
                 crash_notices: Mutex::new(crash_notices),
                 history: Mutex::new(VecDeque::new()),
                 history_tx,
@@ -523,6 +549,23 @@ impl Engine {
                 owner_pid: self.inner.deps.ownership.owner_pid(),
             });
         }
+        // Serialize registration with project removal. Once removal takes
+        // this reservation, every previously accepted command has its owner
+        // set and can be cancelled; later dispatches are refused.
+        let removing = self.inner.removing_projects.lock().unwrap();
+        let (label, project) = {
+            let st = self.inner.state.lock().unwrap();
+            history::describe_action(&action, |id| {
+                st.projects.get(id).map(|e| e.summary.name.clone())
+            })
+        };
+        if let Some(project) = &project
+            && removing.contains(&project.0)
+        {
+            return Err(ErrorInfo::Conflict {
+                message: "the project is being removed; wait for removal to finish".into(),
+            });
+        }
         match &action {
             Action::StartProject { id } => {
                 return self.dispatch_lifecycle(id.clone(), LifecycleVerb::Up, None);
@@ -594,12 +637,7 @@ impl Engine {
         // Name the action once, here, so every command it spawns is
         // attributable in history without each op re-deriving a label.
         {
-            let (label, project) = {
-                let st = self.inner.state.lock().unwrap();
-                history::describe_action(&action, |id| {
-                    st.projects.get(id).map(|e| e.summary.name.clone())
-                })
-            };
+            *handle.project.lock().unwrap() = project.clone();
             self.inner.op_contexts.lock().unwrap().insert(
                 id.0,
                 history::CommandContext { label, project, operation: Some(id) },
@@ -619,51 +657,7 @@ impl Engine {
             Action::RemoveProject { id: project_id } => {
                 let engine = self.clone();
                 self.spawn_operation(id, handle, async move {
-                    let pid = project_id.0.clone();
-                    let engine2 = engine.clone();
-                    let removed = tokio::task::spawn_blocking(move || {
-                        engine2.inner.deps.store.remove_project(&pid)
-                    })
-                    .await
-                    .map_err(internal_err)?
-                    .map_err(internal_err)?;
-                    if !removed {
-                        return Err(ErrorInfo::NotFound {
-                            what: format!("project {}", project_id.0),
-                        });
-                    }
-                    let workspaces = engine.with_state(|st, events| {
-                        if st.projects.remove(&project_id.0).is_some() {
-                            events.push(PatchEvent::ProjectRemoved { id: project_id.clone() });
-                        }
-                        let mut touched = false;
-                        for ws in st.workspaces.iter_mut() {
-                            let before = ws.members.len();
-                            ws.members.retain(|m| m.project_id != project_id.0);
-                            touched |= ws.members.len() != before;
-                            for member in ws.members.iter_mut() {
-                                let before = member.depends_on.len();
-                                member.depends_on.retain(|d| *d != project_id.0);
-                                touched |= member.depends_on.len() != before;
-                            }
-                        }
-                        if touched {
-                            events.push(PatchEvent::WorkspacesChanged {
-                                workspaces: workspace_summaries(st),
-                            });
-                            Some(st.workspaces.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(workspaces) = workspaces {
-                        engine
-                            .inner
-                            .deps
-                            .store
-                            .save_workspaces(&workspaces)
-                            .map_err(internal_err)?;
-                    }
+                    engine.remove_projects(&[project_id], id).await?;
                     engine.hint();
                     Ok(())
                 });
@@ -697,6 +691,22 @@ impl Engine {
                     let directory = PathBuf::from(&path);
                     let directory =
                         mast_compose::strip_verbatim(directory.canonicalize().unwrap_or(directory));
+                    let projects = {
+                        let st = engine.inner.state.lock().unwrap();
+                        if !st.watched_directories.contains(&directory) {
+                            return Ok(());
+                        }
+                        st.projects.values()
+                            .filter(|entry| {
+                                entry.record.path.starts_with(&directory)
+                                    && !st.watched_directories.iter().any(|other| {
+                                        other != &directory && entry.record.path.starts_with(other)
+                                    })
+                            })
+                            .map(|entry| ProjectId(entry.record.id.clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    engine.remove_projects(&projects, id).await?;
                     engine.update_watched_directories(|directories| {
                         let before = directories.len();
                         directories.retain(|f| f != &directory);
@@ -1387,6 +1397,105 @@ impl Engine {
         Ok(id)
     }
 
+    /// Cancel managed commands before forgetting their project. Cancellation
+    /// is only a request; callers that remove metadata also await completion.
+    pub(crate) fn cancel_project_operations(
+        &self,
+        project: &ProjectId,
+        except: Option<OperationId>,
+    ) -> Vec<OperationId> {
+        let ops = self.inner.ops.lock().unwrap();
+        ops.iter()
+            .filter_map(|(id, handle)| {
+                if except == Some(OperationId(*id))
+                    || handle.project.lock().unwrap().as_ref() != Some(project)
+                    || handle.events.lock().unwrap().last().is_some_and(|e| e.kind.is_terminal())
+                {
+                    return None;
+                }
+                handle.cancel.cancel();
+                Some(OperationId(*id))
+            })
+            .collect()
+    }
+
+    async fn remove_projects(&self, projects: &[ProjectId], operation: OperationId) -> Result<(), ErrorInfo> {
+        {
+            // Match dispatch's lock order: reservation, state, lifecycle.
+            let mut removing = self.inner.removing_projects.lock().unwrap();
+            let st = self.inner.state.lock().unwrap();
+            let mut busy = self.inner.busy_projects.lock().unwrap();
+            for project in projects {
+                let entry = st.projects.get(&project.0).ok_or_else(|| ErrorInfo::NotFound {
+                    what: format!("project {}", project.0),
+                })?;
+                if busy.contains(&project.0) {
+                    return Err(ErrorInfo::Conflict {
+                        message: format!("wait for the operation on {} to finish before removing it", entry.summary.name),
+                    });
+                }
+            }
+            for project in projects {
+                removing.insert(project.0.clone());
+                busy.insert(project.0.clone());
+            }
+        }
+        let _reservation = ProjectRemovalReservation {
+            engine: self.clone(),
+            projects: projects.iter().map(|project| project.0.clone()).collect(),
+        };
+        for project in projects {
+            for pending in self.cancel_project_operations(project, Some(operation)) {
+                let mut events = self.operation_events(pending)?;
+                tokio::time::timeout(Duration::from_secs(30), async move {
+                    while let Some(event) = events.next().await {
+                        if event.kind.is_terminal() {
+                            break;
+                        }
+                    }
+                }).await.map_err(|_| ErrorInfo::Conflict {
+                    message: "a project command is still stopping; try removing the project again".into(),
+                })?;
+                if self.inner.ops.lock().unwrap().get(&pending.0).is_some_and(|handle| {
+                    handle.cancel_failed.load(std::sync::atomic::Ordering::Relaxed)
+                }) {
+                    return Err(ErrorInfo::Conflict {
+                        message: "a project command could not be stopped; check its output before removing the project".into(),
+                    });
+                }
+            }
+        }
+        for project in projects {
+            self.retry_project_command_cleanup(project).await?;
+        }
+        self.with_state(|st, events| {
+            let removing = |id: &str| projects.iter().any(|p| p.0 == id);
+            let records = st.projects.values()
+                .filter(|entry| !removing(&entry.record.id))
+                .map(|entry| entry.record.clone()).collect::<Vec<_>>();
+            let mut workspaces = st.workspaces.clone();
+            for workspace in &mut workspaces {
+                workspace.members.retain(|m| !removing(&m.project_id));
+                for member in &mut workspace.members {
+                    member.depends_on.retain(|id| !removing(id));
+                }
+            }
+            self.inner.deps.store.save_projects(&records).map_err(internal_err)?;
+            if workspaces != st.workspaces {
+                self.inner.deps.store.save_workspaces(&workspaces).map_err(internal_err)?;
+            }
+            for project in projects {
+                st.projects.remove(&project.0);
+                events.push(PatchEvent::ProjectRemoved { id: project.clone() });
+            }
+            if workspaces != st.workspaces {
+                st.workspaces = workspaces;
+                events.push(PatchEvent::WorkspacesChanged { workspaces: workspace_summaries(st) });
+            }
+            Ok(())
+        })
+    }
+
     fn persist_settings(&self) -> Result<(), ErrorInfo> {
         let settings = {
             let st = self.inner.state.lock().unwrap();
@@ -1419,6 +1528,12 @@ impl Engine {
                         .map(|p| p.to_string_lossy().into_owned())
                         .collect(),
                 });
+                // Drop stale discovery immediately; an in-flight scan is
+                // discarded when its directory snapshot no longer matches.
+                if !st.discovered.is_empty() {
+                    st.discovered.clear();
+                    events.push(PatchEvent::DiscoveryChanged { discovered: Vec::new() });
+                }
             }
             changed.then(|| st.watched_directories.clone())
         });
