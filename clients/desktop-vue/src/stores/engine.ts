@@ -344,6 +344,13 @@ export const useEngineStore = defineStore("engine", {
       this.reconcileSelection();
     },
 
+    /** Ownership settled after launch — the engine started read-only behind a
+     * short-lived rival and has the lock now. Nothing else in the snapshot
+     * changed, so only this flag moves. */
+    setReadOnly(readOnly: boolean) {
+      this.readOnly = readOnly;
+    },
+
     /** Removed projects must not leave live-looking controls or streams behind. */
     forgetProjectViews(ids: ProjectId[]) {
       for (const id of ids) {

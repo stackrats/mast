@@ -749,7 +749,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
-        let budget = Duration::from_secs(if cancel_running { 60 } else { 10 });
+        // The budget starts at spawn, and two cold PowerShell starts on a
+        // loaded runner can take longer than the timeout variant's budget —
+        // then the kill under test lands before the tree ever reports ready.
+        // Give startup room; the shutdown wait below has to outlast the budget.
+        let budget = Duration::from_secs(if cancel_running { 60 } else { 30 });
         let handle = {
             let cancel = cancel.clone();
             tokio::spawn(async move {
@@ -765,7 +769,7 @@ mod tests {
                 .await
             })
         };
-        let mut processes = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut processes = tokio::time::timeout(Duration::from_secs(60), async {
             while let Some(line) = rx.recv().await {
                 if let Some(ids) = line.line.strip_prefix("MAST_TREE_READY ") {
                     return WindowsTestTree(
@@ -783,7 +787,7 @@ mod tests {
         if cancel_running {
             cancel.cancel();
         }
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("shutdown must finish instead of waiting forever")
             .unwrap();

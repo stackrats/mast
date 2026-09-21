@@ -144,8 +144,17 @@ const MENUS: { id: MenuId; title: string }[] = [
   { id: "view", title: "View" },
 ];
 
+// A close request, the same one the window manager sends; the Rust side
+// answers it by hiding the window and keeping the engine running. Tauri 2
+// refuses this call unless the window's capability grants
+// core:window:allow-close, and a refused call rejects silently — so the
+// rejection is at least said out loud.
 async function closeToTray() {
-  await getCurrentWindow().close();
+  try {
+    await getCurrentWindow().close();
+  } catch (error) {
+    console.warn("Close to tray was refused", error);
+  }
 }
 </script>
 
