@@ -3512,8 +3512,11 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
     ] }).await;
     let running = engine.dispatch(Action::RunProjectCommand { id: id.clone(), name: "serve".into() }).unwrap();
     let mut output = engine.operation_events(running).unwrap();
+    // Thirty seconds, not ten: this drives a real shell while every sibling
+    // test spawns its own, and a shared macOS runner has missed ten on the
+    // final wait with nothing wrong.
     async fn wait_line(events: &mut BoxStream<'static, mast_contract::OperationEvent>, text: &str) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(event) = events.next().await {
                 if matches!(&event.kind, OperationEventKind::Output { line, .. } if line == text) {
                     return;
@@ -3536,7 +3539,7 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
     }
     std::fs::write(project.join("release-stop"), "").unwrap();
     let mut removed = engine.operation_events(removing).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = removed.next().await {
             if event.kind.is_terminal() {
                 assert!(matches!(event.kind, OperationEventKind::Completed));
