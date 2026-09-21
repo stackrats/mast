@@ -64,6 +64,14 @@ pub struct DeepLinkEvent {
     pub url: String,
 }
 
+/// The engine's mutation ownership changed after launch: it started read-only
+/// because another instance held the lock, and has taken it since.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipEvent {
+    pub read_only: bool,
+}
+
 /// Launch-time deep links, parked until the frontend is ready to ask.
 struct DeepLinks(Mutex<Vec<String>>);
 
@@ -472,7 +480,7 @@ fn specta_builder() -> tauri_specta::Builder {
             start_usage_stream,
             stop_usage_stream,
         ])
-        .events(tauri_specta::collect_events![PatchStreamItem, DeepLinkEvent])
+        .events(tauri_specta::collect_events![PatchStreamItem, DeepLinkEvent, OwnershipEvent])
 }
 
 /// A Finder/Dock/Spotlight launch inherits launchd's bare
@@ -622,14 +630,24 @@ pub fn run() {
             );
             {
                 let engine = engine.clone();
+                let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     engine.start();
-                    // Serve the shared-engine socket (M8) when this instance
-                    // owns mutation — the CLI then gets full rights instead
-                    // of a read-only second engine.
-                    if !engine.snapshot().read_only
-                        && let Err(e) =
-                            mast_daemon::serve(engine, &mast_daemon::default_socket_path()).await
+                    // Another instance may hold the lock at launch — usually
+                    // a CLI verb that overlapped this start and is gone in a
+                    // few seconds. Keep asking rather than staying read-only
+                    // for the whole run; the frontend hears when it changes.
+                    while engine.snapshot().read_only {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if engine.try_take_ownership() {
+                            let _ = OwnershipEvent { read_only: false }.emit(&handle);
+                        }
+                    }
+                    // Serve the shared-engine socket (M8) now that this
+                    // instance owns mutation — the CLI then gets full rights
+                    // instead of a read-only second engine.
+                    if let Err(e) =
+                        mast_daemon::serve(engine, &mast_daemon::default_socket_path()).await
                     {
                         tracing::warn!("ipc socket unavailable: {e}");
                     }

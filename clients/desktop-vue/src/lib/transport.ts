@@ -83,6 +83,11 @@ export function onDeepLink(cb: (url: string) => void): Promise<() => void> {
   return events.deepLinkEvent.listen((e) => cb(e.payload.url));
 }
 
+/** The engine took (or lost) mutation ownership after launch. */
+export function onOwnershipChange(cb: (readOnly: boolean) => void): Promise<() => void> {
+  return events.ownershipEvent.listen((e) => cb(e.payload.readOnly));
+}
+
 /** The links the app was LAUNCHED with, drained once after subscribing. */
 export function takeDeepLinks(): Promise<string[]> {
   return commands.takeDeepLinks();

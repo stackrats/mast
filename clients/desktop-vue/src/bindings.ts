@@ -284,9 +284,11 @@ async stopUsageStream() : Promise<Result<null, string>> {
 
 export const events = __makeEvents__<{
 deepLinkEvent: DeepLinkEvent,
+ownershipEvent: OwnershipEvent,
 patchStreamItem: PatchStreamItem
 }>({
 deepLinkEvent: "deep-link-event",
+ownershipEvent: "ownership-event",
 patchStreamItem: "patch-stream-item"
 })
 
@@ -941,6 +943,11 @@ export type OperationEventKind = { type: "started" } | { type: "progress"; perce
  */
 { type: "fixAvailable"; repair: RepairOffer; project: ProjectId } | { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" }
 export type OperationId = number
+/**
+ * The engine's mutation ownership changed after launch: it started read-only
+ * because another instance held the lock, and has taken it since.
+ */
+export type OwnershipEvent = { readOnly: boolean }
 export type PatchEvent = { type: "projectAdded"; project: ProjectSummary } | 
 /**
  * Full-project replacement when observation/resolution changed anything
