@@ -8,6 +8,7 @@
     "notification:default",
     "autostart:default",
     "dialog:allow-open",
-    "core:webview:allow-set-webview-zoom"
+    "core:webview:allow-set-webview-zoom",
+    "core:window:allow-close"
   ]
 }
