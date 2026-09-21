@@ -14,19 +14,47 @@ pub struct OwnershipLock {
 
 pub enum Ownership {
     Owned(OwnershipLock),
-    ReadOnly { owner_pid: Option<u32> },
+    /// Asked for the lock and lost: another instance owns mutation. Keeps the
+    /// lock directory so [`Ownership::retry`] asks the same lock again.
+    ReadOnly { owner_pid: Option<u32>, lock_dir: PathBuf },
+    /// Never asked. An engine that only observes — the CLI printing a status —
+    /// must not compete for the lock: a status poll that held it for two
+    /// seconds could leave a desktop app launched in that window read-only for
+    /// its whole run. A spectator refuses mutation like a read-only engine,
+    /// but its snapshot does not claim another instance owns anything.
+    Spectator,
 }
 
 impl Ownership {
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Ownership::ReadOnly { .. })
+        !matches!(self, Ownership::Owned(_))
+    }
+
+    pub fn is_spectator(&self) -> bool {
+        matches!(self, Ownership::Spectator)
     }
 
     pub fn owner_pid(&self) -> Option<u32> {
         match self {
-            Ownership::ReadOnly { owner_pid } => *owner_pid,
-            Ownership::Owned(_) => None,
+            Ownership::ReadOnly { owner_pid, .. } => *owner_pid,
+            Ownership::Owned(_) | Ownership::Spectator => None,
         }
+    }
+
+    /// Ask for the lock again. flock releases the moment its holder exits, so
+    /// a read-only engine whose rival was a short-lived CLI verb becomes the
+    /// owner on the next try. Returns whether this engine owns mutation now.
+    /// A spectator never asks.
+    pub fn retry(&mut self) -> bool {
+        let lock_dir = match self {
+            Ownership::Owned(_) => return true,
+            Ownership::Spectator => return false,
+            Ownership::ReadOnly { lock_dir, .. } => lock_dir.clone(),
+        };
+        let again = acquire_ownership(Some(lock_dir));
+        let owned = !again.is_read_only();
+        *self = again;
+        owned
     }
 }
 
@@ -92,7 +120,7 @@ pub fn acquire_ownership(dir: Option<PathBuf>) -> Ownership {
         let mut pid_text = String::new();
         let _ = file.rewind();
         let _ = file.read_to_string(&mut pid_text);
-        Ownership::ReadOnly { owner_pid: pid_text.trim().parse().ok() }
+        Ownership::ReadOnly { owner_pid: pid_text.trim().parse().ok(), lock_dir: dir }
     }
 }
 
@@ -129,5 +157,33 @@ mod tests {
         drop(first);
         let third = acquire_ownership(dir);
         assert!(!third.is_read_only(), "the lock must release when the owner drops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_engine_takes_the_lock_on_retry_once_the_owner_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Some(tmp.path().to_path_buf());
+
+        let owner = acquire_ownership(dir.clone());
+        let mut waiting = acquire_ownership(dir);
+        assert!(waiting.is_read_only());
+        assert!(!waiting.retry(), "the owner is still there");
+        assert!(waiting.is_read_only());
+
+        drop(owner);
+        assert!(waiting.retry(), "a released lock is taken on the next ask");
+        assert!(!waiting.is_read_only());
+        assert!(waiting.retry(), "asking again while owning is a no-op");
+    }
+
+    #[test]
+    fn a_spectator_never_competes() {
+        let mut spectator = Ownership::Spectator;
+        assert!(spectator.is_read_only(), "it refuses mutation");
+        assert!(spectator.is_spectator());
+        assert_eq!(spectator.owner_pid(), None);
+        assert!(!spectator.retry(), "and it never asks for the lock");
+        assert!(spectator.is_spectator());
     }
 }

@@ -120,7 +120,9 @@ pub struct EngineDeps {
     pub process_env: HashMap<String, String>,
     /// Executes lifecycle shell-outs; injected so tests need no docker.
     pub runner: Arc<dyn LifecycleRunner>,
-    /// Result of the per-user mutation-ownership lock (plan §1).
+    /// Result of the per-user mutation-ownership lock (plan §1). The engine
+    /// takes it over at construction ([`Engine::try_take_ownership`] can
+    /// change it later); what remains here afterwards is a placeholder.
     pub ownership: Ownership,
 }
 
@@ -166,6 +168,9 @@ pub(crate) struct EngineState {
 pub(crate) struct Inner {
     pub config: EngineConfig,
     pub deps: EngineDeps,
+    /// Who may mutate. Behind a lock because a read-only engine can become
+    /// the owner later — see [`Engine::try_take_ownership`].
+    pub(crate) ownership: Mutex<Ownership>,
     pub state: Mutex<EngineState>,
     patches_tx: broadcast::Sender<EnginePatch>,
     pub(crate) ops: Mutex<HashMap<u64, Arc<OpHandle>>>,
@@ -283,7 +288,8 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
 impl Engine {
     /// Load persisted state and build the engine. No I/O beyond the metadata
     /// store; effect loops start with [`Engine::start`].
-    pub fn new(config: EngineConfig, deps: EngineDeps) -> Self {
+    pub fn new(config: EngineConfig, mut deps: EngineDeps) -> Self {
+        let ownership = std::mem::replace(&mut deps.ownership, Ownership::Spectator);
         let records = deps.store.load_projects().unwrap_or_default();
         let settings = deps.store.load_settings().unwrap_or_default();
         let mut workspaces = deps.store.load_workspaces().unwrap_or_default();
@@ -301,7 +307,7 @@ impl Engine {
                 healed |= member.depends_on.len() != before;
             }
         }
-        if healed && !deps.ownership.is_read_only() {
+        if healed && !ownership.is_read_only() {
             let _ = deps.store.save_workspaces(&workspaces);
         }
         // Crash recovery (plan M4): operations still journaled at startup were
@@ -348,6 +354,7 @@ impl Engine {
             inner: Arc::new(Inner {
                 config,
                 deps,
+                ownership: Mutex::new(ownership),
                 state: Mutex::new(EngineState {
                     seq: 0,
                     replay: VecDeque::new(),
@@ -398,7 +405,18 @@ impl Engine {
     }
 
     pub fn read_only(&self) -> bool {
-        self.inner.deps.ownership.is_read_only()
+        self.inner.ownership.lock().unwrap().is_read_only()
+    }
+
+    /// Whether this engine only ever observes ([`Ownership::Spectator`]).
+    pub fn spectating(&self) -> bool {
+        self.inner.ownership.lock().unwrap().is_spectator()
+    }
+
+    /// Ask for the mutation lock again. Returns whether this engine owns
+    /// mutation now. Owners return true at once; spectators never ask.
+    pub fn try_take_ownership(&self) -> bool {
+        self.inner.ownership.lock().unwrap().retry()
     }
 
     /// Spawn the effect loops (docker connection/events, file watcher,
@@ -441,7 +459,9 @@ impl Engine {
         EngineSnapshot {
             protocol_version: PROTOCOL_VERSION,
             seq: st.seq,
-            read_only: self.read_only(),
+            // A spectator's refusal is its own choice, not another
+            // instance's claim, so it is not reported as read-only.
+            read_only: self.read_only() && !self.spectating(),
             docker: st.docker.clone(),
             integrations: st.integrations.clone(),
             watched_directories: st
@@ -548,7 +568,7 @@ impl Engine {
         );
         if mutating && self.read_only() {
             return Err(ErrorInfo::ReadOnly {
-                owner_pid: self.inner.deps.ownership.owner_pid(),
+                owner_pid: self.inner.ownership.lock().unwrap().owner_pid(),
             });
         }
         // Serialize registration with project removal. Once removal takes
