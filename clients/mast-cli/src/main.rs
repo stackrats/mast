@@ -14,7 +14,9 @@ use mast_contract::{
     Action, DiagSeverity, EngineSnapshot, ErrorInfo, HistoryDetail, HistoryEntry, HistoryOrigin,
     HistoryOutcome, OperationEventKind, ProjectId, ProjectStatus,
 };
-use mast_engine::{Engine, EngineConfig, EngineDeps, RealConnector, RealLifecycleRunner};
+use mast_engine::{
+    Engine, EngineConfig, EngineDeps, Ownership, RealConnector, RealLifecycleRunner,
+};
 use mast_project::MetadataStore;
 
 mod mcp;
@@ -46,7 +48,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Projects, workspaces and their live container state.
-    Status,
+    Status {
+        /// Print the engine snapshot as one JSON document instead of the
+        /// table — for scripts and desktop widgets.
+        #[arg(long)]
+        json: bool,
+    },
     /// `up -d` a project (or one service with --service).
     Start {
         project: String,
@@ -126,11 +133,11 @@ async fn main() {
             )) => {
                 version_mismatch_exit(&error)
             }
-            Err(_) => embedded_engine(),
+            Err(_) => embedded_engine(observes_only(&command)),
         };
 
     let code = match command {
-        Command::Status => status(client.as_ref()).await,
+        Command::Status { json } => status(client.as_ref(), json).await,
         Command::Start { project, service } => {
             lifecycle(client.as_ref(), &project, service, "start").await
         }
@@ -174,7 +181,21 @@ fn version_mismatch_exit(error: &ErrorInfo) -> ! {
     std::process::exit(2)
 }
 
-fn embedded_engine() -> Arc<dyn MastClient> {
+/// Whether a command only reads. Those never compete for the mutation lock:
+/// a status poll from a bar widget that held it for two seconds could
+/// otherwise leave a desktop app launched in that window read-only, and the
+/// answer to "what is running" does not need the right to change it.
+fn observes_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Status { .. }
+            | Command::Diagnose { .. }
+            | Command::History { .. }
+            | Command::Snapshots { .. }
+    )
+}
+
+fn embedded_engine(observe_only: bool) -> Arc<dyn MastClient> {
     let engine = Engine::new(
         EngineConfig::default(),
         EngineDeps {
@@ -188,7 +209,11 @@ fn embedded_engine() -> Arc<dyn MastClient> {
             },
             process_env: std::env::vars().collect(),
             runner: Arc::new(RealLifecycleRunner),
-            ownership: mast_engine::acquire_ownership(None),
+            ownership: if observe_only {
+                Ownership::Spectator
+            } else {
+                mast_engine::acquire_ownership(None)
+            },
         },
     );
     engine.start();
@@ -196,7 +221,9 @@ fn embedded_engine() -> Arc<dyn MastClient> {
 }
 
 /// Wait for the effect loops to produce a meaningful snapshot: docker status
-/// resolved and a settle window with no new patches.
+/// resolved, every project's compose pass finished, and a settle window with
+/// no new patches. Bounded, so a slow resolution degrades to a partial answer
+/// rather than a hang.
 pub(crate) async fn settled_snapshot(client: &dyn MastClient) -> EngineSnapshot {
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut last_seq = 0;
@@ -214,13 +241,38 @@ pub(crate) async fn settled_snapshot(client: &dyn MastClient) -> EngineSnapshot 
             last_seq = snap.seq;
             stable_since = Instant::now();
         }
-        if (docker_known && stable_since.elapsed() > Duration::from_millis(400))
+        if (docker_known
+            && !awaiting_resolution(&snap)
+            && stable_since.elapsed() > Duration::from_millis(400))
             || Instant::now() > deadline
         {
             break snap;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Whether some project has not been through the compose pass yet. Until it
+/// has, its service list is empty because nobody has looked, not because it
+/// has none — and a status printed in that window reads "0/0 services" for a
+/// project that is fine. The pass ends by naming the compose project or by
+/// recording why it could not; either settles the project. With docker down
+/// there is no pass to wait for.
+pub(crate) fn awaiting_resolution(snap: &EngineSnapshot) -> bool {
+    snap.docker.available
+        && snap
+            .projects
+            .iter()
+            .any(|p| p.compose_project_name.is_none() && p.resolution_error.is_none())
+}
+
+/// The settled snapshot as one JSON document. It is the wire contract itself
+/// (`EngineSnapshot`: camelCase keys, `protocolVersion` tagged) rather than a
+/// shape invented for the CLI, so a script or a bar widget reads exactly what
+/// the desktop reads and there is nothing separate to drift. Pretty-printed:
+/// the document is small, and a person looks at it before a script does.
+pub(crate) fn status_json(snap: &EngineSnapshot) -> String {
+    serde_json::to_string_pretty(snap).expect("EngineSnapshot always serializes")
 }
 
 fn glyph(status: ProjectStatus) -> &'static str {
@@ -232,8 +284,12 @@ fn glyph(status: ProjectStatus) -> &'static str {
     }
 }
 
-async fn status(client: &dyn MastClient) -> i32 {
+async fn status(client: &dyn MastClient, json: bool) -> i32 {
     let snap = settled_snapshot(client).await;
+    if json {
+        println!("{}", status_json(&snap));
+        return 0;
+    }
     match (&snap.docker.available, &snap.docker.error) {
         (true, _) => println!(
             "docker: connected ({})",
@@ -581,6 +637,61 @@ async fn diagnose(client: &dyn MastClient, wanted: Option<String>) -> i32 {
 mod tests {
     use super::*;
     use mast_contract::{ProjectStatus, ProjectSummary};
+
+    #[test]
+    fn reading_verbs_never_compete_for_the_lock() {
+        assert!(observes_only(&Command::Status { json: true }));
+        assert!(observes_only(&Command::Diagnose { project: None }));
+        assert!(observes_only(&Command::History { background: false, limit: 5 }));
+        assert!(observes_only(&Command::Snapshots { project: "a".into() }));
+        assert!(!observes_only(&Command::Start { project: "a".into(), service: None }));
+        assert!(!observes_only(&Command::Stop { project: "a".into(), service: None }));
+        assert!(!observes_only(&Command::Snapshot { project: "a".into(), service: "db".into() }));
+        assert!(!observes_only(&Command::Mcp));
+    }
+
+    #[test]
+    fn a_status_waits_for_the_compose_pass_only_while_docker_is_up() {
+        let mut snap = snapshot_with(vec![project("storefront", "/srv/storefront")]);
+        snap.docker.available = true;
+        // Nobody has looked yet: an empty service list must not be printed
+        // as "no services".
+        assert!(awaiting_resolution(&snap));
+        // The pass either names the compose project ...
+        snap.projects[0].compose_project_name = Some("storefront".into());
+        assert!(!awaiting_resolution(&snap));
+        // ... or says why it could not; both settle the project.
+        snap.projects[0].compose_project_name = None;
+        snap.projects[0].resolution_error = Some("no compose file found".into());
+        assert!(!awaiting_resolution(&snap));
+        // With docker down there is no pass to wait for.
+        snap.projects[0].resolution_error = None;
+        snap.docker.available = false;
+        assert!(!awaiting_resolution(&snap));
+        // And nothing registered means nothing to wait for either.
+        let mut empty = snapshot_with(Vec::new());
+        empty.docker.available = true;
+        assert!(!awaiting_resolution(&empty));
+    }
+
+    #[test]
+    fn status_json_is_the_wire_snapshot() {
+        let mut storefront = project("storefront", "/srv/storefront");
+        storefront.status = ProjectStatus::Running;
+        let snap = snapshot_with(vec![storefront]);
+        let text = status_json(&snap);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // camelCase and tagged, as the desktop sees it — not a CLI-only shape.
+        assert_eq!(parsed["protocolVersion"], mast_contract::PROTOCOL_VERSION);
+        assert_eq!(parsed["readOnly"], false);
+        assert_eq!(parsed["docker"]["available"], false);
+        assert_eq!(parsed["projects"][0]["name"], "storefront");
+        assert_eq!(parsed["projects"][0]["status"], "running");
+        // And it round-trips through the contract type, so a consumer that
+        // wants the typed view can have it.
+        let back: EngineSnapshot = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, snap);
+    }
 
     fn snapshot_with(projects: Vec<ProjectSummary>) -> EngineSnapshot {
         EngineSnapshot {
