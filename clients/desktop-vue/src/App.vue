@@ -26,7 +26,7 @@ import { parseDeepLink } from "./lib/deeplink";
 import { sidebarMode } from "./lib/layout";
 import { applyTheme, loadTheme } from "./lib/prefs";
 import { useViewport } from "./lib/viewport";
-import { onDeepLink, takeDeepLinks } from "./lib/transport";
+import { onDeepLink, onOwnershipChange, takeDeepLinks } from "./lib/transport";
 import { useEngineStore } from "./stores/engine";
 
 const store = useEngineStore();
@@ -196,6 +196,7 @@ onMounted(() => {
   void onDeepLink(applyDeepLink).then(async () => {
     for (const url of await takeDeepLinks()) applyDeepLink(url);
   });
+  void onOwnershipChange((readOnly) => store.setReadOnly(readOnly));
 });
 
 onBeforeUnmount(() => {
