@@ -145,6 +145,16 @@ Then run it:
 
 After starting Mast, open **Settings**, add the directories containing your projects, and import the projects Mast discovers.
 
+### Omarchy
+
+[Omarchy](https://omarchy.org) is Arch underneath, so the AppImage is the build to use. Install the CLI as above, then add the Mast bar widget — the running project count in the bar, and a panel to start, stop, restart and open projects:
+
+```bash
+omarchy plugin add https://github.com/stackrats/omarchy-mast.git --enable
+```
+
+The widget needs a `mast` CLI that supports `mast status --json`.
+
 ## macOS
 
 Download the `.dmg` for your chip (Apple Silicon `aarch64` or Intel `x64`) from the latest release, open it, and drag **Mast** into **Applications** as normal.
@@ -446,6 +456,8 @@ mast start <project> --service <name>
 ```
 
 Projects can be matched by name or path fragment.
+
+`mast status --json` prints the same picture as one JSON document — the engine snapshot the desktop app reads, camelCase keys and all — for scripts and desktop widgets such as the [Omarchy bar plugin](https://github.com/stackrats/omarchy-mast).
 
 When the desktop application or daemon is running, the CLI connects to it over IPC.
 
