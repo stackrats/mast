@@ -36,6 +36,11 @@
 # next real resize. The hook is rewritten to prefer Wayland and fall back to
 # X11, and to let a GDK_BACKEND the user has already exported win.
 #
+# Tauri's CLI now ships its own copy of the plugin (tauri-apps/tauri#16062),
+# whose hook carries the line commented out — `# export GDK_BACKEND=x11`. Only
+# an active export forces X11, so only that is rewritten; a hook that leaves
+# GDK_BACKEND unset already gets GTK's own Wayland-then-X11 choice.
+#
 # Usage:
 #   scripts/fix-appimage-wayland.sh <AppImage> [more...]   strip and repack
 #   scripts/fix-appimage-wayland.sh --strip-only <AppDir>  strip in place
@@ -54,9 +59,10 @@ STRIP_LIBS=(
   libwayland-server.so.0
 )
 
-# The hook the GTK plugin writes, and the line in it that forces X11.
+# The hook the GTK plugin writes, and the line in it that forces X11: an
+# active export, not the same text inside a comment.
 GTK_HOOK=apprun-hooks/linuxdeploy-plugin-gtk.sh
-GDK_FORCED_X11='export GDK_BACKEND=x11'
+GDK_FORCED_X11='^[[:space:]]*export[[:space:]]+GDK_BACKEND=x11([[:space:]]|$)'
 GDK_PREFER_WAYLAND='export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}" # rewritten by fix-appimage-wayland.sh: native Wayland where it exists, X11 otherwise, and an exported value wins'
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -85,11 +91,11 @@ strip_appdir() {
 prefer_wayland() {
   local hook="$1/$GTK_HOOK"
   [[ -f "$hook" ]] || { printf '0'; return 0; }
-  if grep -qF "$GDK_FORCED_X11" "$hook"; then
-    # Whole-line replacement on the exact export, via awk rather than sed so
-    # the replacement's $ and " need no escaping.
+  if grep -qE "$GDK_FORCED_X11" "$hook"; then
+    # Whole-line replacement of the export, via awk rather than sed so the
+    # replacement's $ and " need no escaping.
     awk -v from="$GDK_FORCED_X11" -v to="$GDK_PREFER_WAYLAND" \
-      'index($0, from) == 1 { print to; next } { print }' "$hook" > "$hook.tmp" \
+      '$0 ~ from { print to; next } { print }' "$hook" > "$hook.tmp" \
       && mv "$hook.tmp" "$hook"
     printf '    rewrote %s\n' "$GTK_HOOK" >&2
     printf '1'
@@ -181,7 +187,7 @@ for IMG in "$@"; do
   find "$VERIFY/squashfs-root" -name 'libwebkit2gtk-4.1.so.0' | grep -q . \
     || die "libwebkit2gtk missing from the repacked AppImage — bad repack."
   if [[ -f "$VERIFY/squashfs-root/$GTK_HOOK" ]]; then
-    grep -qF "$GDK_FORCED_X11" "$VERIFY/squashfs-root/$GTK_HOOK" \
+    grep -qE "$GDK_FORCED_X11" "$VERIFY/squashfs-root/$GTK_HOOK" \
       && die "the GTK hook still forces GDK_BACKEND=x11 after the repack."
   fi
 

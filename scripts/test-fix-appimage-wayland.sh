@@ -14,6 +14,8 @@
 #   * both AppDir layouts are handled (usr/lib and usr/lib/<triplet>)
 #   * the GTK plugin's hook stops forcing GDK_BACKEND=x11, prefers Wayland,
 #     and still lets a user's own exported GDK_BACKEND win
+#   * a hook that only mentions the export in a comment (Tauri's bundled
+#     plugin) is left alone, and an indented export is still caught
 #   * a second run is a clean no-op rather than an error
 #   * a missing AppDir fails loudly instead of silently succeeding
 #
@@ -136,6 +138,52 @@ if grep -qF 'export GTK_THEME="$APPIMAGE_GTK_THEME"' "$HOOK" \
   pass "neighbouring exports left alone"
 else
   fail "the rewrite disturbed lines other than the GDK_BACKEND export"
+fi
+
+# ---------------------------------------------------------------- case 2c ---
+# Tauri's CLI ships its own copy of the plugin, and its hook has the line
+# commented out. That forces nothing: the hook must come through byte for
+# byte, and GDK_BACKEND stays unset for GTK to choose. Matching the text
+# inside the comment is what failed the v0.7.4 Linux release build.
+C="$T/Commented"
+mkdir -p "$C/apprun-hooks"
+cat > "$C/apprun-hooks/linuxdeploy-plugin-gtk.sh" <<'HOOK'
+#! /usr/bin/env bash
+export GTK_THEME="$APPIMAGE_GTK_THEME" # Custom themes are broken
+# export GDK_BACKEND=x11 # Monitor this closely. AppImage used to crash on Wayland!
+export XDG_DATA_DIRS="$APPDIR/usr/share:/usr/share:$XDG_DATA_DIRS" # g_get_system_data_dirs() from GLib
+HOOK
+cp "$C/apprun-hooks/linuxdeploy-plugin-gtk.sh" "$T/commented-before.sh"
+out=$(bash "$SCRIPT" --strip-only "$C" 2>&1) || fail "strip-only exited non-zero on a commented hook"
+if [[ "$out" == *"hook rewritten: 0"* ]] \
+   && cmp -s "$T/commented-before.sh" "$C/apprun-hooks/linuxdeploy-plugin-gtk.sh"; then
+  pass "a commented-out export is left alone"
+else
+  fail "a hook whose export is only a comment was changed ($out)"
+fi
+got=$(backend_after "$C/apprun-hooks/linuxdeploy-plugin-gtk.sh")
+if [[ -z "$got" ]]; then
+  pass "the commented hook leaves GDK_BACKEND for GTK to choose"
+else
+  fail "expected GDK_BACKEND unset after the commented hook, got '$got'"
+fi
+
+# An active export does not have to start in column one — inside an `if` it
+# is indented, and it forces X11 all the same.
+I="$T/Indented"
+mkdir -p "$I/apprun-hooks"
+cat > "$I/apprun-hooks/linuxdeploy-plugin-gtk.sh" <<'HOOK'
+#! /usr/bin/env bash
+if true; then
+    export GDK_BACKEND=x11
+fi
+HOOK
+bash "$SCRIPT" --strip-only "$I" >/dev/null 2>&1 || fail "strip-only exited non-zero on an indented hook"
+got=$(backend_after "$I/apprun-hooks/linuxdeploy-plugin-gtk.sh")
+if [[ "$got" == "wayland,x11" ]]; then
+  pass "an indented export is rewritten too"
+else
+  fail "expected GDK_BACKEND=wayland,x11 after an indented export, got '$got'"
 fi
 
 # ---------------------------------------------------------------- case 3 ----
