@@ -220,6 +220,10 @@ pub(crate) struct Inner {
     /// `mast-docker` only holds a weak reference, so a dropped engine stops
     /// being notified.
     pub(crate) command_observer: Mutex<Option<Arc<dyn mast_docker::CommandObserver>>>,
+    /// Serializes writes to the local-HTTPS proxy's Caddyfile: an enable
+    /// holds it across render and reload, and the reconcile-time
+    /// convergence skips a pass rather than wait behind one.
+    pub(crate) proxy_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -398,6 +402,7 @@ impl Engine {
                 usage_prev: Mutex::new(HashMap::new()),
                 op_contexts: Mutex::new(HashMap::new()),
                 command_observer: Mutex::new(None),
+                proxy_lock: tokio::sync::Mutex::new(()),
             }),
         };
         engine.install_command_observer();

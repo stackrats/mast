@@ -740,6 +740,8 @@ async fn reconcile(engine: &Engine) {
     if !engine.read_only() {
         engine.spawn_captures(capture_requests);
     }
+    // The ports just re-read may have moved under a domain the proxy serves.
+    engine.converge_proxy().await;
 }
 
 /// Diff one project's services across a reconcile and record which deaths are
