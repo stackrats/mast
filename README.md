@@ -282,6 +282,8 @@ Stop typing `localhost:8082`. Give a project a `.test` domain and Mast serves it
 
 That unlocks the parts of development that plain `http://localhost` quietly breaks: secure cookies, service workers, camera and clipboard APIs, and OAuth callbacks that insist on HTTPS. The address also never changes when ports move.
 
+Projects running Reverb get their WebSocket on the same address: upgrades on `wss://myapp.test/app` go to the port the app container publishes for Reverb, while ordinary `/app/…` pages still reach the app. Sail doesn't publish that port by default, and Mast says so when it's missing. The proxy follows port changes on its own.
+
 Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before an elevation prompt runs it.
 
 Prefer doing it yourself? The dialog shows the exact hosts line and the certificate — path and PEM, each copyable — with a button that opens your hosts file.
