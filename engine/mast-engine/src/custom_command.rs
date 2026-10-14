@@ -120,6 +120,11 @@ pub(crate) fn prepare(
 
     let mut argv = exec_prefix(dir, invocation, &service, &app_user, Some(&marker))?;
     argv.extend(command);
+    // Stop as the user the command ran as, never as root. Reading another
+    // user's /proc/<pid>/environ takes CAP_SYS_PTRACE, which Docker's default
+    // capability set leaves out — so root sees none of the command's
+    // processes, finds no marker, and reports a clean stop over a command that
+    // is still running. The command's own user can read and signal all of it.
     let mut stop_argv = match container {
         // Keep the original identity if the project directory moves or the
         // Compose configuration is edited while the command is running.
@@ -127,10 +132,10 @@ pub(crate) fn prepare(
             "docker".into(),
             "exec".into(),
             "-u".into(),
-            "root".into(),
+            app_user.clone(),
             container.into(),
         ],
-        None => exec_prefix(dir, invocation, &service, "root", None)?,
+        None => exec_prefix(dir, invocation, &service, &app_user, None)?,
     };
     stop_argv.extend(["sh".into(), "-c".into(), stop_script(&marker)]);
     Ok(Some(ManagedCommand { argv, stop_argv }))
@@ -312,7 +317,7 @@ mod tests {
                 "docker",
                 "exec",
                 "-u",
-                "root",
+                "developer",
                 "original-container",
                 "sh",
                 "-c"
@@ -369,5 +374,134 @@ mod tests {
             "other command runs must not be signalled"
         );
         unrelated.kill().await.unwrap();
+    }
+
+    async fn docker(args: &[&str]) -> mast_docker::CommandOutput {
+        let argv: Vec<String> = std::iter::once("docker")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        mast_docker::run_command(
+            &argv,
+            None,
+            &[],
+            std::time::Duration::from_secs(120),
+            64 * 1024,
+        )
+        .await
+        .expect("docker ran")
+    }
+
+    async fn docker_usable() -> bool {
+        if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
+            return false;
+        }
+        mast_docker::run_command(
+            &[
+                "docker".into(),
+                "info".into(),
+                "--format".into(),
+                "{{.OSType}}".into(),
+            ],
+            None,
+            &[],
+            std::time::Duration::from_secs(10),
+            16 * 1024,
+        )
+        .await
+        .map(|out| out.success() && out.stdout.trim() == "linux")
+        .unwrap_or(false)
+    }
+
+    struct RemoveContainer(String);
+
+    impl Drop for RemoveContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    // The test above runs the stop script as the user that owns the
+    // processes, which is the case that always worked. Sail's are owned by
+    // `sail`, inside a container where root lacks CAP_SYS_PTRACE and cannot
+    // read their environment — so this drives the real stop argv against a
+    // real container, with the command owned by a non-root user.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_reaches_a_non_root_command_inside_a_container() {
+        if !docker_usable().await {
+            eprintln!("skipping: no usable docker daemon");
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("mast-it-stop-{nonce}");
+        let _cleanup = RemoveContainer(name.clone());
+        let started = docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "alpine:latest",
+            "sleep",
+            "600",
+        ])
+        .await;
+        assert!(started.success(), "{}", started.stderr);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "APP_USER=1000\n").unwrap();
+        let run = prepare(
+            dir.path(),
+            None,
+            "app",
+            Some(&name),
+            &tail(&["npm", "run", "dev"]),
+            OperationId(1),
+        )
+        .unwrap()
+        .unwrap();
+        let marker = run
+            .argv
+            .iter()
+            .find(|arg| arg.starts_with("MAST_COMMAND_RUN="))
+            .unwrap()
+            .clone();
+        // What `sail exec -T -u <user> -e <marker>` leaves running, plus a
+        // neighbour from another run that must survive.
+        let other = format!("{marker}-other");
+        for (tag, seconds) in [(&marker, "300"), (&other, "301")] {
+            let exec = docker(&[
+                "exec", "-d", "-u", "1000", "-e", tag, &name, "sleep", seconds,
+            ])
+            .await;
+            assert!(exec.success(), "{}", exec.stderr);
+        }
+
+        let stopped = mast_docker::run_command(
+            &run.stop_argv,
+            None,
+            &[],
+            std::time::Duration::from_secs(30),
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(stopped.success(), "{}", stopped.stderr);
+        let ps = docker(&["exec", &name, "ps", "-o", "args"]).await;
+        assert!(
+            !ps.stdout.contains("sleep 300"),
+            "the command is still running after a successful stop:\n{}",
+            ps.stdout
+        );
+        assert!(
+            ps.stdout.contains("sleep 301"),
+            "another run's process was stopped:\n{}",
+            ps.stdout
+        );
     }
 }
