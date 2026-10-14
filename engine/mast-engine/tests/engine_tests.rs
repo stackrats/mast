@@ -3566,8 +3566,10 @@ async fn failed_sail_cleanup_must_succeed_before_a_later_command_can_run() {
     std::fs::write(project.join(".env"), "APP_USER=sail\n").unwrap();
     std::fs::create_dir_all(project.join("vendor/bin")).unwrap();
     let sail = project.join("vendor/bin/sail");
+    // Cleanup runs as the same user as the command; it is the one exec that
+    // carries no `-e MAST_COMMAND_RUN=` marker.
     std::fs::write(&sail,
-        "#!/bin/sh\nif [ \"$4\" = root ]; then\n  [ -f allow-cleanup ] && exit 0\n  echo 'cleanup deliberately blocked' >&2\n  exit 1\nfi\necho launched >> launches.txt\necho ready\nexec sleep 60\n",
+        "#!/bin/sh\nif [ \"$5\" != -e ]; then\n  [ -f allow-cleanup ] && exit 0\n  echo 'cleanup deliberately blocked' >&2\n  exit 1\nfi\necho launched >> launches.txt\necho ready\nexec sleep 60\n",
     ).unwrap();
     std::fs::set_permissions(&sail, std::fs::Permissions::from_mode(0o755)).unwrap();
     let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));

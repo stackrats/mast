@@ -1,6 +1,7 @@
 //! Ownership for executable Sail commands. Killing the host Docker client
-//! does not stop its container process, so mark the process and descendants
-//! with a unique environment value and clean up only that marked family.
+//! does not stop its container process, so each run records its command's
+//! PID inside the container and marks the process and descendants with a
+//! unique environment value, and cleanup stops only that family.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -90,6 +91,7 @@ pub(crate) fn prepare(
     invocation: Option<&ComposeInvocation>,
     app_service: &str,
     container: Option<&str>,
+    name: &str,
     tail: &[String],
     op: OperationId,
 ) -> Result<Option<ManagedCommand>, ErrorInfo> {
@@ -102,7 +104,8 @@ pub(crate) fn prepare(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let marker = format!("MAST_COMMAND_RUN={}-{}-{nonce}", std::process::id(), op.0);
+    let run = format!("{}-{}-{nonce}", std::process::id(), op.0);
+    let marker = format!("MAST_COMMAND_RUN={run}");
     let env = sail_environment(dir, std::env::var("APP_ENV").ok().as_deref());
     let app_user = env
         .get("APP_USER")
@@ -119,7 +122,20 @@ pub(crate) fn prepare(
     let container = container.filter(|_| service == app_service);
 
     let mut argv = exec_prefix(dir, invocation, &service, &app_user, Some(&marker))?;
+    argv.extend([
+        "sh".into(),
+        "-c".into(),
+        RUN_WRAPPER.into(),
+        "mast-run".into(),
+        format!("{RUN_DIR}/{run}"),
+        record_name(name),
+    ]);
     argv.extend(command);
+    // Stop as the user the command ran as, never as root. Reading another
+    // user's /proc/<pid>/environ takes CAP_SYS_PTRACE, which Docker's default
+    // capability set leaves out — so root sees none of the command's
+    // processes, finds no marker, and reports a clean stop over a command that
+    // is still running. The command's own user can read and signal all of it.
     let mut stop_argv = match container {
         // Keep the original identity if the project directory moves or the
         // Compose configuration is edited while the command is running.
@@ -127,13 +143,52 @@ pub(crate) fn prepare(
             "docker".into(),
             "exec".into(),
             "-u".into(),
-            "root".into(),
+            app_user.clone(),
             container.into(),
         ],
-        None => exec_prefix(dir, invocation, &service, "root", None)?,
+        None => exec_prefix(dir, invocation, &service, &app_user, None)?,
     };
-    stop_argv.extend(["sh".into(), "-c".into(), stop_script(&marker)]);
+    stop_argv.extend(["sh".into(), "-c".into(), stop_script(&run)]);
     Ok(Some(ManagedCommand { argv, stop_argv }))
+}
+
+/// Where each run records its command's PID, inside the container. In /tmp,
+/// so the record goes with the container — as does every process it names.
+const RUN_DIR: &str = "/tmp/mast-runs";
+
+/// Record the command's own PID, start time and name, then become it.
+///
+/// The environment marker alone cannot find every process. Sail's PHP binary
+/// carries a file capability (`cap_net_bind_service`, so `artisan serve` can
+/// bind port 80), which makes every PHP process non-dumpable, and the environ
+/// of a non-dumpable process is readable by no one without CAP_SYS_PTRACE —
+/// not even its own user. `exec` keeps the PID, so the record names the
+/// command itself; the start time tells it apart from an unrelated process
+/// that later reuses the number; the name lets a record outlive the Mast
+/// session that wrote it and still say what it was. The wrapper's own comm is
+/// `sh`, so field 22 of its stat is the start time without parsing around a
+/// spaced name.
+const RUN_WRAPPER: &str = r#"mkdir -p "${1%/*}" 2>/dev/null; echo "$$ $(cut -d' ' -f22 /proc/$$/stat) $2" > "$1" 2>/dev/null; shift 2; exec "$@""#;
+
+/// A command name as one field of the record: anything outside a plain
+/// identifier becomes `_`, so the record stays three space-separated words.
+fn record_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "command".into()
+    } else {
+        clean
+    }
 }
 
 fn sail_environment(
@@ -184,28 +239,56 @@ fn exec_prefix(
     Ok(argv)
 }
 
-fn stop_script(marker: &str) -> String {
-    // This value is generated above, never supplied by a user. Matching the
-    // entire environment entry excludes similar command lines and other Mast
-    // runs. Re-scan during shutdown to catch descendants spawned by a parent
-    // while its first termination signal was being delivered.
-    assert!(
-        marker
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '='))
-    );
+fn stop_script(run: &str) -> String {
+    // The run id is generated above, never supplied by a user. A run's
+    // processes are the command the wrapper recorded (if that PID still has
+    // the recorded start time), anything carrying the run's exact marker, and
+    // every descendant of either — found through /proc/<pid>/stat, which
+    // anyone can read, because the PHP processes under a command can be read
+    // through nothing else. Matching the entire environment entry excludes
+    // similar command lines and other Mast runs. Re-scan during shutdown to
+    // catch descendants spawned while the first signals were being delivered.
+    assert!(run.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     format!(
-        r#"marker='{marker}'; stopped=''; remaining=10
+        r#"marker='MAST_COMMAND_RUN={run}'; record='{RUN_DIR}/{run}'; tracked=''; stopped=''; remaining=10
+if {{ read -r pid start _ < "$record" && read -r stat < "/proc/$pid/stat"; }} 2>/dev/null; then
+    rest=${{stat##*) }}; set -- $rest
+    [ "${{20}}" = "$start" ] && tracked=$pid
+fi
 while :; do
-    alive=''
-    for path in /proc/[0-9]*/environ; do
-        pid=${{path#/proc/}}; pid=${{pid%/environ}}
+    table=''
+    for path in /proc/[0-9]*/stat; do
+        pid=${{path#/proc/}}; pid=${{pid%/stat}}
         [ "$pid" = "$$" ] && continue
-        tr '\0' '\n' 2>/dev/null < "$path" | grep -Fx "$marker" >/dev/null || continue
+        {{ read -r stat < "$path"; }} 2>/dev/null || continue
+        rest=${{stat##*) }}; set -- $rest
+        case "$1" in Z|X) continue;; esac
+        table="$table$pid $2
+"
+        case " $tracked " in *" $pid "*) continue;; esac
+        tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | grep -Fx "$marker" >/dev/null && tracked="$tracked $pid"
+    done
+    grown=1
+    while [ -n "$grown" ]; do
+        grown=''
+        while read -r pid ppid; do
+            [ -n "$pid" ] || continue
+            case " $tracked " in *" $pid "*) continue;; esac
+            case " $tracked " in *" $ppid "*) tracked="$tracked $pid"; grown=1;; esac
+        done <<EOF
+$table
+EOF
+    done
+    alive=''
+    for pid in $tracked; do
+        case "
+$table" in *"
+$pid "*) ;; *) continue;; esac
         alive="$alive $pid"
         case " $stopped " in *" $pid "*) ;; *) kill -TERM "$pid" 2>/dev/null; stopped="$stopped $pid";; esac
     done
-    [ -z "$alive" ] && exit 0
+    tracked=$alive
+    if [ -z "$alive" ]; then rm -f "$record"; exit 0; fi
     [ "$remaining" -gt 0 ] || break
     remaining=$((remaining - 1)); sleep 1
 done
@@ -240,6 +323,15 @@ mod tests {
             "default"
         );
         assert_eq!(sail_environment(dir.path(), None)["APP_USER"], "default");
+    }
+
+    #[test]
+    fn record_names_stay_one_field() {
+        assert_eq!(record_name("dev"), "dev");
+        assert_eq!(record_name("queue:work high"), "queue_work_high");
+        assert_eq!(record_name("vite.dev-2"), "vite.dev-2");
+        assert_eq!(record_name(""), "command");
+        assert_eq!(record_name(&"x".repeat(100)).len(), 64);
     }
 
     #[test]
@@ -298,32 +390,50 @@ mod tests {
             None,
             "app",
             Some("original-container"),
+            "dev server",
             &tail(&["npm", "run", "dev"]),
             OperationId(7),
         )
         .unwrap()
         .unwrap();
         assert_eq!(&run.argv[1..6], ["exec", "-T", "-u", "developer", "-e"]);
-        assert!(run.argv[6].starts_with("MAST_COMMAND_RUN="));
-        assert_eq!(&run.argv[7..], ["app", "npm", "run", "dev"]);
+        let run_id = run.argv[6].strip_prefix("MAST_COMMAND_RUN=").unwrap();
+        let record = format!("/tmp/mast-runs/{run_id}");
+        assert_eq!(
+            &run.argv[7..],
+            [
+                "app",
+                "sh",
+                "-c",
+                RUN_WRAPPER,
+                "mast-run",
+                &record,
+                "dev_server",
+                "npm",
+                "run",
+                "dev"
+            ]
+        );
         assert_eq!(
             &run.stop_argv[..7],
             [
                 "docker",
                 "exec",
                 "-u",
-                "root",
+                "developer",
                 "original-container",
                 "sh",
                 "-c"
             ]
         );
         assert!(run.stop_argv[7].contains(&run.argv[6]));
+        assert!(run.stop_argv[7].contains(&record));
         let later = prepare(
             dir.path(),
             None,
             "app",
             Some("original-container"),
+            "dev server",
             &tail(&["npm", "run", "dev"]),
             OperationId(7),
         )
@@ -352,7 +462,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let script = stop_script(&format!("MAST_COMMAND_RUN={token}"));
+        let script = stop_script(&token);
         let output = tokio::process::Command::new("sh")
             .args(["-c", &script])
             .output()
@@ -369,5 +479,208 @@ mod tests {
             "other command runs must not be signalled"
         );
         unrelated.kill().await.unwrap();
+    }
+
+    async fn docker(args: &[&str]) -> mast_docker::CommandOutput {
+        let argv: Vec<String> = std::iter::once("docker")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        mast_docker::run_command(
+            &argv,
+            None,
+            &[],
+            std::time::Duration::from_secs(120),
+            64 * 1024,
+        )
+        .await
+        .expect("docker ran")
+    }
+
+    async fn docker_usable() -> bool {
+        if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
+            return false;
+        }
+        mast_docker::run_command(
+            &[
+                "docker".into(),
+                "info".into(),
+                "--format".into(),
+                "{{.OSType}}".into(),
+            ],
+            None,
+            &[],
+            std::time::Duration::from_secs(10),
+            16 * 1024,
+        )
+        .await
+        .map(|out| out.success() && out.stdout.trim() == "linux")
+        .unwrap_or(false)
+    }
+
+    struct RemoveContainer(String);
+
+    impl Drop for RemoveContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    /// Start a prepared run in a plain container the way `sail exec` would:
+    /// the run's user, marker and recording wrapper, with `command` standing
+    /// in for the Sail executable.
+    async fn start_in(container: &str, run: &ManagedCommand, command: &[&str]) {
+        let service = run.argv.iter().position(|arg| arg == "app").unwrap();
+        let mut argv: Vec<&str> = vec!["exec", "-d"];
+        argv.extend(run.argv[3..service].iter().map(String::as_str));
+        argv.push(container);
+        argv.extend(
+            run.argv[service + 1..service + 7]
+                .iter()
+                .map(String::as_str),
+        );
+        argv.extend(command);
+        let exec = docker(&argv).await;
+        assert!(exec.success(), "{}", exec.stderr);
+    }
+
+    // Sail's PHP processes run as `sail` and are non-dumpable — the PHP binary
+    // carries a file capability — so their environment is readable by neither
+    // root nor `sail`, and the marker cannot find them. A setgid copy of
+    // busybox stands in for that binary: running it makes a process
+    // non-dumpable the same way. (It must keep the name `busybox`, which is
+    // how busybox knows to take the applet from its first argument.) Both runs start through their real argv,
+    // wrapper included, and one is stopped through its real stop argv.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_reaches_command_processes_no_one_can_read() {
+        if !docker_usable().await {
+            eprintln!("skipping: no usable docker daemon");
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("mast-it-stop-{nonce}");
+        let _cleanup = RemoveContainer(name.clone());
+        let started = docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "alpine:latest",
+            "sleep",
+            "600",
+        ])
+        .await;
+        assert!(started.success(), "{}", started.stderr);
+        let setgid = docker(&[
+            "exec",
+            &name,
+            "sh",
+            "-c",
+            "mkdir /tmp/setgid && cp /bin/busybox /tmp/setgid/busybox \\
+             && chgrp daemon /tmp/setgid/busybox && chmod 2755 /tmp/setgid/busybox",
+        ])
+        .await;
+        assert!(setgid.success(), "{}", setgid.stderr);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "APP_USER=1000\n").unwrap();
+        let prepared = |op| {
+            prepare(
+                dir.path(),
+                None,
+                "app",
+                Some(&name),
+                "dev",
+                &tail(&["npm", "run", "dev"]),
+                OperationId(op),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let ours = prepared(1);
+        let theirs = prepared(2);
+        // A command with a child, as `artisan dev` has, beside another run.
+        start_in(
+            &name,
+            &ours,
+            &[
+                "/tmp/setgid/busybox",
+                "sh",
+                "-c",
+                "/tmp/setgid/busybox sleep 300 & wait",
+            ],
+        )
+        .await;
+        start_in(&name, &theirs, &["/tmp/setgid/busybox", "sleep", "301"]).await;
+        let record =
+            ours.argv[ours.argv.iter().position(|arg| arg == "mast-run").unwrap() + 1].clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ps = docker(&["exec", &name, "ps", "-o", "args"]).await;
+            let recorded = docker(&["exec", &name, "test", "-s", &record]).await;
+            if ps.stdout.contains("busybox sleep 300")
+                && ps.stdout.contains("sleep 301")
+                && recorded.success()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runs did not start:\n{}",
+                ps.stdout
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let fields = docker(&["exec", &name, "cat", &record]).await;
+        let fields: Vec<&str> = fields.stdout.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "record is `pid start name`: {fields:?}");
+        assert_eq!(fields[2], "dev");
+        // The case this guards: the command's own user cannot read its
+        // environment, so only the record and the process tree can find it.
+        let unreadable = docker(&[
+            "exec",
+            "-u",
+            "1000",
+            &name,
+            "sh",
+            "-c",
+            &format!("read -r pid start < {record} && ! cat /proc/$pid/environ >/dev/null 2>&1"),
+        ])
+        .await;
+        assert!(
+            unreadable.success(),
+            "the command's environment should be unreadable"
+        );
+
+        let stopped = mast_docker::run_command(
+            &ours.stop_argv,
+            None,
+            &[],
+            std::time::Duration::from_secs(30),
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(stopped.success(), "{}", stopped.stderr);
+        let ps = docker(&["exec", &name, "ps", "-o", "args"]).await;
+        assert!(
+            !ps.stdout.contains("sleep 300"),
+            "the command or its child is still running after a successful stop:\n{}",
+            ps.stdout
+        );
+        assert!(
+            ps.stdout.contains("sleep 301"),
+            "another run's process was stopped:\n{}",
+            ps.stdout
+        );
+        let kept = docker(&["exec", &name, "test", "-e", &record]).await;
+        assert!(!kept.success(), "a completed stop removes the run's record");
     }
 }

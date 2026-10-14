@@ -873,7 +873,7 @@ impl Engine {
             let app_service = app_service_of(&path);
             let container = self.process_container_id(project, &app_service);
             if let Some(managed) = crate::custom_command::prepare(
-                &path, invocation.as_ref(), &app_service, container.as_deref(), &argv[1..], op,
+                &path, invocation.as_ref(), &app_service, container.as_deref(), name, &argv[1..], op,
             )? {
                 argv = managed.argv;
                 stop_argv = Some(managed.stop_argv);
