@@ -91,6 +91,7 @@ pub(crate) fn prepare(
     invocation: Option<&ComposeInvocation>,
     app_service: &str,
     container: Option<&str>,
+    name: &str,
     tail: &[String],
     op: OperationId,
 ) -> Result<Option<ManagedCommand>, ErrorInfo> {
@@ -127,6 +128,7 @@ pub(crate) fn prepare(
         RUN_WRAPPER.into(),
         "mast-run".into(),
         format!("{RUN_DIR}/{run}"),
+        record_name(name),
     ]);
     argv.extend(command);
     // Stop as the user the command ran as, never as root. Reading another
@@ -154,7 +156,7 @@ pub(crate) fn prepare(
 /// so the record goes with the container — as does every process it names.
 const RUN_DIR: &str = "/tmp/mast-runs";
 
-/// Record the command's own PID and start time, then become the command.
+/// Record the command's own PID, start time and name, then become it.
 ///
 /// The environment marker alone cannot find every process. Sail's PHP binary
 /// carries a file capability (`cap_net_bind_service`, so `artisan serve` can
@@ -162,9 +164,32 @@ const RUN_DIR: &str = "/tmp/mast-runs";
 /// of a non-dumpable process is readable by no one without CAP_SYS_PTRACE —
 /// not even its own user. `exec` keeps the PID, so the record names the
 /// command itself; the start time tells it apart from an unrelated process
-/// that later reuses the number. The wrapper's own comm is `sh`, so field 22
-/// of its stat is the start time without parsing around a spaced name.
-const RUN_WRAPPER: &str = r#"mkdir -p "${1%/*}" 2>/dev/null; echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" > "$1" 2>/dev/null; shift; exec "$@""#;
+/// that later reuses the number; the name lets a record outlive the Mast
+/// session that wrote it and still say what it was. The wrapper's own comm is
+/// `sh`, so field 22 of its stat is the start time without parsing around a
+/// spaced name.
+const RUN_WRAPPER: &str = r#"mkdir -p "${1%/*}" 2>/dev/null; echo "$$ $(cut -d' ' -f22 /proc/$$/stat) $2" > "$1" 2>/dev/null; shift 2; exec "$@""#;
+
+/// A command name as one field of the record: anything outside a plain
+/// identifier becomes `_`, so the record stays three space-separated words.
+fn record_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "command".into()
+    } else {
+        clean
+    }
+}
 
 fn sail_environment(
     dir: &Path,
@@ -226,7 +251,7 @@ fn stop_script(run: &str) -> String {
     assert!(run.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     format!(
         r#"marker='MAST_COMMAND_RUN={run}'; record='{RUN_DIR}/{run}'; tracked=''; stopped=''; remaining=10
-if {{ read -r pid start < "$record" && read -r stat < "/proc/$pid/stat"; }} 2>/dev/null; then
+if {{ read -r pid start _ < "$record" && read -r stat < "/proc/$pid/stat"; }} 2>/dev/null; then
     rest=${{stat##*) }}; set -- $rest
     [ "${{20}}" = "$start" ] && tracked=$pid
 fi
@@ -301,6 +326,15 @@ mod tests {
     }
 
     #[test]
+    fn record_names_stay_one_field() {
+        assert_eq!(record_name("dev"), "dev");
+        assert_eq!(record_name("queue:work high"), "queue_work_high");
+        assert_eq!(record_name("vite.dev-2"), "vite.dev-2");
+        assert_eq!(record_name(""), "command");
+        assert_eq!(record_name(&"x".repeat(100)).len(), 64);
+    }
+
+    #[test]
     fn only_known_sail_executables_are_wrapped() {
         assert_eq!(
             executable(&tail(&["artisan", "queue:work"])),
@@ -356,6 +390,7 @@ mod tests {
             None,
             "app",
             Some("original-container"),
+            "dev server",
             &tail(&["npm", "run", "dev"]),
             OperationId(7),
         )
@@ -373,6 +408,7 @@ mod tests {
                 RUN_WRAPPER,
                 "mast-run",
                 &record,
+                "dev_server",
                 "npm",
                 "run",
                 "dev"
@@ -397,6 +433,7 @@ mod tests {
             None,
             "app",
             Some("original-container"),
+            "dev server",
             &tail(&["npm", "run", "dev"]),
             OperationId(7),
         )
@@ -500,7 +537,7 @@ mod tests {
         argv.extend(run.argv[3..service].iter().map(String::as_str));
         argv.push(container);
         argv.extend(
-            run.argv[service + 1..service + 6]
+            run.argv[service + 1..service + 7]
                 .iter()
                 .map(String::as_str),
         );
@@ -559,6 +596,7 @@ mod tests {
                 None,
                 "app",
                 Some(&name),
+                "dev",
                 &tail(&["npm", "run", "dev"]),
                 OperationId(op),
             )
@@ -600,6 +638,10 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        let fields = docker(&["exec", &name, "cat", &record]).await;
+        let fields: Vec<&str> = fields.stdout.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "record is `pid start name`: {fields:?}");
+        assert_eq!(fields[2], "dev");
         // The case this guards: the command's own user cannot read its
         // environment, so only the record and the process tree can find it.
         let unreadable = docker(&[
