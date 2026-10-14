@@ -156,6 +156,80 @@ pub struct ProcessState {
     pub id: String,
     pub title: String,
     pub running: bool,
+    /// How many copies are running in the app container, whoever started
+    /// them. More than one of a daemon is almost always a leftover: two
+    /// Horizon masters both work the queue, two schedulers run every task
+    /// twice.
+    #[serde(default)]
+    pub instances: u32,
+}
+
+/// Who started a process tree running inside a project's app container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ContainerRunOwner {
+    /// A command or process this Mast session is running.
+    Mast { command: String },
+    /// A command an earlier Mast session started and no longer tracks — the
+    /// app quit or restarted while it ran, which never stops what a
+    /// `docker exec` started.
+    EarlierMast { command: String },
+    /// Started in the container by something other than Mast: a terminal
+    /// (`sail artisan …`), an agent, another tool.
+    Outside,
+    /// Whatever started it has exited, and the container's init adopted it.
+    Orphaned,
+}
+
+/// One process tree running inside a project's app container beyond the
+/// container's own startup: each `docker exec` session — what Mast's
+/// commands, a terminal's `sail artisan …` and agents all create — and
+/// anything left behind when its starter exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRun {
+    /// The tree's root, as the container numbers it. With `start_ticks`, the
+    /// identity [`Action::StopContainerRun`] targets.
+    pub pid: u32,
+    /// The root's start time in clock ticks since boot, so a stop can never
+    /// reach a different process that has since reused the PID.
+    pub start_ticks: u64,
+    pub owner: ContainerRunOwner,
+    /// The command name for Mast's runs; otherwise the root's command line,
+    /// shortened.
+    pub title: String,
+    pub command_line: String,
+    pub started_at_unix: u64,
+    /// Resident memory of the whole tree, rounded.
+    pub memory_bytes: u64,
+    pub process_count: u32,
+    /// What it runs, in display terms ("Horizon", "Vite", …), one entry per
+    /// kind present.
+    pub kinds: Vec<String>,
+}
+
+/// Something wrong with a project that a click can fix, shown on its card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Advisory {
+    pub message: String,
+    pub actions: Vec<AdvisoryAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AdvisoryAction {
+    /// Stop one process tree in the app container ([`ContainerRun`]).
+    StopContainerRun {
+        label: String,
+        pid: u32,
+        #[serde(rename = "startTicks")]
+        start_ticks: u64,
+    },
+    /// Restart one of the project's commands.
+    RestartCommand { label: String, name: String },
+    /// Apply a named repair ([`Action::ApplyRepair`]).
+    ApplyRepair { label: String, repair: String, arg: Option<String> },
 }
 
 /// The app's Sail PHP runtime: what `build.context` currently pins and which
@@ -280,6 +354,14 @@ pub struct ProjectSummary {
     /// Non-fatal conditions worth surfacing (M4): unbootstrapped Sail clone,
     /// missing .env, both compose-file families present, …
     pub warnings: Vec<String>,
+    /// Process trees running in the app container beyond its own startup —
+    /// Mast's commands and anything else, with who started each.
+    #[serde(default)]
+    pub container_runs: Vec<ContainerRun>,
+    /// Problems a click can fix: duplicate daemons, pages not using the
+    /// project's Vite.
+    #[serde(default)]
+    pub advisories: Vec<Advisory>,
     /// The user's dragged position in the project list
     /// ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
     /// pre-ordering world — every rank 0 — stays exactly alphabetical.
@@ -1151,6 +1233,15 @@ pub enum Action {
     /// Stop a Laravel app process (SIGTERM by cmdline match in-container —
     /// also catches processes started from a terminal).
     StopProcess { id: ProjectId, process: String },
+    /// Stop one process tree in the app container ([`ContainerRun`]) —
+    /// SIGTERM to the root and every descendant, provided the root still has
+    /// the start time it was listed with.
+    StopContainerRun {
+        id: ProjectId,
+        pid: u32,
+        #[serde(rename = "startTicks")]
+        start_ticks: u64,
+    },
     /// Replace the project's user-defined command list (persisted).
     SetProjectCommands { id: ProjectId, commands: Vec<ProjectCommand> },
     /// Run one user-defined command as a streamed cancellable operation.
@@ -1363,6 +1454,34 @@ mod tests {
                 id: "horizon".into(),
                 title: "Horizon".into(),
                 running: true,
+                instances: 2,
+            }],
+            container_runs: vec![ContainerRun {
+                pid: 42,
+                start_ticks: 16_984_000,
+                owner: ContainerRunOwner::EarlierMast { command: "dev".into() },
+                title: "dev".into(),
+                command_line: "sh -c pnpm dlx @laravel/multiplex".into(),
+                started_at_unix: 1_791_961_641,
+                memory_bytes: 2_400_000_000,
+                process_count: 29,
+                kinds: vec!["Horizon".into(), "Vite".into()],
+            }],
+            advisories: vec![Advisory {
+                message: "Horizon is running twice.".into(),
+                actions: vec![
+                    AdvisoryAction::StopContainerRun {
+                        label: "Stop the leftover dev".into(),
+                        pid: 42,
+                        start_ticks: 16_984_000,
+                    },
+                    AdvisoryAction::RestartCommand { label: "Restart dev".into(), name: "dev".into() },
+                    AdvisoryAction::ApplyRepair {
+                        label: "Remove public/hot".into(),
+                        repair: "remove-hot".into(),
+                        arg: None,
+                    },
+                ],
             }],
             git_branch: Some("main".into()),
             git_dirty: Some(false),
@@ -1573,6 +1692,7 @@ mod tests {
             },
             Action::StartProcess { id: ProjectId("p1".into()), process: "reverb".into() },
             Action::StopProcess { id: ProjectId("p1".into()), process: "reverb".into() },
+            Action::StopContainerRun { id: ProjectId("p1".into()), pid: 42, start_ticks: 16_984_000 },
             Action::SetProjectCommands {
                 id: ProjectId("p1".into()),
                 commands: vec![ProjectCommand {

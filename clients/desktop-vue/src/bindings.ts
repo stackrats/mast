@@ -522,6 +522,12 @@ export type Action =
  */
 { type: "stopProcess"; id: ProjectId; process: string } | 
 /**
+ * Stop one process tree in the app container ([`ContainerRun`]) —
+ * SIGTERM to the root and every descendant, provided the root still has
+ * the start time it was listed with.
+ */
+{ type: "stopContainerRun"; id: ProjectId; pid: number; startTicks: number } | 
+/**
  * Replace the project's user-defined command list (persisted).
  */
 { type: "setProjectCommands"; id: ProjectId; commands: ProjectCommand[] } | 
@@ -598,6 +604,23 @@ export type Action =
  */
 { type: "reorderWorkspaces"; ids: WorkspaceId[] }
 /**
+ * Something wrong with a project that a click can fix, shown on its card.
+ */
+export type Advisory = { message: string; actions: AdvisoryAction[] }
+export type AdvisoryAction = 
+/**
+ * Stop one process tree in the app container ([`ContainerRun`]).
+ */
+{ type: "stopContainerRun"; label: string; pid: number; startTicks: number } | 
+/**
+ * Restart one of the project's commands.
+ */
+{ type: "restartCommand"; label: string; name: string } | 
+/**
+ * Apply a named repair ([`Action::ApplyRepair`]).
+ */
+{ type: "applyRepair"; label: string; repair: string; arg: string | null }
+/**
  * Why a capture was taken. The reason is the whole diagnostic frame: the same
  * forty lines mean something different before a user-requested restart than
  * they do after a container fell over on its own.
@@ -657,6 +680,60 @@ installedImage: string | null;
  * running — in each case there is no choice to present.
  */
 versions: string[] }
+/**
+ * One process tree running inside a project's app container beyond the
+ * container's own startup: each `docker exec` session — what Mast's
+ * commands, a terminal's `sail artisan …` and agents all create — and
+ * anything left behind when its starter exited.
+ */
+export type ContainerRun = { 
+/**
+ * The tree's root, as the container numbers it. With `start_ticks`, the
+ * identity [`Action::StopContainerRun`] targets.
+ */
+pid: number; 
+/**
+ * The root's start time in clock ticks since boot, so a stop can never
+ * reach a different process that has since reused the PID.
+ */
+startTicks: number; owner: ContainerRunOwner; 
+/**
+ * The command name for Mast's runs; otherwise the root's command line,
+ * shortened.
+ */
+title: string; commandLine: string; startedAtUnix: number; 
+/**
+ * Resident memory of the whole tree, rounded.
+ */
+memoryBytes: number; processCount: number; 
+/**
+ * What it runs, in display terms ("Horizon", "Vite", …), one entry per
+ * kind present.
+ */
+kinds: string[] }
+/**
+ * Who started a process tree running inside a project's app container.
+ */
+export type ContainerRunOwner = 
+/**
+ * A command or process this Mast session is running.
+ */
+{ type: "mast"; command: string } | 
+/**
+ * A command an earlier Mast session started and no longer tracks — the
+ * app quit or restarted while it ran, which never stops what a
+ * `docker exec` started.
+ */
+{ type: "earlierMast"; command: string } | 
+/**
+ * Started in the container by something other than Mast: a terminal
+ * (`sail artisan …`), an agent, another tool.
+ */
+{ type: "outside" } | 
+/**
+ * Whatever started it has exited, and the container's init adopted it.
+ */
+{ type: "orphaned" }
 /**
  * Container runtime state as reported by the daemon.
  */
@@ -1039,7 +1116,14 @@ nodeAvailable?: string[] }
  * long-running artisan command inside the app container. Detected from
  * composer.json/.env; `running` comes from an in-container cmdline scan.
  */
-export type ProcessState = { id: string; title: string; running: boolean }
+export type ProcessState = { id: string; title: string; running: boolean; 
+/**
+ * How many copies are running in the app container, whoever started
+ * them. More than one of a daemon is almost always a leftover: two
+ * Horizon masters both work the queue, two schedulers run every task
+ * twice.
+ */
+instances?: number }
 /**
  * A user-defined per-project command (M7.5): argv-only (whitespace-split,
  * no shell), `sail` prefix resolves to `vendor/bin/sail`.
@@ -1155,6 +1239,16 @@ localDomain?: string | null;
  * missing .env, both compose-file families present, …
  */
 warnings: string[]; 
+/**
+ * Process trees running in the app container beyond its own startup —
+ * Mast's commands and anything else, with who started each.
+ */
+containerRuns?: ContainerRun[]; 
+/**
+ * Problems a click can fix: duplicate daemons, pages not using the
+ * project's Vite.
+ */
+advisories?: Advisory[]; 
 /**
  * The user's dragged position in the project list
  * ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the

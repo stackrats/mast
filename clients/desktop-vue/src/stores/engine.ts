@@ -167,6 +167,11 @@ export function processKey(project: string, process: string): string {
   return `${project}:process:${process}`;
 }
 
+/** One process tree in a project's app container, by root PID and start time. */
+export function containerRunKey(project: string, pid: number, startTicks: number): string {
+  return `${project}:run:${pid}:${startTicks}`;
+}
+
 /** Share-tunnel operations get their own op slot: the tunnel runs
  * indefinitely, and parking it on the project key would block the lifecycle
  * buttons (and their Cancel semantics) the whole time. */
@@ -207,6 +212,10 @@ export const useEngineStore = defineStore("engine", {
     projects: [] as ProjectSummary[],
     workspaces: [] as WorkspaceSummary[],
     operations: {} as Record<ProjectId, OperationView>,
+    /** Process trees in app containers being stopped, keyed by
+     * {@link containerRunKey}: both the run list and an advisory can stop the
+     * same one, and both should show it going. */
+    stoppingRuns: {} as Record<string, true>,
     activity: [] as ActivityLine[],
     /** Effect history, oldest first — the logs panel's History tab. */
     history: [] as HistoryEntry[],
@@ -945,6 +954,20 @@ export const useEngineStore = defineStore("engine", {
         return false;
       } finally {
         if (current()) op.cancelling = false;
+      }
+    },
+
+    /** Stop one process tree in a project's app container, as the card
+     * lists it — root PID and start time, so a stale listing cannot reach a
+     * process that has since reused the number. */
+    async stopContainerRun(project: ProjectId, pid: number, startTicks: number): Promise<void> {
+      const key = containerRunKey(project, pid, startTicks);
+      if (this.stoppingRuns[key] || this.readOnly) return;
+      this.stoppingRuns[key] = true;
+      try {
+        await this.run({ type: "stopContainerRun", id: project, pid, startTicks });
+      } finally {
+        delete this.stoppingRuns[key];
       }
     },
 

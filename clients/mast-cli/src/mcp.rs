@@ -1140,6 +1140,8 @@ mod tests {
             services: Vec::new(),
             resolution_error: None,
             warnings: Vec::new(),
+            container_runs: Vec::new(),
+            advisories: Vec::new(),
             rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),

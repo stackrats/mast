@@ -13,6 +13,8 @@ use mast_contract::{ErrorInfo, OperationId, ProjectId};
 pub(crate) struct ManagedCommand {
     pub(crate) argv: Vec<String>,
     pub(crate) stop_argv: Vec<String>,
+    /// The run id its record in the container is named by.
+    pub(crate) run: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -149,7 +151,11 @@ pub(crate) fn prepare(
         None => exec_prefix(dir, invocation, &service, &app_user, None)?,
     };
     stop_argv.extend(["sh".into(), "-c".into(), stop_script(&run)]);
-    Ok(Some(ManagedCommand { argv, stop_argv }))
+    Ok(Some(ManagedCommand {
+        argv,
+        stop_argv,
+        run,
+    }))
 }
 
 /// Where each run records its command's PID, inside the container. In /tmp,
@@ -172,7 +178,7 @@ const RUN_WRAPPER: &str = r#"mkdir -p "${1%/*}" 2>/dev/null; echo "$$ $(cut -d' 
 
 /// A command name as one field of the record: anything outside a plain
 /// identifier becomes `_`, so the record stays three space-separated words.
-fn record_name(name: &str) -> String {
+pub(crate) fn record_name(name: &str) -> String {
     let clean: String = name
         .chars()
         .take(64)
@@ -481,52 +487,7 @@ mod tests {
         unrelated.kill().await.unwrap();
     }
 
-    async fn docker(args: &[&str]) -> mast_docker::CommandOutput {
-        let argv: Vec<String> = std::iter::once("docker")
-            .chain(args.iter().copied())
-            .map(String::from)
-            .collect();
-        mast_docker::run_command(
-            &argv,
-            None,
-            &[],
-            std::time::Duration::from_secs(120),
-            64 * 1024,
-        )
-        .await
-        .expect("docker ran")
-    }
-
-    async fn docker_usable() -> bool {
-        if std::env::var_os("MAST_SKIP_DOCKER_TESTS").is_some() {
-            return false;
-        }
-        mast_docker::run_command(
-            &[
-                "docker".into(),
-                "info".into(),
-                "--format".into(),
-                "{{.OSType}}".into(),
-            ],
-            None,
-            &[],
-            std::time::Duration::from_secs(10),
-            16 * 1024,
-        )
-        .await
-        .map(|out| out.success() && out.stdout.trim() == "linux")
-        .unwrap_or(false)
-    }
-
-    struct RemoveContainer(String);
-
-    impl Drop for RemoveContainer {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "-f", &self.0])
-                .output();
-        }
-    }
+    use crate::test_docker::{docker, docker_usable};
 
     /// Start a prepared run in a plain container the way `sail exec` would:
     /// the run's user, marker and recording wrapper, with `command` standing
@@ -560,23 +521,7 @@ mod tests {
             eprintln!("skipping: no usable docker daemon");
             return;
         }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let name = format!("mast-it-stop-{nonce}");
-        let _cleanup = RemoveContainer(name.clone());
-        let started = docker(&[
-            "run",
-            "-d",
-            "--name",
-            &name,
-            "alpine:latest",
-            "sleep",
-            "600",
-        ])
-        .await;
-        assert!(started.success(), "{}", started.stderr);
+        let (name, _cleanup) = crate::test_docker::alpine().await;
         let setgid = docker(&[
             "exec",
             &name,
