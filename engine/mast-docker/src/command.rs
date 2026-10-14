@@ -295,6 +295,13 @@ async fn wait_for_killed_child(child: &mut tokio::process::Child) -> std::io::Re
         .map(|_| ())
 }
 
+/// Whether any process is still in the group — `kill` with signal 0 checks
+/// without signalling.
+#[cfg(unix)]
+fn group_alive(pid: i32) -> bool {
+    unsafe { libc::kill(-pid, 0) == 0 }
+}
+
 #[cfg(unix)]
 async fn terminate_streaming_child(
     child: &mut tokio::process::Child,
@@ -302,9 +309,22 @@ async fn terminate_streaming_child(
     grace: Option<Duration>,
 ) -> std::io::Result<()> {
     if let Some(grace) = grace {
+        let deadline = tokio::time::Instant::now() + grace;
         kill_group(pid as i32, SIG_TERM);
         if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
-            return status.map(|_| ());
+            status?;
+            // The direct child is gone; whatever else it started in the group
+            // gets the rest of the grace to follow, then SIGKILL. A descendant
+            // that outlives the TERM — one that ignores it, or one caught
+            // mid-fork when it arrived — keeps the output pipes open, and a
+            // stop would otherwise wait on it for as long as it runs.
+            while group_alive(pid as i32) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if group_alive(pid as i32) {
+                kill_group(pid as i32, SIG_KILL);
+            }
+            return Ok(());
         }
     }
     kill_group(pid as i32, SIG_KILL);
@@ -701,6 +721,50 @@ mod tests {
         let outcome = handle.await.unwrap().unwrap();
         assert_eq!(outcome, CommandOutcome::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(5), "cancel was not prompt");
+    }
+
+    /// A descendant can outlive the group's SIGTERM — by ignoring it, as
+    /// here, or by being mid-fork when it lands, as a loaded macOS runner
+    /// showed — and it holds the output pipes. Once the direct child is gone,
+    /// the rest of the group must still be stopped within the grace.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_stops_a_descendant_that_outlives_the_term() {
+        let (tx, mut rx) = mpsc::channel(64);
+        // An ignored signal stays ignored across exec.
+        let argv: Vec<String> = ["sh", "-c", "(trap '' TERM; exec sleep 300) & echo $!; wait"]
+            .map(String::from)
+            .to_vec();
+        let cancel = CancellationToken::new();
+        let handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_streaming(
+                    &argv,
+                    None,
+                    &[],
+                    tx,
+                    cancel,
+                    Duration::from_secs(60),
+                    Duration::from_secs(1),
+                )
+                .await
+            })
+        };
+        let sleeper: i32 = rx.recv().await.unwrap().line.trim().parse().unwrap();
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        assert_eq!(handle.await.unwrap().unwrap(), CommandOutcome::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5), "cancel was not prompt");
+        // Gone, not merely signalled: give init a moment to reap it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(sleeper, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the descendant that ignored SIGTERM outlived the cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[cfg(windows)]
