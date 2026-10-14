@@ -10,7 +10,7 @@ Mast observed containers. Everything that matters for a Laravel app runs as
 processes _inside_ one — Horizon, the scheduler, queue workers, Reverb,
 Vite — and every `docker exec` leaves its own process tree there, which
 outlives the client that started it. Quitting Mast, a Stop that silently
-failed (v0.7.2–v0.7.5), an agent's `sail artisan horizon`: each left trees
+failed (v0.7.2–v0.7.4), an agent's `sail artisan horizon`: each left trees
 nobody could see. One real container held two `artisan dev` stacks, 3 GB and
 0.5 GB: two Horizon masters, two schedulers running every task twice, and a
 Vite whose exit had deleted the other's `public/hot`, so pages served an old
