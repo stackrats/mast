@@ -27,8 +27,8 @@ importers:
   clients/desktop-vue:
     dependencies:
       '@tauri-apps/api':
-        specifier: ^2
-        version: 2.11.1
+        specifier: ^2.12.3
+        version: 2.12.3
       '@tauri-apps/plugin-autostart':
         specifier: ^2
         version: 2.5.1
@@ -551,8 +551,8 @@ packages:
     peerDependencies:
       vue: ^2.7.0 || ^3.0.0
 
-  '@tauri-apps/api@2.11.1':
-    resolution: {integrity: sha512-M2FPuYND2m+wh5hfW9ZpSdxMPdEJovPBWwoHJmwUpysTYNHaOkVFN419m/K0LIgjb/7KU2vBgsUepJWugQCvAA==}
+  '@tauri-apps/api@2.12.3':
+    resolution: {integrity: sha512-9s0PKw0p4r3kFq92jhpivYSp+cSht15o0gXpZxuQd0+dV9KCexEVkNaLELVoLdJWyoH4KlfQo5h3W2LIM8siJg==}
 
   '@tauri-apps/plugin-autostart@2.5.1':
     resolution: {integrity: sha512-zS/xx7yzveCcotkA+8TqkI2lysmG2wvQXv2HGAVExITmnFfHAdj1arGsbbfs3o6EktRHf6l34pJxc3YGG2mg7w==}
@@ -1928,19 +1928,19 @@ snapshots:
       '@tanstack/virtual-core': 3.17.7
       vue: 3.5.40(typescript@5.9.3)
 
-  '@tauri-apps/api@2.11.1': {}
+  '@tauri-apps/api@2.12.3': {}
 
   '@tauri-apps/plugin-autostart@2.5.1':
     dependencies:
-      '@tauri-apps/api': 2.11.1
+      '@tauri-apps/api': 2.12.3
 
   '@tauri-apps/plugin-dialog@2.7.2':
     dependencies:
-      '@tauri-apps/api': 2.11.1
+      '@tauri-apps/api': 2.12.3
 
   '@tauri-apps/plugin-notification@2.3.3':
     dependencies:
-      '@tauri-apps/api': 2.11.1
+      '@tauri-apps/api': 2.12.3
 
   '@testing-library/dom@10.4.1':
     dependencies:
@@ -1976,11 +1976,11 @@ snapshots:
       vite: '@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)'
       vue: 3.5.40(typescript@5.9.3)
 
-  '@vitest/browser-preview@4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))':
+  '@vitest/browser-preview@4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)':
     dependencies:
       '@testing-library/dom': 10.4.1
       '@testing-library/user-event': 14.6.1(@testing-library/dom@10.4.1)
-      '@vitest/browser': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))
+      '@vitest/browser': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)
       vitest: 4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))
     transitivePeerDependencies:
       - bufferutil
@@ -1988,7 +1988,7 @@ snapshots:
       - utf-8-validate
       - vite
 
-  '@vitest/browser@4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))':
+  '@vitest/browser@4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)':
     dependencies:
       '@blazediff/core': 1.9.1
       '@vitest/mocker': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))
@@ -2706,8 +2706,8 @@ snapshots:
     dependencies:
       '@oxc-project/types': 0.141.0
       '@oxlint/plugins': 1.73.0
-      '@vitest/browser': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))
-      '@vitest/browser-preview': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))
+      '@vitest/browser': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)
+      '@vitest/browser-preview': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)
       '@vitest/expect': 4.1.10
       '@vitest/mocker': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))
       '@vitest/pretty-format': 4.1.10
@@ -2783,7 +2783,7 @@ snapshots:
       vite: '@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)'
       why-is-node-running: 2.3.0
     optionalDependencies:
-      '@vitest/browser-preview': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10(@vitest/browser-preview@4.1.10)(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3)))
+      '@vitest/browser-preview': 4.1.10(@voidzero-dev/vite-plus-core@0.2.6(jiti@2.7.0)(typescript@5.9.3))(vitest@4.1.10)
     transitivePeerDependencies:
       - msw
 
