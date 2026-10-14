@@ -3488,7 +3488,16 @@ async fn removing_project_cancels_its_running_command_before_forgetting_it() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
+    // DEBUG (ci-debug branch only): repeat to catch the macOS-runner failure.
+    for round in 0..15 {
+        removal_round(round).await;
+    }
+}
+
+#[cfg(unix)]
+async fn removal_round(round: u32) {
     use std::os::unix::fs::PermissionsExt;
+    eprintln!("DEBUG round {round}");
 
     let tmp = tempfile::tempdir().unwrap();
     let project = make_project(tmp.path(), "slow-shutdown");
