@@ -236,6 +236,18 @@ fn probe_unix_socket(_path: &std::path::Path) -> DockerUnavailable {
     DockerUnavailable::NotRunning
 }
 
+/// Inside a project's `public/`, only `hot` matters to Mast; a build that
+/// writes its output straight into `public/` must not set off a reconcile
+/// per file. Everything else watched is a project root or a watched
+/// directory, where any change may matter.
+fn relevant_change(path: &std::path::Path) -> bool {
+    let in_public = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "public");
+    !in_public || path.file_name().is_some_and(|name| name == "hot")
+}
+
 /// Watch watched-directories and imported project roots (non-recursive) for
 /// compose-file/.env changes; every debounced burst is one hint. The watcher
 /// is rebuilt when the watched path set changes.
@@ -252,17 +264,29 @@ async fn file_watcher_loop(engine: Engine, hint_tx: mpsc::Sender<()>) {
             let st = engine.inner.state.lock().unwrap();
             let mut paths = st.watched_directories.clone();
             paths.extend(st.projects.values().map(|e| e.record.path.clone()));
-            paths.sort();
-            paths.dedup();
             paths
         };
+        // `public/` too, for `public/hot`: a Vite starting or exiting there
+        // changes where every page gets its assets, and the card should say
+        // so now rather than on the next timed pass.
+        let mut desired: Vec<PathBuf> = desired
+            .into_iter()
+            .flat_map(|path| {
+                let public = path.join("public");
+                std::iter::once(path).chain(public.is_dir().then_some(public))
+            })
+            .collect();
+        desired.sort();
+        desired.dedup();
         if desired != watched {
             let tx = hint_tx.clone();
             match notify_debouncer_full::new_debouncer(
                 Duration::from_millis(200),
                 None,
                 move |result: notify_debouncer_full::DebounceEventResult| {
-                    if result.is_ok() {
+                    if result.is_ok_and(|events| {
+                        events.iter().any(|event| event.paths.iter().any(|path| relevant_change(path)))
+                    }) {
                         let _ = tx.try_send(());
                     }
                 },
@@ -509,15 +533,14 @@ async fn reconcile(engine: &Engine) {
         None => None,
     };
 
-    // App-process running states (M8.5): one in-container cmdline scan per
-    // project that has detected processes and a running app container.
-    let mut process_scans: HashMap<String, String> = HashMap::new();
+    // What runs inside each running app container, and who started it: one
+    // `/proc` walk per project (see `inventory`). It also answers the app
+    // processes' running states (M8.5).
+    let mut process_scans: HashMap<String, crate::inventory::Scan> = HashMap::new();
+    let mut vite_facts: HashMap<String, crate::inventory::ViteFacts> = HashMap::new();
     if let Some(observations) = &observations {
         for (id, dir) in &project_dirs {
-            let Some((detected, app_service)) = process_infos.get(id) else { continue };
-            if detected.is_empty() {
-                continue;
-            }
+            let Some((_, app_service)) = process_infos.get(id) else { continue };
             let dir_str = dir.to_string_lossy();
             let matched: Vec<&ContainerObservation> = observations
                 .iter()
@@ -535,19 +558,34 @@ async fn reconcile(engine: &Engine) {
                 container.id.as_str(),
                 "sh",
                 "-c",
-                mast_laravel::processes::scan_script(),
+                crate::inventory::SCAN_SCRIPT,
             ]
             .map(String::from)
             .into();
             if let Ok(out) =
-                mast_docker::run_command(&argv, None, &[], Duration::from_secs(5), 256 * 1024)
+                mast_docker::run_command(&argv, None, &[], Duration::from_secs(5), 1024 * 1024)
                     .await
                 && out.success()
+                && let Some(scan) = crate::inventory::parse(&out.stdout)
             {
-                process_scans.insert(id.clone(), out.stdout);
+                process_scans.insert(id.clone(), scan);
+                let dir = dir.clone();
+                if let Ok(facts) =
+                    tokio::task::spawn_blocking(move || crate::inventory::read_vite_facts(&dir)).await
+                {
+                    vite_facts.insert(id.clone(), facts);
+                }
             }
         }
     }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // What this session is running, per project — read before the state
+    // lock, never inside it.
+    let lives: HashMap<String, crate::inventory::Live> =
+        process_scans.keys().map(|id| (id.clone(), engine.live_in(id))).collect();
 
     // ---- fold everything into state, emitting minimal patches ----
     // The fold also notices services that died since the last pass. It runs
@@ -664,17 +702,37 @@ async fn reconcile(engine: &Engine) {
             if let Some(php) = php_infos.get(&id) {
                 summary.php = php.clone();
             }
+            let scan = process_scans.get(&id);
+            let counts = scan.map(crate::inventory::kind_counts).unwrap_or_default();
+            let live = lives.get(&id).cloned().unwrap_or_default();
+            summary.container_runs = scan
+                .map(|scan| crate::inventory::runs(scan, &live, now_unix))
+                .unwrap_or_default();
+            summary.advisories =
+                crate::inventory::duplicate_advisories(&summary.container_runs, &counts);
+            if let Some(facts) = vite_facts.get(&id) {
+                summary
+                    .advisories
+                    .extend(crate::inventory::vite_advisories(facts, &summary.container_runs));
+            }
             if let Some((detected, _)) = process_infos.get(&id) {
+                // Running means a process that IS the daemon, found by the
+                // same reading of each command line as everything else here —
+                // not the daemon's name anywhere in any command line, which a
+                // dev-stack runner carries in its arguments long after the
+                // pane running it has died.
                 summary.processes = detected
                     .iter()
-                    .map(|def| mast_contract::ProcessState {
-                        id: def.id.to_string(),
-                        title: def.title.to_string(),
-                        running: process_scans
-                            .get(&id)
-                            .is_some_and(|scan| {
-                                mast_laravel::processes::scan_shows(scan, def.pattern)
-                            }),
+                    .map(|def| {
+                        let instances = crate::inventory::kind_of_process_id(def.id)
+                            .and_then(|kind| counts.get(kind).copied())
+                            .unwrap_or(0);
+                        mast_contract::ProcessState {
+                            id: def.id.to_string(),
+                            title: def.title.to_string(),
+                            running: instances > 0,
+                            instances,
+                        }
                     })
                     .collect();
             }
@@ -980,8 +1038,19 @@ fn build_services(
 mod tests {
     use super::{
         CommandError, DockerError, build_services, connect_error_text, merge_host_ports,
-        parse_git_status,
+        parse_git_status, relevant_change,
     };
+
+    #[test]
+    fn only_the_hot_file_counts_inside_public() {
+        use std::path::Path;
+        assert!(relevant_change(Path::new("/p/app/public/hot")));
+        assert!(!relevant_change(Path::new("/p/app/public/app.js")));
+        assert!(!relevant_change(Path::new("/p/app/public/build")));
+        assert!(relevant_change(Path::new("/p/app/.env")));
+        assert!(relevant_change(Path::new("/p/app/public")));
+        assert!(relevant_change(Path::new("/p/new-project")));
+    }
 
     #[test]
     fn container_association_respects_directory_boundaries() {

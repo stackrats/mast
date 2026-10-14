@@ -11,6 +11,9 @@ mod db_repair;
 mod diagnostics;
 mod effects;
 mod history;
+mod inventory;
+#[cfg(test)]
+mod test_docker;
 pub mod integrations;
 mod lifecycle;
 mod lock;
@@ -176,6 +179,9 @@ pub(crate) struct Inner {
     pub(crate) ops: Mutex<HashMap<u64, Arc<OpHandle>>>,
     /// Built-in Laravel supervisors, keyed by project and process name.
     pub(crate) process_runs: Mutex<HashMap<(String, String), OperationId>>,
+    /// Sail commands this session is running, by the run id their record in
+    /// the container carries: (project id, command name).
+    pub(crate) command_runs: Mutex<HashMap<String, (String, String)>>,
     pub(crate) next_op: AtomicU64,
     pub adapter: Mutex<Option<Arc<dyn RuntimeAdapter>>>,
     pub hint_tx: Mutex<Option<mpsc::Sender<()>>>,
@@ -276,6 +282,8 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         services: Vec::new(),
         resolution_error: None,
         warnings: Vec::new(),
+        container_runs: Vec::new(),
+        advisories: Vec::new(),
         rank: record.rank,
         commands: commands_to_contract(record),
         processes: Vec::new(),
@@ -384,6 +392,7 @@ impl Engine {
                 patches_tx,
                 ops: Mutex::new(HashMap::new()),
                 process_runs: Mutex::new(HashMap::new()),
+                command_runs: Mutex::new(HashMap::new()),
                 next_op: AtomicU64::new(0),
                 adapter: Mutex::new(None),
                 hint_tx: Mutex::new(None),
@@ -457,6 +466,34 @@ impl Engine {
         if let Some(tx) = self.inner.hint_tx.lock().unwrap().as_ref() {
             let _ = tx.try_send(());
         }
+    }
+
+    /// What this session is running in a project's app container, for
+    /// telling its own process trees from everyone else's.
+    pub(crate) fn live_in(&self, project: &str) -> inventory::Live {
+        let commands = self
+            .inner
+            .command_runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (id, _))| id == project)
+            .map(|(run, (_, name))| (run.clone(), name.clone()))
+            .collect();
+        let processes = self
+            .inner
+            .process_runs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(id, _)| id == project)
+            .filter_map(|(_, process)| {
+                let kind = inventory::kind_of_process_id(process)?;
+                let title = mast_laravel::processes::process_def(process)?.title.to_string();
+                Some((kind, title))
+            })
+            .collect();
+        inventory::Live { commands, processes }
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -1046,6 +1083,13 @@ impl Engine {
                 let h = handle.clone();
                 self.spawn_operation(id, handle, async move {
                     engine.stop_process(&h, id, &project, &process).await
+                });
+            }
+            Action::StopContainerRun { id: project, pid, start_ticks } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.stop_container_run(&h, id, &project, pid, start_ticks).await
                 });
             }
             Action::SetProjectCommands { id: project, commands } => {

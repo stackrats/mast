@@ -790,6 +790,132 @@ impl Engine {
             .and_then(|service| service.container_id.clone())
     }
 
+    /// Stop copies of command `name` that an earlier Mast session left running
+    /// in the app container, so running it replaces them rather than adding a
+    /// second. Quitting Mast never ends what its `docker exec`s started, so
+    /// without this every relaunch's auto-start doubles the dev stack. Only
+    /// runs whose record names this exact command qualify; nothing started
+    /// outside Mast is touched. Finding them is best-effort — a failed scan
+    /// starts the command as before — but a leftover that will not stop
+    /// stops the run.
+    async fn replace_leftovers(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        project: &ProjectId,
+        container: &str,
+        name: &str,
+    ) -> Result<(), ErrorInfo> {
+        let argv: Vec<String> = ["docker", "exec", container, "sh", "-c", crate::inventory::SCAN_SCRIPT]
+            .map(String::from)
+            .into();
+        let Ok(out) =
+            mast_docker::run_command(&argv, None, &[], Duration::from_secs(5), 1024 * 1024).await
+        else {
+            return Ok(());
+        };
+        let Some(scan) = out.success().then(|| crate::inventory::parse(&out.stdout)).flatten() else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let wanted = crate::custom_command::record_name(name);
+        let leftovers = crate::inventory::runs(&scan, &self.live_in(&project.0), now)
+            .into_iter()
+            .filter(|run| {
+                matches!(&run.owner, mast_contract::ContainerRunOwner::EarlierMast { command } if *command == wanted)
+            });
+        for run in leftovers {
+            self.emit_op(
+                handle,
+                op,
+                OperationEventKind::Output {
+                    line: format!(
+                        "stopping the {name} an earlier Mast session left running ({} processes)",
+                        run.process_count
+                    ),
+                    stderr: false,
+                },
+            );
+            let stop: Vec<String> = vec![
+                "docker".into(),
+                "exec".into(),
+                container.into(),
+                "sh".into(),
+                "-c".into(),
+                crate::inventory::stop_tree_script(run.pid, run.start_ticks),
+            ];
+            run_process_stop(&stop, Path::new("")).await?;
+        }
+        Ok(())
+    }
+
+    /// The container whose processes the card lists — reconcile's choice:
+    /// the app service, else the one service named like an app, else the
+    /// only service there is.
+    pub(crate) fn inventory_container(&self, project: &ProjectId) -> Option<String> {
+        let path = self.inner.state.lock().unwrap().projects.get(&project.0)?.record.path.clone();
+        let app_service = app_service_of(&path);
+        let st = self.inner.state.lock().unwrap();
+        let services: Vec<&mast_contract::ServiceState> = st
+            .projects
+            .get(&project.0)?
+            .summary
+            .services
+            .iter()
+            .filter(|service| service.state == Some(mast_contract::ContainerState::Running))
+            .collect();
+        let chosen = services
+            .iter()
+            .find(|service| service.name == app_service)
+            .or_else(|| services.iter().find(|service| service.name.contains("app")))
+            .or_else(|| if services.len() == 1 { services.first() } else { None })?;
+        chosen.container_id.clone()
+    }
+
+    /// Stop one process tree in the app container, as listed on the card —
+    /// whoever started it. Identified by root PID and start time, so a
+    /// listing that has gone stale can never reach a different process.
+    pub(crate) async fn stop_container_run(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        project: &ProjectId,
+        pid: u32,
+        start_ticks: u64,
+    ) -> Result<(), ErrorInfo> {
+        let container = self.inventory_container(project).ok_or_else(|| ErrorInfo::InvalidInput {
+            message: "the app container is not running".into(),
+        })?;
+        self.emit_op(
+            handle,
+            op,
+            OperationEventKind::Output {
+                line: format!("stopping process {pid} and everything it started"),
+                stderr: false,
+            },
+        );
+        let argv: Vec<String> = vec![
+            "docker".into(),
+            "exec".into(),
+            container,
+            "sh".into(),
+            "-c".into(),
+            crate::inventory::stop_tree_script(pid, start_ticks),
+        ];
+        let result = run_process_stop(&argv, Path::new("")).await;
+        self.hint();
+        result?;
+        self.emit_op(
+            handle,
+            op,
+            OperationEventKind::Output { line: "stopped".into(), stderr: false },
+        );
+        Ok(())
+    }
+
     /// Run one user-defined command (M7.5): whitespace-split argv, no shell;
     /// `sail` resolves to vendor/bin/sail; cwd = project dir; streamed +
     /// cancellable (dev servers run until stopped).
@@ -830,6 +956,9 @@ impl Engine {
         }
         let mut argv: Vec<String> = command.split_whitespace().map(String::from).collect();
         let mut stop_argv = None;
+        // Held until the command ends, so the card can tell this run's
+        // processes from everyone else's.
+        let mut _registration: Option<CommandRunRegistration> = None;
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
         }
@@ -875,6 +1004,10 @@ impl Engine {
             if let Some(managed) = crate::custom_command::prepare(
                 &path, invocation.as_ref(), &app_service, container.as_deref(), name, &argv[1..], op,
             )? {
+                if let Some(container) = &container {
+                    self.replace_leftovers(handle, op, project, container, name).await?;
+                }
+                _registration = Some(CommandRunRegistration::new(self, &managed.run, project, name));
                 argv = managed.argv;
                 stop_argv = Some(managed.stop_argv);
             } else {
@@ -1868,6 +2001,31 @@ pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<(), 
         return Err(ErrorInfo::Internal { message: format!("stop failed: {detail}") });
     }
     Ok(())
+}
+
+/// A Sail command's run id, registered for as long as the command runs (see
+/// [`crate::inventory::Live`]).
+pub(crate) struct CommandRunRegistration {
+    engine: Engine,
+    run: String,
+}
+
+impl CommandRunRegistration {
+    fn new(engine: &Engine, run: &str, project: &ProjectId, name: &str) -> Self {
+        engine
+            .inner
+            .command_runs
+            .lock()
+            .unwrap()
+            .insert(run.to_string(), (project.0.clone(), name.to_string()));
+        Self { engine: engine.clone(), run: run.to_string() }
+    }
+}
+
+impl Drop for CommandRunRegistration {
+    fn drop(&mut self) {
+        self.engine.inner.command_runs.lock().unwrap().remove(&self.run);
+    }
 }
 
 /// `docker compose <files/profiles> exec -T <service> <tail…>` — the exact
