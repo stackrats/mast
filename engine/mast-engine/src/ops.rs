@@ -328,7 +328,16 @@ impl Engine {
             Duration::from_secs(8),
         )
         .await;
-        let _ = forwarder.await;
+        // The process has exited: forward what it wrote, but only for a
+        // moment. The forwarder ends when every holder of the output pipes
+        // has closed them, and a background process the command left behind
+        // inherits them — waiting on it would hold the operation open for as
+        // long as that process runs. Its later output belongs to no
+        // operation, so it is dropped.
+        let mut forwarder = forwarder;
+        if tokio::time::timeout(Duration::from_secs(2), &mut forwarder).await.is_err() {
+            forwarder.abort();
+        }
         result.map_err(|e| ErrorInfo::Internal { message: redactor.redact(&e.to_string()) })
     }
 }

@@ -3487,6 +3487,46 @@ async fn removing_project_cancels_its_running_command_before_forgetting_it() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_leaves_a_background_process_still_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "leaves-a-daemon");
+    // The background sleeper inherits stdout and stderr, so the output pipes
+    // stay open long after the script itself has exited.
+    let script = project.join("start.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 300 &\necho $! > daemon.pid\necho started\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let id = engine.snapshot().projects[0].id.clone();
+    run_action(&engine, Action::SetProjectCommands { id: id.clone(), commands: vec![
+        mast_contract::ProjectCommand {
+            name: "start".into(), command: "./start.sh".into(),
+            auto_start: false, cwd: None, after: None, ready_when: None,
+            auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+        },
+    ] }).await;
+    let op = engine.dispatch(Action::RunProjectCommand { id, name: "start".into() }).unwrap();
+    let mut events = engine.operation_events(op).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = events.next().await {
+            if event.kind.is_terminal() {
+                return event.kind;
+            }
+        }
+        panic!("operation ended without a terminal event");
+    })
+    .await;
+    if let Ok(pid) = std::fs::read_to_string(project.join("daemon.pid")) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    let ended = ended.expect("the operation must end with the command, not with what it left running");
+    assert!(matches!(ended, OperationEventKind::Completed), "{ended:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
     // DEBUG (ci-debug branch only): repeat to catch the macOS-runner failure.
     for round in 0..15 {
