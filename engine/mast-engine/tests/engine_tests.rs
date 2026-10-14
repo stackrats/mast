@@ -3538,16 +3538,41 @@ async fn project_removal_blocks_new_commands_until_shutdown_finishes() {
         assert!(matches!(engine.dispatch(action), Err(ErrorInfo::Conflict { .. })));
     }
     std::fs::write(project.join("release-stop"), "").unwrap();
+    // DEBUG (ci-debug branch only): record what both operations do after the
+    // release, with timestamps, and dump them plus the process table on timeout.
+    let t0 = std::time::Instant::now();
+    let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let mut removed = engine.operation_events(removing).unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(event) = removed.next().await {
-            if event.kind.is_terminal() {
-                assert!(matches!(event.kind, OperationEventKind::Completed));
-                return;
+    let record = trace.clone();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async move {
+        let mut output_open = true;
+        loop {
+            tokio::select! {
+                event = output.next(), if output_open => match event {
+                    Some(e) => record.lock().unwrap().push(format!("{:?} serve: {:?}", t0.elapsed(), e.kind)),
+                    None => { output_open = false; record.lock().unwrap().push(format!("{:?} serve: stream closed", t0.elapsed())); }
+                },
+                event = removed.next() => match event {
+                    Some(e) => {
+                        record.lock().unwrap().push(format!("{:?} remove: {:?}", t0.elapsed(), e.kind));
+                        if e.kind.is_terminal() { return e.kind; }
+                    }
+                    None => panic!("removal ended without a terminal event"),
+                },
             }
         }
-        panic!("removal ended without a terminal event");
-    }).await.unwrap();
+    }).await;
+    let kind = match outcome {
+        Ok(kind) => kind,
+        Err(_) => {
+            let ps = std::process::Command::new("ps").args(["-ax", "-o", "pid,ppid,pgid,stat,etime,command"]).output().unwrap();
+            let ps = String::from_utf8_lossy(&ps.stdout);
+            let relevant: Vec<&str> = ps.lines().filter(|l| l.contains("serve.sh") || l.contains("sleep") || l.contains("PID")).collect();
+            panic!("removal did not finish in 30s\ntrace:\n{}\nprocesses:\n{}\nrelease-stop exists: {}", trace.lock().unwrap().join("\n"), relevant.join("\n"), project.join("release-stop").exists());
+        }
+    };
+    eprintln!("DEBUG trace:\n{}", trace.lock().unwrap().join("\n"));
+    assert!(matches!(kind, OperationEventKind::Completed), "{kind:?}");
     assert!(engine.snapshot().projects.is_empty());
 
     // The reservation ends with the operation; importing the same path must
