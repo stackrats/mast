@@ -9,7 +9,7 @@
     "check": "vp check"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.12.3",
     "@tauri-apps/plugin-autostart": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-notification": "^2",

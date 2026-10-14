@@ -79,9 +79,10 @@ pub fn reallocate_webview(window: &tauri::WebviewWindow) {
 
 /// Whether the window should carry no titlebar of its own.
 ///
-/// Running as native Wayland, GTK draws one — "Mast", minimise, maximise,
-/// close — because GTK3 cannot ask the compositor to. It has no server-side
-/// decoration support on Wayland whatsoever; `GTK_CSD=0`, which the first
+/// Running as native Wayland, who draws the titlebar is the compositor's
+/// call. GTK3 asks for server-side decorations through KDE's protocol, and
+/// where that is offered — KWin offers it — the compositor draws its own;
+/// everywhere else GTK draws one client-side. `GTK_CSD=0`, which the first
 /// version of this set, affects X11 only, which is why the bar never showed
 /// under XWayland and why that variable did nothing here.
 ///
