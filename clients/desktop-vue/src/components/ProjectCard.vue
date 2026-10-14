@@ -59,7 +59,9 @@ import { stripAnsi } from "../lib/ansi";
 import { formatElapsed, useElapsed } from "../lib/elapsed";
 import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
 import { commandKey, processKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
+import Advisories from "./Advisories.vue";
 import CatalogDialog from "./CatalogDialog.vue";
+import ContainerRuns from "./ContainerRuns.vue";
 import DataSnapshotsDialog from "./DataSnapshotsDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
 import AnsiText from "./ui/AnsiText.vue";
@@ -1009,6 +1011,8 @@ async function clearAppLog() {
       {{ warning }}
     </p>
 
+    <Advisories :project="project" />
+
     <!-- One clickable chip per service: the whole chip opens a menu with
          logs/shell plus per-service lifecycle verbs. -->
     <div class="mt-3">
@@ -1226,15 +1230,25 @@ async function clearAppLog() {
         <DropdownMenuRoot v-for="proc in processes" :key="proc.id">
           <DropdownMenuTrigger as-child>
             <Chip
-              :dot="processView(proc).dot"
-              :tip="`${processHints[proc.id] ?? proc.title} ${processView(proc).status}${processView(proc).error ? `: ${processView(proc).error}` : ''}`"
-              :aria-label="`${proc.title}: ${processView(proc).status}`"
+              :dot="
+                (proc.instances ?? 0) > 1 && processView(proc).dot
+                  ? 'bg-amber-500'
+                  : processView(proc).dot
+              "
+              :tip="`${processHints[proc.id] ?? proc.title} ${processView(proc).status}${(proc.instances ?? 0) > 1 ? ` — ${proc.instances} copies are running in the app container` : ''}${processView(proc).error ? `: ${processView(proc).error}` : ''}`"
+              :aria-label="`${proc.title}: ${processView(proc).status}${(proc.instances ?? 0) > 1 ? `, ${proc.instances} copies` : ''}`"
             >
               <Loader2
                 v-if="processView(proc).pending"
                 class="h-3 w-3 shrink-0 animate-spin text-amber-500"
               />
               {{ proc.title }}
+              <span
+                v-if="(proc.instances ?? 0) > 1"
+                class="text-[10px] font-medium text-amber-600 dark:text-amber-400"
+              >
+                ×{{ proc.instances }}
+              </span>
               <ChevronDown class="h-3 w-3 text-slate-400" />
             </Chip>
           </DropdownMenuTrigger>
@@ -1445,6 +1459,8 @@ async function clearAppLog() {
         </Chip>
       </div>
     </div>
+
+    <ContainerRuns :project="project" />
 
     <Modal v-model:open="exportOpen" title="Share commands via mast.yml">
       <div class="space-y-3">
