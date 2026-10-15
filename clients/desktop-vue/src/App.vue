@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp, SquareTerminal } from "lucide-vue-next";
 
 import type { ProjectSummary, WorkspaceSummary } from "./bindings";
 import AboutDialog from "./components/AboutDialog.vue";
+import AgentsPane from "./components/AgentsPane.vue";
 import AppMenubar from "./components/AppMenubar.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import DiagnosticsDialog from "./components/DiagnosticsDialog.vue";
@@ -271,6 +272,7 @@ function editWorkspace(ws: WorkspaceSummary) {
               @diagnose="openDiagnostics(selectedProject)"
             />
           </div>
+          <AgentsPane v-else-if="store.selection.kind === 'agents'" />
           <HomePane v-else @open-settings="settingsOpen = true" />
         </main>
       </div>

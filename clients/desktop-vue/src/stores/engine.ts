@@ -117,6 +117,7 @@ export interface LogView {
 
 export type Selection =
   | { kind: "home" }
+  | { kind: "agents" }
   | { kind: "project"; id: ProjectId }
   | { kind: "workspace"; id: string };
 
@@ -172,6 +173,16 @@ export function containerRunKey(project: string, pid: number, startTicks: number
   return `${project}:run:${pid}:${startTicks}`;
 }
 
+/** One process tree on this machine that the Agents view lists. */
+export function hostRunKey(project: string, pid: number, startTicks: number): string {
+  return `${project}:host:${pid}:${startTicks}`;
+}
+
+/** One of a project's git worktrees, for the actions on it and its stack. */
+export function worktreeKey(project: string, path: string): string {
+  return `${project}:worktree:${path}`;
+}
+
 /** Share-tunnel operations get their own op slot: the tunnel runs
  * indefinitely, and parking it on the project key would block the lifecycle
  * buttons (and their Cancel semantics) the whole time. */
@@ -216,6 +227,9 @@ export const useEngineStore = defineStore("engine", {
      * {@link containerRunKey}: both the run list and an advisory can stop the
      * same one, and both should show it going. */
     stoppingRuns: {} as Record<string, true>,
+    /** Agents-view actions in flight, keyed by {@link hostRunKey} or
+     * {@link worktreeKey}: the row and the Clean up list both show them. */
+    agentOps: {} as Record<string, true>,
     activity: [] as ActivityLine[],
     /** Effect history, oldest first — the logs panel's History tab. */
     history: [] as HistoryEntry[],
@@ -969,6 +983,36 @@ export const useEngineStore = defineStore("engine", {
       } finally {
         delete this.stoppingRuns[key];
       }
+    },
+
+    /** Run one of the Agents view's actions, tracked under `key` so every
+     * place offering it shows it going. Resolves to the failure, or null —
+     * Clean up reports per row, so this never raises the global error. */
+    async agentAction(key: string, action: Action): Promise<string | null> {
+      if (this.agentOps[key]) return null;
+      if (this.readOnly) return "Another Mast instance owns this machine — running read-only.";
+      this.agentOps[key] = true;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          dispatchAction(action, (event) => {
+            if (event.kind.type === "completed" || event.kind.type === "cancelled") resolve();
+            else if (event.kind.type === "failed") reject(new Error(event.kind.error));
+          }).catch(reject);
+        });
+        return null;
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      } finally {
+        delete this.agentOps[key];
+      }
+    },
+
+    /** An Agents-view action from a single click: its failure goes where
+     * every other failure does. */
+    async agentClick(key: string, action: Action): Promise<void> {
+      this.error = null;
+      const failure = await this.agentAction(key, action);
+      if (failure) this.error = failure;
     },
 
     /** Stop the old process completely before launching its replacement. */

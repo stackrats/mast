@@ -5,9 +5,10 @@
 // drag-to-resize this panel has — and its offcanvas mobile drawer is dead
 // weight in a desktop window.
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { Boxes, ChevronRight, Folder, Home, Loader2, Plus, Search } from "lucide-vue-next";
+import { Bot, Boxes, ChevronRight, Folder, Home, Loader2, Plus, Search } from "lucide-vue-next";
 
 import type { ProjectStatus, WorkspaceSummary } from "../bindings";
+import { overview as agentOverview } from "../lib/agents";
 import { sidebarMode, sidebarWidth } from "../lib/layout";
 import {
   loadSidebarCollapsed,
@@ -93,9 +94,14 @@ onBeforeUnmount(() => {
 function isSelected(kind: string, id?: string): boolean {
   const sel = store.selection;
   if (sel.kind !== kind) return false;
-  if (kind === "home") return true;
+  if (kind === "home" || kind === "agents") return true;
   return "id" in sel && sel.id === id;
 }
+
+// The Agents item says when there is something to look at: amber with how
+// many things are left running that nothing live is using, otherwise how
+// many agent sessions are working right now.
+const agents = computed(() => agentOverview(store.projects));
 
 function projectName(id: string): string {
   return store.projects.find((p) => p.id === id)?.name ?? id;
@@ -376,6 +382,34 @@ const dropIntoClass = "outline-2 -outline-offset-1 outline-slate-400 outline-das
               Home
               <SidebarMenuBadge v-if="store.discovered.length">
                 {{ store.discovered.length }}
+              </SidebarMenuBadge>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              :is-active="isSelected('agents')"
+              @click="store.selection = { kind: 'agents' }"
+            >
+              <span class="relative flex shrink-0">
+                <Bot class="h-3.5 w-3.5 text-slate-400" />
+                <span
+                  v-if="agents.sessions > 0"
+                  class="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500"
+                />
+              </span>
+              Agents
+              <Tooltip
+                v-if="agents.leftovers > 0"
+                :text="`${agents.leftovers} left running that nothing is using`"
+              >
+                <span
+                  class="ml-auto flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-amber-100 px-1.5 text-[10px] font-medium text-amber-800 tabular-nums select-none dark:bg-amber-900/60 dark:text-amber-300"
+                >
+                  {{ agents.leftovers }}
+                </span>
+              </Tooltip>
+              <SidebarMenuBadge v-else-if="agents.sessions > 0">
+                {{ agents.sessions }}
               </SidebarMenuBadge>
             </SidebarMenuButton>
           </SidebarMenuItem>

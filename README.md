@@ -50,6 +50,7 @@ Mast gives your existing Sail projects a single control center.
 - Switch PHP and Node versions as single, verified operations.
 - Copy database credentials and open service dashboards straight from their chips.
 - Manage services and environment variables without leaving Mast.
+- See what coding agents are running — their worktrees, dev servers, headless browsers — and clean up what they leave behind.
 
 ### Mast doesn't replace Sail
 
@@ -266,6 +267,23 @@ Clone, import, done — everyone gets the same commands, ordering, and readiness
 
 ---
 
+## Coding agents and worktrees
+
+Agents like Claude Code and Codex work on several things at once by giving each task its own git worktree, and from there they start things: a `sail up` that brings up a second stack, an `npm run dev`, a headless browser for a test. Those keep running after the session that started them ends, holding memory and ports nobody is using.
+
+The **Agents** page shows all of it across your projects:
+
+- **Agent sessions** working right now, in the checkout or a worktree, with what each has running.
+- **Left running** — dev servers, workers, `sail`/`docker` clients and headless browsers whose session has ended, with their memory. The sidebar badge counts them.
+- **In the app container** — process trees Mast didn't start, from the card's own list.
+- **Worktrees**, wherever they live (`.claude/worktrees/`, Codex's and Cursor's folders, or anywhere `git worktree add` put them): branch, uncommitted changes, commits the checkout doesn't have, and any containers started from them — which usually want the same ports as your project.
+
+Stop anything individually, stop or remove a worktree's containers, or remove a worktree: Mast stops what runs in it and removes its containers first, keeps its branch, and asks separately before discarding uncommitted changes. It refuses while an agent is still working there. **Clean up** lists every leftover with what nothing live is using already ticked, so one review clears it all; worktrees themselves are never removed from there.
+
+Each project's card carries the same section for that project, with its own Clean up, so you see an agent's leftovers where you were already looking.
+
+Processes on the host are watched on Linux; worktrees and their containers are shown on every platform.
+
 ## Share your site publicly
 
 `sail share`, as a button. Publish the running app at a temporary public URL, scan the QR code to open it on your phone, and keep the tunnel's own output in view — the place where share problems actually explain themselves.
@@ -449,6 +467,7 @@ mast stop <project>
 mast restart <project>
 mast diagnose
 mast history
+mast agents
 ```
 
 Control an individual service with:
@@ -476,6 +495,8 @@ mast mcp
 ```
 
 It speaks the Model Context Protocol over stdio, talking to the same engine as the app. An agent gets `mast_status` (projects, services, health, ports), `mast_logs`, `mast_laravel_log` (parsed, stack traces included), `mast_captures` (a dead container's last words), `mast_diagnose`, `mast_history`, `mast_wait`, the lifecycle verbs, and `mast_run_command` — which runs your **saved** commands only, so the command list you curated stays the consent boundary.
+
+`mast_agents` shows an agent what is already running — its own leftovers, another session's dev server, a worktree's stack holding the ports — and the server asks agents to check it before starting one and again before they finish. It only reads: stopping and removing happen in the app.
 
 ---
 
