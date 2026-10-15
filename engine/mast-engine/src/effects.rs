@@ -238,13 +238,25 @@ fn probe_unix_socket(_path: &std::path::Path) -> DockerUnavailable {
 
 /// Inside a project's `public/`, only `hot` matters to Mast; a build that
 /// writes its output straight into `public/` must not set off a reconcile
-/// per file. Everything else watched is a project root or a watched
-/// directory, where any change may matter.
+/// per file. Inside `.git`, only worktrees coming and going do: every git
+/// command an agent runs touches the index and the logs there. Everything
+/// else watched is a project root or a watched directory, where any change
+/// may matter.
 fn relevant_change(path: &std::path::Path) -> bool {
-    let in_public = path
-        .parent()
-        .and_then(|dir| dir.file_name())
-        .is_some_and(|name| name == "public");
+    let parent = path.parent().and_then(|dir| dir.file_name());
+    if parent.is_some_and(|name| name == ".git") {
+        return path.file_name().is_some_and(|name| name == "worktrees");
+    }
+    if parent.is_some_and(|name| name == "worktrees")
+        && path
+            .parent()
+            .and_then(|dir| dir.parent())
+            .and_then(|dir| dir.file_name())
+            .is_some_and(|name| name == ".git")
+    {
+        return true;
+    }
+    let in_public = parent.is_some_and(|name| name == "public");
     !in_public || path.file_name().is_some_and(|name| name == "hot")
 }
 
@@ -268,12 +280,22 @@ async fn file_watcher_loop(engine: Engine, hint_tx: mpsc::Sender<()>) {
         };
         // `public/` too, for `public/hot`: a Vite starting or exiting there
         // changes where every page gets its assets, and the card should say
-        // so now rather than on the next timed pass.
+        // so now rather than on the next timed pass. And `.git` with its
+        // `worktrees`, so an agent's new worktree shows up as it is made
+        // (ADR-0012) — `.git` itself for the first one, since git creates
+        // `worktrees/` then and removes it with the last.
         let mut desired: Vec<PathBuf> = desired
             .into_iter()
             .flat_map(|path| {
                 let public = path.join("public");
-                std::iter::once(path).chain(public.is_dir().then_some(public))
+                let git = path.join(".git");
+                let worktrees = git.join("worktrees");
+                let git = git.is_dir().then_some(git);
+                let worktrees = worktrees.is_dir().then_some(worktrees);
+                std::iter::once(path)
+                    .chain(public.is_dir().then_some(public))
+                    .chain(git)
+                    .chain(worktrees)
             })
             .collect();
         desired.sort();
@@ -407,6 +429,8 @@ async fn reconcile(engine: &Engine) {
     let mut fingerprints: HashMap<String, Option<u64>> = HashMap::new();
     // The committed mast.yml's contribution (commands + its own warnings).
     let mut manifests: HashMap<String, crate::manifest::Manifest> = HashMap::new();
+    // Git worktrees besides the project's own checkout (ADR-0012).
+    let mut worktree_lists: HashMap<String, Vec<mast_contract::Worktree>> = HashMap::new();
     let mut missing_directories = Vec::new();
     for (id, dir) in &project_dirs {
         if !dir.is_dir() {
@@ -414,8 +438,19 @@ async fn reconcile(engine: &Engine) {
         }
         let env = process_env.clone();
         let dir = dir.clone();
-        let (resolved, fingerprint, project_warnings, redactor, ports, git, procs, app_url, php, manifest) =
-            tokio::task::spawn_blocking(move || {
+        let (
+            resolved,
+            fingerprint,
+            project_warnings,
+            redactor,
+            ports,
+            git,
+            procs,
+            app_url,
+            php,
+            manifest,
+            worktrees,
+        ) = tokio::task::spawn_blocking(move || {
                 let resolved =
                     mast_compose::resolve_invocation(&dir, &env).map_err(|e| e.to_string());
                 let fingerprint = resolved.as_ref().ok().map(|inv| {
@@ -467,6 +502,7 @@ async fn reconcile(engine: &Engine) {
                     mast_laravel::app_url(&env),
                     crate::php::php_info(&dir),
                     crate::manifest::read(&dir),
+                    crate::agents::read_worktrees(&dir),
                 )
             })
             .await
@@ -482,6 +518,7 @@ async fn reconcile(engine: &Engine) {
                     None,
                     None,
                     crate::manifest::Manifest::default(),
+                    Vec::new(),
                 )
             });
         resolutions.insert(id.clone(), resolved);
@@ -494,6 +531,7 @@ async fn reconcile(engine: &Engine) {
         app_urls.insert(id.clone(), app_url);
         php_infos.insert(id.clone(), php);
         manifests.insert(id.clone(), manifest);
+        worktree_lists.insert(id.clone(), worktrees);
     }
 
     // Refresh resolved models where the invocation OR the file content
@@ -542,9 +580,22 @@ async fn reconcile(engine: &Engine) {
         for (id, dir) in &project_dirs {
             let Some((_, app_service)) = process_infos.get(id) else { continue };
             let dir_str = dir.to_string_lossy();
+            // The project's own containers, as its services are matched: a
+            // nested worktree's stack has config files under the project
+            // root too, and must not be scanned as the project's app.
+            let compose_name = resolutions
+                .get(id)
+                .and_then(|r| r.as_ref().ok())
+                .map(|invocation| invocation.project_name.as_str());
+            let worktrees = worktree_lists.get(id).map(Vec::as_slice).unwrap_or_default();
             let matched: Vec<&ContainerObservation> = observations
                 .iter()
-                .filter(|o| o.state == "running" && observation_belongs_to(o, &dir_str))
+                .filter(|o| {
+                    o.state == "running"
+                        && compose_name == Some(o.project.as_str())
+                        && observation_belongs_to(o, &dir_str)
+                        && !in_worktree(o, worktrees)
+                })
                 .collect();
             let container = matched
                 .iter()
@@ -582,6 +633,35 @@ async fn reconcile(engine: &Engine) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Agent sessions and the jobs on this machine working in each project's
+    // checkout or worktrees: one walk of the process table (ADR-0012).
+    let places: Vec<crate::agents::Place> = project_dirs
+        .iter()
+        .flat_map(|(id, dir)| {
+            let worktrees = worktree_lists.get(id).map(Vec::as_slice).unwrap_or_default();
+            std::iter::once(crate::agents::Place {
+                project: id.clone(),
+                dir: dir.clone(),
+                worktree: None,
+            })
+            .chain(worktrees.iter().map(|w| crate::agents::Place {
+                project: id.clone(),
+                dir: PathBuf::from(&w.path),
+                worktree: Some(PathBuf::from(&w.path)),
+            }))
+        })
+        .collect();
+    let activity = if places.is_empty() {
+        crate::agents::Activity::default()
+    } else {
+        tokio::task::spawn_blocking(move || {
+            crate::agents::scan_host()
+                .map(|scan| crate::agents::classify(&scan, &places, now_unix))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    };
     // What this session is running, per project — read before the state
     // lock, never inside it.
     let lives: HashMap<String, crate::inventory::Live> =
@@ -715,6 +795,31 @@ async fn reconcile(engine: &Engine) {
                     .advisories
                     .extend(crate::inventory::vite_advisories(facts, &summary.container_runs));
             }
+            let mut worktrees = worktree_lists.get(&id).cloned().unwrap_or_default();
+            if let Some(observations) = &observations {
+                for worktree in &mut worktrees {
+                    worktree.containers = crate::agents::worktree_containers(
+                        observations,
+                        std::path::Path::new(&worktree.path),
+                    );
+                }
+            } else {
+                // Docker unreachable says nothing about what runs there.
+                for worktree in &mut worktrees {
+                    if let Some(previous) =
+                        entry.summary.worktrees.iter().find(|w| w.path == worktree.path)
+                    {
+                        worktree.containers = previous.containers.clone();
+                    }
+                }
+            }
+            summary.advisories.extend(crate::agents::shared_name_advisories(
+                summary.compose_project_name.as_deref(),
+                &worktrees,
+            ));
+            summary.worktrees = worktrees;
+            summary.agent_sessions = activity.sessions.get(&id).cloned().unwrap_or_default();
+            summary.host_runs = activity.runs.get(&id).cloned().unwrap_or_default();
             if let Some((detected, _)) = process_infos.get(&id) {
                 // Running means a process that IS the daemon, found by the
                 // same reading of each command line as everything else here —
@@ -744,6 +849,7 @@ async fn reconcile(engine: &Engine) {
                     .filter(|o| {
                         summary.compose_project_name.as_deref() == Some(o.project.as_str())
                             && observation_belongs_to(o, &project_dir)
+                            && !in_worktree(o, &summary.worktrees)
                     })
                     .collect();
                 let app_service = process_infos.get(&id).map(|(_, name)| name.as_str());
@@ -871,6 +977,9 @@ fn collect_deaths(
 fn git_info(dir: &std::path::Path) -> (Option<String>, Option<bool>) {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["-C"]).arg(dir).args(["status", "--porcelain", "--branch"]);
+    // A reading must never take index.lock: an agent committing in this
+    // checkout at the same moment would fail.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     // This is the one spawn that bypasses mast-docker's runner, so it needs
     // its own CREATE_NO_WINDOW — per project per reconcile, it was an
     // endless console flicker on Windows.
@@ -944,6 +1053,15 @@ fn observation_belongs_to(observation: &ContainerObservation, project_dir: &str)
         || observation.config_files.iter().any(|f| {
             std::path::Path::new(f).starts_with(std::path::Path::new(project_dir))
         })
+}
+
+/// Whether a container was started from one of the project's worktrees —
+/// the worktree's stack, even when its config files sit under the project
+/// root or its `.env` copied the project's compose name (ADR-0012).
+fn in_worktree(observation: &ContainerObservation, worktrees: &[mast_contract::Worktree]) -> bool {
+    worktrees
+        .iter()
+        .any(|w| crate::agents::started_from(observation, std::path::Path::new(&w.path)))
 }
 
 /// Union of declared services (resolved model) and observed containers.
@@ -1050,6 +1168,17 @@ mod tests {
         assert!(relevant_change(Path::new("/p/app/.env")));
         assert!(relevant_change(Path::new("/p/app/public")));
         assert!(relevant_change(Path::new("/p/new-project")));
+    }
+
+    #[test]
+    fn inside_git_only_worktrees_coming_and_going_count() {
+        use std::path::Path;
+        assert!(relevant_change(Path::new("/p/app/.git/worktrees")));
+        assert!(relevant_change(Path::new("/p/app/.git/worktrees/fix-login")));
+        assert!(!relevant_change(Path::new("/p/app/.git/index")));
+        assert!(!relevant_change(Path::new("/p/app/.git/index.lock")));
+        assert!(!relevant_change(Path::new("/p/app/.git/FETCH_HEAD")));
+        assert!(relevant_change(Path::new("/p/app/.git")));
     }
 
     #[test]

@@ -208,6 +208,108 @@ pub struct ContainerRun {
     pub kinds: Vec<String>,
 }
 
+/// A git worktree of a project's repository other than the project's own
+/// checkout — what coding agents create to work on several things at once
+/// (ADR-0012). Read from git's admin directory, so it is listed wherever it
+/// lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Worktree {
+    /// The checkout's directory. With the project, what the worktree actions
+    /// target.
+    pub path: String,
+    /// The name git keeps it under (`.git/worktrees/<name>`).
+    pub name: String,
+    /// The branch checked out; None when HEAD is detached.
+    pub branch: Option<String>,
+    /// The commit checked out, abbreviated.
+    pub head: Option<String>,
+    /// Whose convention the path follows — "Claude Code" for a checkout
+    /// under `.claude/worktrees/`. A location, not proof of who made it.
+    pub tool: Option<String>,
+    pub created_at_unix: Option<u64>,
+    /// The checkout directory is gone; git lists it until it is pruned.
+    pub missing: bool,
+    /// Pinned with `git worktree lock`; git refuses to remove or prune it.
+    pub locked: bool,
+    /// Files with uncommitted changes, untracked ones included — what
+    /// removing it would lose. None when it could not be read.
+    pub changed_files: Option<u32>,
+    /// Commits checked out there that the project's own checkout does not
+    /// have. The branch keeps them after a remove, unless HEAD is detached.
+    pub unmerged_commits: Option<u32>,
+    /// Containers started from it: its own compose stack.
+    pub containers: Vec<WorktreeContainer>,
+}
+
+/// A container whose compose project was started from a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeContainer {
+    pub id: String,
+    pub name: String,
+    pub service: String,
+    pub compose_project: String,
+    pub running: bool,
+    /// Host ports it publishes — usually the same ones the project's own
+    /// stack wants, since the worktree's `.env` is a copy.
+    pub ports: Vec<u16>,
+}
+
+/// A coding agent's CLI running in a project's checkout or one of its
+/// worktrees, found by what program it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    /// Display name: "Claude Code", "Codex", …
+    pub agent: String,
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub cwd: String,
+    /// The worktree it works in (its path); None for the project's own
+    /// checkout.
+    pub worktree: Option<String>,
+    pub started_at_unix: u64,
+}
+
+/// Who a [`HostRun`] belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum HostRunOwner {
+    /// A coding agent session that is still running started it.
+    Agent { agent: String, pid: u32 },
+    /// Whatever started it has exited, and init or the user's service
+    /// manager adopted it. It runs until someone stops it.
+    Orphaned,
+}
+
+/// One process tree on this machine working in a project's checkout or one
+/// of its worktrees, of a kind worth knowing about — a dev server, an
+/// artisan daemon, a `sail`/`docker compose` client, a headless browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRun {
+    /// The tree's root. With `start_ticks`, the identity
+    /// [`Action::StopHostRun`] targets.
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub owner: HostRunOwner,
+    pub title: String,
+    pub command_line: String,
+    pub cwd: String,
+    /// The worktree it works in (its path); None for the project's own
+    /// checkout.
+    pub worktree: Option<String>,
+    /// Its working directory has been deleted since it started — a worktree
+    /// removed out from under it.
+    pub cwd_deleted: bool,
+    pub started_at_unix: u64,
+    /// Resident memory of the whole tree, rounded.
+    pub memory_bytes: u64,
+    pub process_count: u32,
+    pub kinds: Vec<String>,
+}
+
 /// Something wrong with a project that a click can fix, shown on its card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -362,6 +464,17 @@ pub struct ProjectSummary {
     /// project's Vite.
     #[serde(default)]
     pub advisories: Vec<Advisory>,
+    /// Git worktrees of the project's repository besides its own checkout
+    /// (ADR-0012).
+    #[serde(default)]
+    pub worktrees: Vec<Worktree>,
+    /// Coding agents running in the checkout or its worktrees.
+    #[serde(default)]
+    pub agent_sessions: Vec<AgentSession>,
+    /// Process trees on this machine working in the checkout or its
+    /// worktrees: what agent sessions are running, and what they left.
+    #[serde(default)]
+    pub host_runs: Vec<HostRun>,
     /// The user's dragged position in the project list
     /// ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
     /// pre-ordering world — every rank 0 — stays exactly alphabetical.
@@ -1290,6 +1403,29 @@ pub enum Action {
     /// Persist a dragged ordering of the workspace list; workspaces not
     /// named keep their relative order after the named ones.
     ReorderWorkspaces { ids: Vec<WorkspaceId> },
+    /// Stop one process tree on this machine ([`HostRun`]): SIGTERM to the
+    /// root and every descendant, SIGKILL to what is left after ten
+    /// seconds — provided the root still has the start time it was listed
+    /// with.
+    StopHostRun {
+        id: ProjectId,
+        pid: u32,
+        #[serde(rename = "startTicks")]
+        start_ticks: u64,
+    },
+    /// Stop the containers started from one of the project's worktrees,
+    /// keeping them.
+    StopWorktreeContainers { id: ProjectId, path: String },
+    /// Remove the containers started from one of the project's worktrees.
+    /// Named volumes are kept.
+    RemoveWorktreeContainers { id: ProjectId, path: String },
+    /// `git worktree remove` one of the project's worktrees, after stopping
+    /// every process working in it and removing its containers. The branch
+    /// is kept. Refused while it has uncommitted changes unless `force` —
+    /// which DESTROYS them: clients must confirm.
+    RemoveWorktree { id: ProjectId, path: String, force: bool },
+    /// `git worktree prune`: forget the worktrees whose directory is gone.
+    PruneWorktrees { id: ProjectId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1483,6 +1619,66 @@ mod tests {
                     },
                 ],
             }],
+            worktrees: vec![Worktree {
+                path: "/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into(),
+                name: "fix-login".into(),
+                branch: Some("worktree-fix-login".into()),
+                head: Some("8ba4734".into()),
+                tool: Some("Claude Code".into()),
+                created_at_unix: Some(1_791_961_000),
+                missing: false,
+                locked: false,
+                changed_files: Some(3),
+                unmerged_commits: Some(1),
+                containers: vec![WorktreeContainer {
+                    id: "c0ffee".into(),
+                    name: "fix-login-laravel.test-1".into(),
+                    service: "laravel.test".into(),
+                    compose_project: "fix-login".into(),
+                    running: true,
+                    ports: vec![80, 5173],
+                }],
+            }],
+            agent_sessions: vec![AgentSession {
+                agent: "Claude Code".into(),
+                pid: 15_479,
+                start_ticks: 9_000_000,
+                cwd: "/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into(),
+                worktree: Some("/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into()),
+                started_at_unix: 1_791_960_000,
+            }],
+            host_runs: vec![
+                HostRun {
+                    pid: 2_453_807,
+                    start_ticks: 9_100_000,
+                    owner: HostRunOwner::Orphaned,
+                    title: "headless chrome".into(),
+                    command_line: "/opt/google/chrome/chrome --headless=new".into(),
+                    cwd: "/home/dev/code/fake-sail-app".into(),
+                    worktree: None,
+                    cwd_deleted: false,
+                    started_at_unix: 1_791_960_100,
+                    memory_bytes: 870_000_000,
+                    process_count: 21,
+                    kinds: vec!["Headless browser".into()],
+                },
+                HostRun {
+                    pid: 2_460_000,
+                    start_ticks: 9_200_000,
+                    owner: HostRunOwner::Agent { agent: "Claude Code".into(), pid: 15_479 },
+                    title: "vite".into(),
+                    command_line: "node node_modules/.bin/vite".into(),
+                    cwd: "/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into(),
+                    worktree: Some(
+                        "/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into(),
+                    ),
+                    cwd_deleted: false,
+                    started_at_unix: 1_791_960_200,
+                    memory_bytes: 120_000_000,
+                    process_count: 3,
+                    kinds: vec!["Vite".into()],
+                },
+            ],
             git_branch: Some("main".into()),
             git_dirty: Some(false),
             app_url: Some("http://localhost:8080".into()),
@@ -1731,6 +1927,21 @@ mod tests {
                 ids: vec![ProjectId("p2".into()), ProjectId("p1".into())],
             },
             Action::ReorderWorkspaces { ids: vec![WorkspaceId("w1".into())] },
+            Action::StopHostRun { id: ProjectId("p1".into()), pid: 2_453_807, start_ticks: 9_100_000 },
+            Action::StopWorktreeContainers {
+                id: ProjectId("p1".into()),
+                path: "/home/dev/code/app/.claude/worktrees/x".into(),
+            },
+            Action::RemoveWorktreeContainers {
+                id: ProjectId("p1".into()),
+                path: "/home/dev/code/app/.claude/worktrees/x".into(),
+            },
+            Action::RemoveWorktree {
+                id: ProjectId("p1".into()),
+                path: "/home/dev/code/app/.claude/worktrees/x".into(),
+                force: false,
+            },
+            Action::PruneWorktrees { id: ProjectId("p1".into()) },
         ] {
             roundtrip(&action);
         }

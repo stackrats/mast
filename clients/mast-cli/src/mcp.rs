@@ -91,6 +91,16 @@ async fn handle_line(client: &dyn MastClient, line: &str) -> Option<String> {
     })
 }
 
+/// What an agent should know before it reaches for a tool. Clients that
+/// load tool schemas lazily show an agent only the tools' names, and
+/// nothing in `mast_agents` says "call me before `sail up`".
+const INSTRUCTIONS: &str = "Mast manages this machine's Laravel Sail projects. Use mast_status \
+to see projects and their containers instead of running docker compose blind. Before starting \
+a dev server, a queue worker or `sail up` — especially from a git worktree — call mast_agents: \
+one may already be running, or another worktree's containers may hold the ports. Background \
+processes you start keep running after your session ends; before finishing, call mast_agents \
+again and stop what you started.";
+
 /// Echo whatever protocol revision the client asked for. Everything this
 /// server offers — tools, nothing else — exists in every revision to date,
 /// so agreeing beats making the client negotiate down.
@@ -101,6 +111,7 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": requested,
         "capabilities": {"tools": {}},
         "serverInfo": {"name": "mast", "version": mast_contract::BUILD_VERSION},
+        "instructions": INSTRUCTIONS,
     })
 }
 
@@ -128,6 +139,7 @@ async fn tools_call(client: &dyn MastClient, params: &Value) -> Result<Value, (i
         "mast_history" => history_tool(client, &args).await,
         "mast_snapshots" => snapshots_tool(client, &args).await,
         "mast_snapshot_data" => snapshot_take_tool(client, &args).await,
+        "mast_agents" => agents_tool(client, &args).await,
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     Ok(tool_result(outcome))
@@ -279,6 +291,15 @@ fn tool_specs() -> Value {
                 "type": "object",
                 "properties": {"project": project_arg(), "service": service_arg()},
                 "required": ["project", "service"],
+            },
+        },
+        {
+            "name": "mast_agents",
+            "description": "What coding agents — you included — have going around each project: agent sessions, dev servers, headless browsers and sail/docker clients running on this machine (with whether their session is still alive or they were orphaned), process trees in the app container that Mast did not start, and git worktrees with their branch, uncommitted changes and any containers started from them. Check it before starting a dev server or `sail up` (one may already be running, or a worktree's stack may hold the ports) and after finishing, to see what you left running. Read-only: stopping and removing happen in the Mast app.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": project_arg()},
+                "required": [],
             },
         },
     ])
@@ -1092,6 +1113,18 @@ fn keep_tail(lines: Vec<String>, cap: usize) -> Vec<String> {
     kept
 }
 
+async fn agents_tool(client: &dyn MastClient, args: &Value) -> Result<String, String> {
+    let snap = settled_snapshot(client).await;
+    let projects = match optional_str(args, "project") {
+        Some(wanted) => vec![find_project(&snap, &wanted)?.clone()],
+        None => snap.projects.clone(),
+    };
+    if projects.is_empty() {
+        return Ok("no projects are imported into Mast".into());
+    }
+    Ok(crate::agents::report(&projects, now_unix_ms() / 1000))
+}
+
 fn keep_head(text: &str, cap: usize) -> String {
     let total = text.lines().count();
     if total <= cap {
@@ -1142,6 +1175,9 @@ mod tests {
             warnings: Vec::new(),
             container_runs: Vec::new(),
             advisories: Vec::new(),
+            worktrees: Vec::new(),
+            agent_sessions: Vec::new(),
+            host_runs: Vec::new(),
             rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),
@@ -1191,6 +1227,7 @@ mod tests {
                 "mast_history",
                 "mast_snapshots",
                 "mast_snapshot_data",
+                "mast_agents",
             ]
         );
         for tool in tools {
@@ -1215,6 +1252,7 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "mast");
         assert_eq!(result["serverInfo"]["version"], mast_contract::BUILD_VERSION);
+        assert!(result["instructions"].as_str().unwrap().contains("mast_agents"));
     }
 
     #[test]

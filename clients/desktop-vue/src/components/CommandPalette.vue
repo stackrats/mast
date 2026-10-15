@@ -58,6 +58,9 @@ function perform(effect: PaletteEffect) {
     case "home":
       store.selection = { kind: "home" };
       break;
+    case "agents":
+      store.selection = { kind: "agents" };
+      break;
     case "workspace":
       store.selection = { kind: "workspace", id: effect.id };
       break;

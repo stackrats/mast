@@ -11,6 +11,8 @@ mod db_repair;
 mod diagnostics;
 mod effects;
 mod history;
+mod agent_ops;
+mod agents;
 mod inventory;
 #[cfg(test)]
 mod test_docker;
@@ -284,6 +286,9 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         warnings: Vec::new(),
         container_runs: Vec::new(),
         advisories: Vec::new(),
+        worktrees: Vec::new(),
+        agent_sessions: Vec::new(),
+        host_runs: Vec::new(),
         rank: record.rank,
         commands: commands_to_contract(record),
         processes: Vec::new(),
@@ -1090,6 +1095,41 @@ impl Engine {
                 let h = handle.clone();
                 self.spawn_operation(id, handle, async move {
                     engine.stop_container_run(&h, id, &project, pid, start_ticks).await
+                });
+            }
+            Action::StopHostRun { id: project, pid, start_ticks } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.stop_host_run(&h, id, &project, pid, start_ticks).await
+                });
+            }
+            Action::StopWorktreeContainers { id: project, path } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.stop_worktree_containers(&h, id, &project, &path).await
+                });
+            }
+            Action::RemoveWorktreeContainers { id: project, path } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.remove_worktree_containers(&h, id, &project, &path).await
+                });
+            }
+            Action::RemoveWorktree { id: project, path, force } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.remove_worktree(&h, id, &project, &path, force).await
+                });
+            }
+            Action::PruneWorktrees { id: project } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.prune_worktrees(&h, id, &project).await
                 });
             }
             Action::SetProjectCommands { id: project, commands } => {

@@ -12,6 +12,7 @@ export type PaletteEffect =
   /** Move the main pane. */
   | { kind: "select"; id: ProjectId }
   | { kind: "home" }
+  | { kind: "agents" }
   | { kind: "workspace"; id: string }
   /** Dispatch an engine action, tracked as an operation on `project`. */
   | { kind: "action"; action: Action; project: ProjectId; label: string }
@@ -179,6 +180,13 @@ export function buildPalette(
       group: "App",
       keywords: "overview fleet dashboard",
       effect: { kind: "home" },
+    },
+    {
+      id: "nav:agents",
+      title: "Agents",
+      group: "App",
+      keywords: "worktrees claude codex sessions leftovers orphaned processes clean up",
+      effect: { kind: "agents" },
     },
     {
       id: "app:settings",

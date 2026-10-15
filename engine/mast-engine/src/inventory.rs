@@ -168,7 +168,7 @@ pub(crate) fn kind_of(cmdline: &str) -> Option<&'static str> {
 
 /// A command line's words, without a leading `sh -c`: for a shell wrapper,
 /// what matters is the script it runs.
-fn program_words(cmdline: &str) -> Vec<&str> {
+pub(crate) fn program_words(cmdline: &str) -> Vec<&str> {
     let words: Vec<&str> = cmdline.split_whitespace().collect();
     match words.as_slice() {
         [shell, "-c", rest @ ..] if shell.ends_with("sh") => rest.to_vec(),
@@ -401,7 +401,7 @@ fn attribute_builtin_processes(runs: &mut [ContainerRun], live: &Live) {
 
 /// A command line short enough for a chip: the artisan verb, or the program
 /// and its first argument.
-fn short_command(cmdline: &str) -> String {
+pub(crate) fn short_command(cmdline: &str) -> String {
     let words = program_words(cmdline);
     if let Some(verb) = artisan_verb(&words) {
         return format!("artisan {verb}");
@@ -432,7 +432,7 @@ fn short_command(cmdline: &str) -> String {
 
 /// Two significant figures, so a chip's number does not churn the card on
 /// every scan as a process's resident set breathes.
-fn round_memory(bytes: u64) -> u64 {
+pub(crate) fn round_memory(bytes: u64) -> u64 {
     if bytes < 100 {
         return bytes;
     }

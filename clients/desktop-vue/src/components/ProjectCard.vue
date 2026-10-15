@@ -2,6 +2,8 @@
 import { computed, ref, watch } from "vue";
 import {
   Archive,
+  Bot,
+  Brush,
   Camera,
   ChartColumn,
   Check,
@@ -52,6 +54,7 @@ import type {
   ProxyCa,
   ServiceState,
 } from "../bindings";
+import { cleanupPlan, hasAgentWork } from "../lib/agents";
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { processStatus, statusBadgeVariant, statusDot } from "../lib/status";
@@ -60,10 +63,12 @@ import { formatElapsed, useElapsed } from "../lib/elapsed";
 import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
 import { commandKey, processKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
 import Advisories from "./Advisories.vue";
+import AgentsCleanupDialog from "./AgentsCleanupDialog.vue";
 import CatalogDialog from "./CatalogDialog.vue";
 import ContainerRuns from "./ContainerRuns.vue";
 import DataSnapshotsDialog from "./DataSnapshotsDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
+import ProjectAgents from "./ProjectAgents.vue";
 import AnsiText from "./ui/AnsiText.vue";
 import Badge from "./ui/Badge.vue";
 import Button from "./ui/Button.vue";
@@ -198,6 +203,12 @@ function processView(process: ProcessState) {
 }
 
 const rowLabelClass = "text-[11px] font-medium tracking-wide text-slate-400";
+
+// What agents have going in this project beyond its app container, which
+// the row above lists already (ADR-0012).
+const agentWork = computed(() => hasAgentWork(project));
+const agentCleanupOpen = ref(false);
+const agentCleanable = computed(() => cleanupPlan([project], Date.now()).length > 0);
 
 const processHints: Record<string, string> = {
   reverb: "Laravel's WebSocket server (php artisan reverb:start).",
@@ -1461,6 +1472,30 @@ async function clearAppLog() {
     </div>
 
     <ContainerRuns :project="project" />
+
+    <div v-if="agentWork" class="mt-3">
+      <div class="flex items-center gap-1.5">
+        <p :class="rowLabelClass">Agents</p>
+        <Hint
+          text="Coding agents working in this project, what they have running on this machine and what they left running after their session ended, and the git worktrees they work in. Clean up lists every leftover here, the app container's included, with what nothing is using already ticked."
+        />
+        <div class="ml-auto flex gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            :disabled="store.readOnly || !agentCleanable"
+            @click="agentCleanupOpen = true"
+          >
+            <Brush class="h-3.5 w-3.5" /> Clean up…
+          </Button>
+          <Button variant="ghost" size="sm" @click="store.selection = { kind: 'agents' }">
+            <Bot class="h-3.5 w-3.5" /> All agents
+          </Button>
+        </div>
+      </div>
+      <ProjectAgents :project="project" :container-runs="false" class="mt-1" />
+      <AgentsCleanupDialog v-model:open="agentCleanupOpen" :project="project.id" />
+    </div>
 
     <Modal v-model:open="exportOpen" title="Share commands via mast.yml">
       <div class="space-y-3">
