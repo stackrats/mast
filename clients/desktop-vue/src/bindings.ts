@@ -602,7 +602,35 @@ export type Action =
  * Persist a dragged ordering of the workspace list; workspaces not
  * named keep their relative order after the named ones.
  */
-{ type: "reorderWorkspaces"; ids: WorkspaceId[] }
+{ type: "reorderWorkspaces"; ids: WorkspaceId[] } | 
+/**
+ * Stop one process tree on this machine ([`HostRun`]): SIGTERM to the
+ * root and every descendant, SIGKILL to what is left after ten
+ * seconds — provided the root still has the start time it was listed
+ * with.
+ */
+{ type: "stopHostRun"; id: ProjectId; pid: number; startTicks: number } | 
+/**
+ * Stop the containers started from one of the project's worktrees,
+ * keeping them.
+ */
+{ type: "stopWorktreeContainers"; id: ProjectId; path: string } | 
+/**
+ * Remove the containers started from one of the project's worktrees.
+ * Named volumes are kept.
+ */
+{ type: "removeWorktreeContainers"; id: ProjectId; path: string } | 
+/**
+ * `git worktree remove` one of the project's worktrees, after stopping
+ * every process working in it and removing its containers. The branch
+ * is kept. Refused while it has uncommitted changes unless `force` —
+ * which DESTROYS them: clients must confirm.
+ */
+{ type: "removeWorktree"; id: ProjectId; path: string; force: boolean } | 
+/**
+ * `git worktree prune`: forget the worktrees whose directory is gone.
+ */
+{ type: "pruneWorktrees"; id: ProjectId }
 /**
  * Something wrong with a project that a click can fix, shown on its card.
  */
@@ -620,6 +648,20 @@ export type AdvisoryAction =
  * Apply a named repair ([`Action::ApplyRepair`]).
  */
 { type: "applyRepair"; label: string; repair: string; arg: string | null }
+/**
+ * A coding agent's CLI running in a project's checkout or one of its
+ * worktrees, found by what program it is.
+ */
+export type AgentSession = { 
+/**
+ * Display name: "Claude Code", "Codex", …
+ */
+agent: string; pid: number; startTicks: number; cwd: string; 
+/**
+ * The worktree it works in (its path); None for the project's own
+ * checkout.
+ */
+worktree: string | null; startedAtUnix: number }
 /**
  * Why a capture was taken. The reason is the whole diagnostic frame: the same
  * forty lines mean something different before a user-requested restart than
@@ -913,6 +955,44 @@ export type HistoryOutcome =
  * A file write that went through.
  */
 { type: "applied" }
+/**
+ * One process tree on this machine working in a project's checkout or one
+ * of its worktrees, of a kind worth knowing about — a dev server, an
+ * artisan daemon, a `sail`/`docker compose` client, a headless browser.
+ */
+export type HostRun = { 
+/**
+ * The tree's root. With `start_ticks`, the identity
+ * [`Action::StopHostRun`] targets.
+ */
+pid: number; startTicks: number; owner: HostRunOwner; title: string; commandLine: string; cwd: string; 
+/**
+ * The worktree it works in (its path); None for the project's own
+ * checkout.
+ */
+worktree: string | null; 
+/**
+ * Its working directory has been deleted since it started — a worktree
+ * removed out from under it.
+ */
+cwdDeleted: boolean; startedAtUnix: number; 
+/**
+ * Resident memory of the whole tree, rounded.
+ */
+memoryBytes: number; processCount: number; kinds: string[] }
+/**
+ * Who a [`HostRun`] belongs to.
+ */
+export type HostRunOwner = 
+/**
+ * A coding agent session that is still running started it.
+ */
+{ type: "agent"; agent: string; pid: number } | 
+/**
+ * Whatever started it has exited, and init or the user's service
+ * manager adopted it. It runs until someone stops it.
+ */
+{ type: "orphaned" }
 /**
  * User preferences: which external tools to launch (M4 integrations, `None`
  * = auto-detect) and how Mast should behave on the user's behalf.
@@ -1250,6 +1330,20 @@ containerRuns?: ContainerRun[];
  */
 advisories?: Advisory[]; 
 /**
+ * Git worktrees of the project's repository besides its own checkout
+ * (ADR-0012).
+ */
+worktrees?: Worktree[]; 
+/**
+ * Coding agents running in the checkout or its worktrees.
+ */
+agentSessions?: AgentSession[]; 
+/**
+ * Process trees on this machine working in the checkout or its
+ * worktrees: what agent sessions are running, and what they left.
+ */
+hostRuns?: HostRun[]; 
+/**
  * The user's dragged position in the project list
  * ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
  * pre-ordering world — every rank 0 — stays exactly alphabetical.
@@ -1434,6 +1528,66 @@ graphError: string | null;
  * host port.
  */
 warnings: string[] }
+/**
+ * A git worktree of a project's repository other than the project's own
+ * checkout — what coding agents create to work on several things at once
+ * (ADR-0012). Read from git's admin directory, so it is listed wherever it
+ * lives.
+ */
+export type Worktree = { 
+/**
+ * The checkout's directory. With the project, what the worktree actions
+ * target.
+ */
+path: string; 
+/**
+ * The name git keeps it under (`.git/worktrees/<name>`).
+ */
+name: string; 
+/**
+ * The branch checked out; None when HEAD is detached.
+ */
+branch: string | null; 
+/**
+ * The commit checked out, abbreviated.
+ */
+head: string | null; 
+/**
+ * Whose convention the path follows — "Claude Code" for a checkout
+ * under `.claude/worktrees/`. A location, not proof of who made it.
+ */
+tool: string | null; createdAtUnix: number | null; 
+/**
+ * The checkout directory is gone; git lists it until it is pruned.
+ */
+missing: boolean; 
+/**
+ * Pinned with `git worktree lock`; git refuses to remove or prune it.
+ */
+locked: boolean; 
+/**
+ * Files with uncommitted changes, untracked ones included — what
+ * removing it would lose. None when it could not be read.
+ */
+changedFiles: number | null; 
+/**
+ * Commits checked out there that the project's own checkout does not
+ * have. The branch keeps them after a remove, unless HEAD is detached.
+ */
+unmergedCommits: number | null; 
+/**
+ * Containers started from it: its own compose stack.
+ */
+containers: WorktreeContainer[] }
+/**
+ * A container whose compose project was started from a worktree.
+ */
+export type WorktreeContainer = { id: string; name: string; service: string; composeProject: string; running: boolean; 
+/**
+ * Host ports it publishes — usually the same ones the project's own
+ * stack wants, since the worktree's `.env` is a copy.
+ */
+ports: number[] }
 
 /** tauri-specta globals **/
 

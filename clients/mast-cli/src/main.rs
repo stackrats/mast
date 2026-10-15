@@ -19,6 +19,7 @@ use mast_engine::{
 };
 use mast_project::MetadataStore;
 
+mod agents;
 mod mcp;
 
 /// Shown above `--help` and on a bare `mast`. Block glyphs, so it needs a
@@ -94,6 +95,16 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
+    /// What coding agents are doing: their sessions, the processes on this
+    /// machine and in app containers that Mast did not start, and the git
+    /// worktrees they work in. Stopping and removing happen in the app.
+    Agents {
+        /// Project name (or path suffix) to scope the report to.
+        project: Option<String>,
+        /// Print each project's worktrees, sessions and runs as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List a project's data snapshots (labeled docker volumes).
     Snapshots { project: String },
     /// Snapshot a service's data volumes — the thing to run BEFORE a risky
@@ -154,6 +165,7 @@ async fn main() {
         Command::History { background, limit } => {
             history(client.as_ref(), background, limit).await
         }
+        Command::Agents { project, json } => agents(client.as_ref(), project, json).await,
         Command::Snapshots { project } => snapshots(client.as_ref(), &project).await,
         Command::Snapshot { project, service } => {
             snapshot(client.as_ref(), &project, service).await
@@ -191,6 +203,7 @@ fn observes_only(command: &Command) -> bool {
         Command::Status { .. }
             | Command::Diagnose { .. }
             | Command::History { .. }
+            | Command::Agents { .. }
             | Command::Snapshots { .. }
     )
 }
@@ -338,6 +351,48 @@ async fn status(client: &dyn MastClient, json: bool) -> i32 {
             workspace,
         );
     }
+    0
+}
+
+async fn agents(client: &dyn MastClient, project: Option<String>, json: bool) -> i32 {
+    let snap = settled_snapshot(client).await;
+    let projects: Vec<mast_contract::ProjectSummary> = match &project {
+        Some(wanted) => match resolve_project(&snap, wanted) {
+            Ok((id, _)) => snap.projects.iter().filter(|p| p.id == id).cloned().collect(),
+            Err(message) => {
+                eprintln!("{message}");
+                return 2;
+            }
+        },
+        None => snap.projects.clone(),
+    };
+    if json {
+        let projects: Vec<serde_json::Value> = projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "path": p.path,
+                    "worktrees": p.worktrees,
+                    "agentSessions": p.agent_sessions,
+                    "hostRuns": p.host_runs,
+                    "containerRuns": p.container_runs,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "projects": projects }));
+        return 0;
+    }
+    if projects.is_empty() {
+        println!("no projects imported — open the desktop app to add some");
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("{}", agents::report(&projects, now));
     0
 }
 
@@ -720,6 +775,9 @@ mod tests {
             warnings: Vec::new(),
             container_runs: Vec::new(),
             advisories: Vec::new(),
+            worktrees: Vec::new(),
+            agent_sessions: Vec::new(),
+            host_runs: Vec::new(),
             rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),
