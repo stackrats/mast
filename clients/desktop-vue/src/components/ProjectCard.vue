@@ -51,23 +51,30 @@ import type {
   ProcessState,
   ProjectCommand,
   ProjectSummary,
-  ProxyCa,
   ServiceState,
 } from "../bindings";
 import { cleanupPlan, hasAgentWork } from "../lib/agents";
+import { isHostCommand } from "../lib/localDomains";
 import { iconButtonClass, menuContentClass, menuItemClass, menuSeparatorClass } from "../lib/menu";
 import { formatBytes, formatCores, rollupByProject, series } from "../lib/usage";
 import { processStatus, statusBadgeVariant, statusDot } from "../lib/status";
 import { stripAnsi } from "../lib/ansi";
 import { formatElapsed, useElapsed } from "../lib/elapsed";
-import { envReport, laravelLog, phpRuntime, proxyCa } from "../lib/transport";
-import { commandKey, processKey, shareKey, useEngineStore, domainKey } from "../stores/engine";
+import { envReport, laravelLog, phpRuntime } from "../lib/transport";
+import {
+  commandDomainKey,
+  commandKey,
+  processKey,
+  shareKey,
+  useEngineStore,
+} from "../stores/engine";
 import Advisories from "./Advisories.vue";
 import AgentsCleanupDialog from "./AgentsCleanupDialog.vue";
 import CatalogDialog from "./CatalogDialog.vue";
 import ContainerRuns from "./ContainerRuns.vue";
 import DataSnapshotsDialog from "./DataSnapshotsDialog.vue";
 import EnvPanel from "./EnvPanel.vue";
+import LocalHttpsDialog from "./LocalHttpsDialog.vue";
 import ProjectAgents from "./ProjectAgents.vue";
 import AnsiText from "./ui/AnsiText.vue";
 import Badge from "./ui/Badge.vue";
@@ -284,65 +291,22 @@ function startShare() {
 function stopShare() {
   void store.cancelLifecycle(shareKey(project.id));
 }
-// --- local HTTPS domain: one shared Caddy proxy serves every claimed
-// .test address with a locally-trusted certificate; the operation's own
-// output and follow-up Fix buttons live in this dialog ---
+// --- local HTTPS: the app's domain and its dev servers', in one dialog
+// (LocalHttpsDialog), opened from the HTTPS button or a command's chip ---
 const httpsOpen = ref(false);
-const domainOp = computed(() => store.operations[domainKey(project.id)]);
-const domainBusy = computed(() => domainOp.value != null && domainOp.value.terminal === null);
-const domainDraft = ref("");
-watch(httpsOpen, (open) => {
-  if (!open) return;
-  const slug =
-    project.name
-      .toLowerCase()
-      .replace(/[^a-z0-9-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "app";
-  domainDraft.value = project.localDomain ?? `${slug}.test`;
-});
-const domainValid = computed(() =>
-  /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.(test|localhost)$/.test(
-    domainDraft.value.trim().toLowerCase(),
+/** The command whose row the dialog opens on, when a chip opened it. */
+const httpsFocus = ref<string | null>(null);
+function openHttps(command: string | null = null) {
+  httpsFocus.value = command;
+  httpsOpen.value = true;
+}
+const servedDomains = computed(() =>
+  [project.localDomain, ...(project.commandDomains ?? []).map((c) => c.domain)].filter(
+    (d): d is string => !!d,
   ),
 );
-function setDomain(domain: string | null) {
-  void store.runLifecycle(
-    domainKey(project.id),
-    domain ? `Enable https://${domain}` : "Disable local domain",
-    { type: "setLocalDomain", id: project.id, domain },
-  );
-}
-
-/** The proxy CA's root certificate, for the trust that Fix buttons cannot
- * reach: Firefox's import dialog wants the file, curl --cacert and
- * NODE_EXTRA_CA_CERTS want the path, other tools want the PEM itself. */
-const caFile = ref<ProxyCa | null>(null);
-const manualCopied = ref<"path" | "pem" | "hosts" | null>(null);
-async function loadProxyCa() {
-  try {
-    caFile.value = await proxyCa();
-  } catch {
-    caFile.value = null;
-  }
-}
-watch(
-  () => [httpsOpen.value, domainOp.value?.terminal] as const,
-  ([open]) => {
-    if (open) void loadProxyCa();
-  },
-);
-/** The exact line the add-hosts-entry repair would append — shown so the
- * manual route needs no guesswork. */
-const hostsLine = computed(() =>
-  project.localDomain ? `127.0.0.1\t${project.localDomain}` : null,
-);
-async function copyManual(kind: "path" | "pem" | "hosts") {
-  const value =
-    kind === "hosts" ? hostsLine.value : kind === "path" ? caFile.value?.path : caFile.value?.pem;
-  if (!value) return;
-  await navigator.clipboard.writeText(value);
-  manualCopied.value = kind;
-  setTimeout(() => (manualCopied.value = null), 1500);
+function commandDomain(name: string) {
+  return project.commandDomains?.find((c) => c.command === name) ?? null;
 }
 
 // --- laravel.log viewer: the app's own log, parsed — an error and its
@@ -637,6 +601,7 @@ async function saveCommandForm() {
     fromManifest: false,
   };
   const original = editingCommand.value;
+  const claim = original === null ? null : commandDomain(original);
   // Edited in place rather than removed and appended: the chip row is in list
   // order, and a command should not jump to the end because its cwd changed.
   await saveCommands(
@@ -644,7 +609,19 @@ async function saveCommandForm() {
       ? [...commands.value, edited]
       : commands.value.map((c) => (c.name === original ? edited : c)),
   );
-  if (!store.error) commandDialogOpen.value = false;
+  if (store.error) return;
+  commandDialogOpen.value = false;
+  // A domain is claimed by command name. Renamed, the old name's claim is
+  // stranded — claiming its domain for the new name moves it, pin and all.
+  if (claim && name !== original && isHostCommand(edited)) {
+    void store.runLifecycle(commandDomainKey(project.id, name), `Move https://${claim.domain}`, {
+      type: "setCommandDomain",
+      id: project.id,
+      command: name,
+      domain: claim.domain,
+      port: claim.pinned ? claim.port : null,
+    });
+  }
 }
 
 // --- PHP runtime viewer: php -m and the classic ini limits from the LIVE
@@ -925,14 +902,14 @@ async function clearAppLog() {
       </Tooltip>
       <Tooltip
         :text="
-          project.localDomain
-            ? `Serving https://${project.localDomain} through the local proxy.`
-            : 'Serve this app at a stable, trusted https://…test address through a local proxy.'
+          servedDomains.length > 0
+            ? `Serving ${servedDomains.map((d) => `https://${d}`).join(', ')} through the local proxy.`
+            : 'Serve this app and its dev servers at stable, trusted https://…test addresses through a local proxy.'
         "
       >
-        <Button variant="ghost" size="sm" @click="httpsOpen = true">
+        <Button variant="ghost" size="sm" @click="openHttps()">
           <Lock class="h-3.5 w-3.5" /> HTTPS
-          <span v-if="project.localDomain" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+          <span v-if="servedDomains.length > 0" class="h-1.5 w-1.5 rounded-full bg-emerald-500" />
         </Button>
       </Tooltip>
       <Tooltip
@@ -1344,7 +1321,8 @@ async function clearAppLog() {
                 (cmd.restartWhenChanged?.length
                   ? ` · restarts when ${cmd.restartWhenChanged.join(' ')} change`
                   : '') +
-                (cmd.fromManifest ? ' · shared via mast.yml' : '')
+                (cmd.fromManifest ? ' · shared via mast.yml' : '') +
+                (commandDomain(cmd.name) ? ` · https://${commandDomain(cmd.name)!.domain}` : '')
               "
             >
               <Loader2
@@ -1352,6 +1330,7 @@ async function clearAppLog() {
                 class="h-3 w-3 animate-spin text-amber-500"
               />
               {{ cmd.name }}
+              <Lock v-if="commandDomain(cmd.name)" class="h-3 w-3 text-emerald-500" />
               <span v-if="cmd.autoStart" class="text-[10px] text-slate-400">auto</span>
               <span v-if="cmd.fromManifest" class="text-[10px] text-slate-400">shared</span>
               <ChevronDown class="h-3 w-3 text-slate-400" />
@@ -1379,6 +1358,17 @@ async function clearAppLog() {
                 </p>
               </div>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
+              <DropdownMenuItem
+                v-if="commandDomain(cmd.name)"
+                :class="menuItemClass"
+                @select="
+                  store.run({ type: 'openUrl', url: `https://${commandDomain(cmd.name)!.domain}` })
+                "
+              >
+                <Globe class="h-3.5 w-3.5 text-slate-400" /> Open https://{{
+                  commandDomain(cmd.name)!.domain
+                }}
+              </DropdownMenuItem>
               <DropdownMenuItem
                 v-if="!commandRunning(cmd.name)"
                 :class="menuItemClass"
@@ -1409,6 +1399,15 @@ async function clearAppLog() {
                 {{ commandOp(cmd.name)?.restarting ? "Restarting…" : "Restart" }}
               </DropdownMenuItem>
               <DropdownMenuSeparator :class="menuSeparatorClass" />
+              <!-- A domain is this machine's, not the command's definition,
+                   so a mast.yml command can have one too. -->
+              <DropdownMenuItem
+                v-if="isHostCommand(cmd)"
+                :class="menuItemClass"
+                @select="openHttps(cmd.name)"
+              >
+                <Lock class="h-3.5 w-3.5 text-slate-400" /> HTTPS…
+              </DropdownMenuItem>
               <!-- A shared command's definition lives in the repo's mast.yml;
                    the file is where it is edited, and a saved command of the
                    same name is how one person overrides it locally. -->
@@ -1908,145 +1907,12 @@ async function clearAppLog() {
       </template>
     </Modal>
 
-    <!-- The HTTPS differentiator: claim a .test domain, watch the proxy
-         converge, and pick up the two system-level steps as Fix buttons —
-         the operation's output stays in the dialog so "why does the browser
-         still warn" has an answer in view. -->
-    <Modal v-model:open="httpsOpen" title="Local HTTPS domain">
-      <div class="space-y-3">
-        <p class="text-xs text-slate-500 dark:text-slate-400">
-          One shared Caddy proxy (ports 80/443) serves every Mast project that claims a domain, with
-          certificates from its own local-only authority — secure cookies, service workers and other
-          HTTPS-only features work in dev, and the address stays stable however the ports move.
-        </p>
-        <label class="block text-xs text-slate-600 dark:text-slate-300">
-          Domain
-          <Input v-model="domainDraft" placeholder="myapp.test" class="mt-1 font-mono" />
-        </label>
-        <p v-if="!domainValid" class="text-xs text-amber-700 dark:text-amber-300">
-          Lowercase letters, digits and hyphens, ending in
-          <span class="font-mono">.test</span> or <span class="font-mono">.localhost</span>.
-        </p>
-        <div class="flex flex-wrap gap-2">
-          <Button
-            :disabled="locked || !domainValid || domainBusy"
-            @click="setDomain(domainDraft.trim().toLowerCase())"
-          >
-            <Lock class="h-3.5 w-3.5" />
-            {{ project.localDomain ? "Update" : "Enable" }}
-          </Button>
-          <Button
-            v-if="project.localDomain"
-            variant="outline"
-            @click="store.run({ type: 'openUrl', url: `https://${project.localDomain}` })"
-          >
-            <Globe class="h-3.5 w-3.5" /> Open
-          </Button>
-          <Button
-            v-if="project.localDomain"
-            variant="outline"
-            :disabled="locked || domainBusy"
-            @click="setDomain(null)"
-          >
-            Disable
-          </Button>
-        </div>
-        <div
-          v-if="domainOp && domainOp.lines.length > 0"
-          class="max-h-48 overflow-y-auto rounded-md border border-slate-200 bg-slate-50 p-2 font-mono text-[11px] leading-relaxed dark:border-slate-800 dark:bg-neutral-900"
-        >
-          <p
-            v-for="(line, i) in domainOp.lines"
-            :key="i"
-            :class="
-              line.stderr
-                ? 'text-amber-700 dark:text-amber-300'
-                : 'text-slate-600 dark:text-slate-300'
-            "
-          >
-            {{ line.line }}
-          </p>
-        </div>
-        <p
-          v-if="domainOp && domainOp.terminal === 'failed'"
-          class="text-xs text-red-700 dark:text-red-300"
-        >
-          Failed: {{ domainOp.error }}
-        </p>
-        <!-- Follow-up steps, not failure fallout: these render on success
-             too, because /etc/hosts and CA trust are what stand between a
-             green operation and a browser that stops warning. -->
-        <div v-if="domainOp && domainOp.fixes.length > 0" class="flex flex-wrap gap-1">
-          <FixButton
-            v-for="f in domainOp.fixes"
-            :key="f.repair.id + (f.repair.arg ?? '')"
-            :repair="f.repair"
-            :project="f.project"
-          />
-        </div>
-        <p class="text-xs text-slate-400">
-          Two one-time system steps — the hosts-file line and trusting the certificate authority —
-          appear as Fix buttons after enabling, each with a preview and an elevation prompt. Nothing
-          touches your system without them.
-        </p>
-        <!-- The manual route, always available: elevation prompts are not an
-             option everywhere (no polkit agent, hardened machines, Firefox's
-             own store), so everything a person needs to do it by hand is
-             copyable right here. -->
-        <div
-          v-if="project.localDomain"
-          class="space-y-2 border-t border-slate-200 pt-3 dark:border-slate-700"
-        >
-          <p class="text-xs font-medium text-slate-600 dark:text-slate-300">
-            Prefer to set it up yourself?
-          </p>
-          <p class="text-xs text-slate-500 dark:text-slate-400">
-            Add this line to your hosts file:
-          </p>
-          <p
-            class="flex items-baseline gap-1.5 font-mono text-xs select-all text-slate-900 dark:text-slate-100"
-          >
-            {{ hostsLine }}
-            <Tooltip text="Copy the hosts line.">
-              <button :class="['shrink-0', iconButtonClass]" @click="copyManual('hosts')">
-                <Check v-if="manualCopied === 'hosts'" class="h-3.5 w-3.5 text-emerald-600" />
-                <Copy v-else class="h-3.5 w-3.5" />
-              </button>
-            </Tooltip>
-          </p>
-          <div>
-            <Button variant="outline" size="sm" @click="store.run({ type: 'openHostsFile' })">
-              <FileCog class="h-3.5 w-3.5" /> Open hosts file
-            </Button>
-          </div>
-          <template v-if="caFile">
-            <p class="text-xs text-slate-500 dark:text-slate-400">
-              And trust the certificate authority where you need it — Firefox's import dialog,
-              <span class="font-mono">curl --cacert</span>,
-              <span class="font-mono">NODE_EXTRA_CA_CERTS</span>:
-            </p>
-            <p
-              class="flex items-baseline gap-1.5 font-mono text-xs break-all select-all text-slate-900 dark:text-slate-100"
-            >
-              {{ caFile.path }}
-              <Tooltip text="Copy the certificate file's path.">
-                <button :class="['shrink-0', iconButtonClass]" @click="copyManual('path')">
-                  <Check v-if="manualCopied === 'path'" class="h-3.5 w-3.5 text-emerald-600" />
-                  <Copy v-else class="h-3.5 w-3.5" />
-                </button>
-              </Tooltip>
-            </p>
-            <div>
-              <Button variant="outline" size="sm" @click="copyManual('pem')">
-                <Check v-if="manualCopied === 'pem'" class="h-3.5 w-3.5 text-emerald-600" />
-                <Copy v-else class="h-3.5 w-3.5" />
-                {{ manualCopied === "pem" ? "Copied" : "Copy certificate (PEM)" }}
-              </Button>
-            </div>
-          </template>
-        </div>
-      </div>
-    </Modal>
+    <LocalHttpsDialog
+      v-model:open="httpsOpen"
+      :project="project"
+      :locked="locked"
+      :focus="httpsFocus"
+    />
 
     <!-- Everything a database GUI asks for, in the copy-icon rhythm of the
          share settings — plus the host-vs-container caveat, because pointing

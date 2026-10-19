@@ -33,6 +33,9 @@ pub(crate) struct OpHandle {
     /// GPG outages, port squatters, version-locked volumes — read as
     /// sentences instead of scrollback.
     pub(crate) signatures: Mutex<Vec<(&'static mast_diagnostics::ErrorSignature, String)>>,
+    /// Set while this operation runs a host command: its output is read
+    /// for the port it announces (project, command name).
+    pub(crate) announces: Mutex<Option<(mast_contract::ProjectId, String)>>,
 }
 
 impl Engine {
@@ -46,12 +49,21 @@ impl Engine {
             events: Mutex::new(Vec::new()),
             events_tx,
             signatures: Mutex::new(Vec::new()),
+            announces: Mutex::new(None),
         });
         self.inner.ops.lock().unwrap().insert(id.0, handle.clone());
         (id, handle)
     }
 
     pub(crate) fn emit_op(&self, handle: &OpHandle, id: OperationId, kind: OperationEventKind) {
+        // Only a host command's lines are read for a port — a build's
+        // thousands of lines are not worth parsing for one.
+        if let OperationEventKind::Output { line, .. } = &kind
+            && let Some((project, command)) = handle.announces.lock().unwrap().clone()
+            && let Some(port) = crate::command_https::announced_port(line)
+        {
+            self.note_command_port(&project, &command, port);
+        }
         if let OperationEventKind::Output { line, .. } = &kind
             && let Some(sig) = mast_diagnostics::classify_line(line)
         {

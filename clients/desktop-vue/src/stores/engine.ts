@@ -196,6 +196,12 @@ export function domainKey(project: string): string {
   return `${project}:domain`;
 }
 
+/** Each command's local domain has its own slot beside the app's, so
+ * enabling one does not hide another's output and Fix buttons. */
+export function commandDomainKey(project: string, command: string): string {
+  return `${project}:domain:${command}`;
+}
+
 /** Operations-map key for a project being scaffolded — it has no id yet. */
 export function createKey(name: string): string {
   return `new:${name}`;

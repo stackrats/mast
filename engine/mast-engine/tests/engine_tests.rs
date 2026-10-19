@@ -3681,3 +3681,105 @@ async fn compose_resolution_errors_emit_project_updates_without_other_state_chan
         panic!("patch stream ended without the resolution error");
     }).await.expect("a resolution error must update live clients, not just snapshots");
 }
+
+/// A host command's announced port reaches its domain claim through the
+/// real command runner. Nothing here reads the process table, so it runs
+/// the same on Linux, macOS and Windows (`echo` is Git's there, as `touch`
+/// is above). Claims are seeded in the store rather than made with
+/// `SetCommandDomain`: a successful claim converges the machine's one
+/// `mast-proxy` container, and no test may touch that. What dispatch
+/// refuses is refused before any proxy work, so the refusals are checked
+/// through the API.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_commands_announced_port_reaches_its_domain_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "shopapi");
+    let store = MetadataStore::open(tmp.path().join("meta")).unwrap();
+    let mut record = store.import_project(&project).unwrap();
+    let command = |name: &str, line: &str| mast_project::ProjectCommandRecord {
+        name: name.into(),
+        command: line.into(),
+        auto_start: false,
+        cwd: None,
+        after: None,
+        ready_when: None,
+        auto_restart: false,
+        restart_when_changed: Vec::new(),
+    };
+    record.commands = vec![
+        command("web", "echo Local: http://localhost:5174/"),
+        command("dev", "sail artisan dev"),
+    ];
+    record.local_domain = Some("api.shop.test".into());
+    record.command_domains = vec![mast_project::CommandDomainRecord {
+        command: "web".into(),
+        domain: "web.shop.test".into(),
+        port: Some(5173),
+        pinned: false,
+    }];
+    store.save_projects(std::slice::from_ref(&record)).unwrap();
+
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(FakeAdapter::new())));
+    engine.start();
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    assert_eq!(
+        snap.projects[0].command_domains,
+        vec![mast_contract::CommandDomain {
+            command: "web".into(),
+            domain: "web.shop.test".into(),
+            port: Some(5173),
+            pinned: false,
+        }]
+    );
+
+    // The announcement is live state while the run lasts.
+    let mut patches = engine.subscribe(Some(snap.seq));
+    let announced = tokio::spawn(async move {
+        while let Some(item) = patches.next().await {
+            if let SubscriptionItem::Patch { patch } = item
+                && let mast_contract::PatchEvent::ProjectUpdated { project } = patch.event
+                && project.command_ports
+                    == vec![mast_contract::CommandPort { command: "web".into(), port: 5174 }]
+            {
+                return true;
+            }
+        }
+        false
+    });
+    run_action(&engine, Action::RunProjectCommand { id: pid.clone(), name: "web".into() }).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), announced).await.unwrap().unwrap(),
+        "the announced port must reach live clients"
+    );
+
+    // The run is over: the claim kept the port it moved to, persisted, and
+    // the announcement went with the run.
+    let snap = engine.snapshot();
+    assert_eq!(snap.projects[0].command_domains[0].port, Some(5174));
+    assert!(snap.projects[0].command_ports.is_empty(), "{:?}", snap.projects[0].command_ports);
+    let saved = MetadataStore::open(tmp.path().join("meta")).unwrap().load_projects().unwrap();
+    assert_eq!(saved[0].command_domains[0].port, Some(5174));
+
+    let refused = |action: Action| match engine.dispatch(action) {
+        Err(ErrorInfo::InvalidInput { message }) => message,
+        Err(ErrorInfo::NotFound { what }) => what,
+        other => panic!("dispatched what it must refuse: {other:?}"),
+    };
+    let claim = |command: &str, domain: &str| Action::SetCommandDomain {
+        id: pid.clone(),
+        command: command.into(),
+        domain: Some(domain.into()),
+        port: None,
+    };
+    assert!(refused(claim("dev", "dev.shop.test")).contains("app container"));
+    assert!(refused(claim("nope", "nope.shop.test")).contains("\"nope\""));
+    assert!(refused(claim("web", "web.shop.dev")).contains(".test"));
+    assert!(refused(claim("web", "api.shop.test")).contains("shopapi's app"));
+    // And the app cannot take a command's domain.
+    let message = refused(Action::SetLocalDomain {
+        id: pid.clone(),
+        domain: Some("web.shop.test".into()),
+    });
+    assert!(message.contains("shopapi's command web"), "{message}");
+}

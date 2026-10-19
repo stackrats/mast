@@ -222,6 +222,8 @@ mod tests {
             share_url: None,
             share_dashboard_url: None,
             local_domain: None,
+            command_domains: Vec::new(),
+            command_ports: Vec::new(),
             warnings: Vec::new(),
             container_runs: Vec::new(),
             advisories: Vec::new(),

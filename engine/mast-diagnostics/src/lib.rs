@@ -12,7 +12,7 @@ mod checks;
 mod history;
 pub mod signatures;
 
-pub use checks::{all_checks, run_all};
+pub use checks::{RuntimeFlavor, all_checks, run_all, runtime_flavor};
 pub use history::{DiagnosticsDb, DiagnosticsError, RepairAudit, RunSummary};
 pub use signatures::{ErrorSignature, classify_line};
 

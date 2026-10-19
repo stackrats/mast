@@ -480,6 +480,41 @@ pub struct ProjectSummary {
     /// pre-ordering world — every rank 0 — stays exactly alphabetical.
     #[serde(default)]
     pub rank: u32,
+    /// Local HTTPS domains claimed for the project's host commands
+    /// ([`Action::SetCommandDomain`]), in claim order. A claim whose command
+    /// no longer exists stays listed until it is released, so the domain is
+    /// not silently handed to someone else.
+    #[serde(default)]
+    pub command_domains: Vec<CommandDomain>,
+    /// Where the project's running host commands said they serve, read from
+    /// their output ("Local: http://localhost:5173/"). An entry lasts as long
+    /// as the run that announced it.
+    #[serde(default)]
+    pub command_ports: Vec<CommandPort>,
+}
+
+/// A local HTTPS domain served for one of a project's host commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandDomain {
+    pub command: String,
+    pub domain: String,
+    /// The host port the proxy forwards to. `None` until the command has
+    /// announced one or the user pinned one; the proxy answers with an
+    /// explanation meanwhile.
+    pub port: Option<u16>,
+    /// The user set `port`. Otherwise it follows whatever the command
+    /// announces, so a Vite that moves to 5174 because 5173 was busy stays
+    /// reachable at the same address.
+    pub pinned: bool,
+}
+
+/// The port a running host command announced in its output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandPort {
+    pub command: String,
+    pub port: u16,
 }
 
 /// A candidate found under a watched directory, not yet imported.
@@ -1426,6 +1461,21 @@ pub enum Action {
     RemoveWorktree { id: ProjectId, path: String, force: bool },
     /// `git worktree prune`: forget the worktrees whose directory is gone.
     PruneWorktrees { id: ProjectId },
+    /// Claim (or clear, with `domain: None`) a stable `https://…test`
+    /// address for one of the project's host commands — a dev server Mast
+    /// runs on this machine, such as a separate frontend's `vp dev` — on
+    /// the same proxy as [`Action::SetLocalDomain`]. The proxy forwards to
+    /// `port` when given (pinned), otherwise to the port the command
+    /// announces in its own output, followed as it moves. Commands that run
+    /// in the app container (`sail …`) are refused: their address is the
+    /// app's own domain.
+    SetCommandDomain {
+        id: ProjectId,
+        command: String,
+        domain: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1575,6 +1625,13 @@ mod tests {
             resolution_error: None,
             warnings: vec!["Sail project without vendor/".into()],
             rank: 3,
+            command_domains: vec![CommandDomain {
+                command: "dev".into(),
+                domain: "web.fake-sail-app.test".into(),
+                port: Some(5173),
+                pinned: false,
+            }],
+            command_ports: vec![CommandPort { command: "dev".into(), port: 5173 }],
             commands: vec![ProjectCommand {
                 name: "dev".into(),
                 command: "sail npm run dev".into(),
@@ -1942,9 +1999,35 @@ mod tests {
                 force: false,
             },
             Action::PruneWorktrees { id: ProjectId("p1".into()) },
+            Action::SetCommandDomain {
+                id: ProjectId("p1".into()),
+                command: "dev frontend".into(),
+                domain: Some("suite.shop.test".into()),
+                port: Some(5173),
+            },
+            Action::SetCommandDomain {
+                id: ProjectId("p1".into()),
+                command: "dev frontend".into(),
+                domain: None,
+                port: None,
+            },
         ] {
             roundtrip(&action);
         }
+        // An older client never sends `port`: it means "follow the command".
+        let action: Action = serde_json::from_str(
+            r#"{"type":"setCommandDomain","id":"p1","command":"dev","domain":"web.shop.test"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::SetCommandDomain {
+                id: ProjectId("p1".into()),
+                command: "dev".into(),
+                domain: Some("web.shop.test".into()),
+                port: None,
+            }
+        );
         roundtrip(&VolumeSnapshot {
             group: "1a2b3c".into(),
             project: ProjectId("p1".into()),

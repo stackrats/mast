@@ -9,6 +9,9 @@ mast-compose.workspace = true
 mast-docker.workspace = true
 mast-project.workspace = true
 mast-registry.workspace = true
+# The domain probe: one request through the local HTTPS proxy. Same build as
+# mast-registry's, so it adds no crates.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 async-trait.workspace = true
 futures.workspace = true
 notify = "8.2.0"
@@ -20,8 +23,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 libc = "0.2.189"
 mast-diagnostics = { workspace = true }
-mast-laravel = { version = "0.8.0", path = "../mast-laravel" }
-mast-yaml-edit = { version = "0.8.0", path = "../mast-yaml-edit" }
+mast-laravel = { version = "0.9.0", path = "../mast-laravel" }
+mast-yaml-edit = { version = "0.9.0", path = "../mast-yaml-edit" }
 serde_json.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
