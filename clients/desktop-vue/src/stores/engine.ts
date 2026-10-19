@@ -236,6 +236,9 @@ export const useEngineStore = defineStore("engine", {
     /** Agents-view actions in flight, keyed by {@link hostRunKey} or
      * {@link worktreeKey}: the row and the Clean up list both show them. */
     agentOps: {} as Record<string, true>,
+    /** Commands started elsewhere being stopped from here, keyed by
+     * {@link commandKey}. */
+    stoppingCommands: {} as Record<string, true>,
     activity: [] as ActivityLine[],
     /** Effect history, oldest first — the logs panel's History tab. */
     history: [] as HistoryEntry[],
@@ -331,6 +334,17 @@ export const useEngineStore = defineStore("engine", {
       return (key: string): boolean => {
         const op = state.operations[key];
         return op != null && op.terminal === null;
+      };
+    },
+
+    /** A saved command the engine is running that this window did not start
+     * — from the CLI, a bar widget, an agent through MCP (ADR-0013). */
+    commandRunningElsewhere(state) {
+      return (project: ProjectId, name: string): boolean => {
+        const op = state.operations[commandKey(project, name)];
+        if (op != null && op.terminal === null) return false;
+        const summary = state.projects.find((p) => p.id === project);
+        return (summary?.runningCommands ?? []).includes(name);
       };
     },
 
@@ -838,7 +852,9 @@ export const useEngineStore = defineStore("engine", {
       if (
         latest?.status !== "running" ||
         !latest.commands?.some((c) => c.name === cmd.name && c.autoStart) ||
-        this.hasRunningOp(key)
+        this.hasRunningOp(key) ||
+        // Started from the CLI or the bar already: one copy is the point.
+        (latest.runningCommands ?? []).includes(cmd.name)
       )
         return;
       await this.runLifecycle(key, cmd.name, {
@@ -873,6 +889,9 @@ export const useEngineStore = defineStore("engine", {
         )
           return false;
         const op = this.operations[key];
+        // Running, but started elsewhere: there is no output here to judge
+        // readiness by, and it has been up for as long as anyone could see.
+        if (!op && this.commandRunningElsewhere(project, name)) return true;
         // Absent is "not yet", not "never": the command it waits for is very
         // likely being dispatched in the same tick. The timeout is what stops
         // this waiting forever on a command nobody is going to start.
@@ -1021,9 +1040,35 @@ export const useEngineStore = defineStore("engine", {
       if (failure) this.error = failure;
     },
 
+    /** Stop a saved command, whoever started it: this window's own run is
+     * cancelled like any operation, one started elsewhere through the
+     * engine (ADR-0013). */
+    async stopCommand(project: ProjectId, name: string): Promise<void> {
+      const key = commandKey(project, name);
+      if (!this.commandRunningElsewhere(project, name)) {
+        await this.cancelLifecycle(key);
+        return;
+      }
+      if (this.stoppingCommands[key] || this.readOnly) return;
+      this.stoppingCommands[key] = true;
+      try {
+        await this.run({ type: "stopProjectCommand", id: project, name });
+      } finally {
+        delete this.stoppingCommands[key];
+      }
+    },
+
     /** Stop the old process completely before launching its replacement. */
     async restartCommand(project: ProjectId, name: string): Promise<void> {
       const key = commandKey(project, name);
+      if (this.commandRunningElsewhere(project, name)) {
+        // Stopped through the engine, then run from here, so this window
+        // follows the new run's output.
+        await this.stopCommand(project, name);
+        if (this.commandRunningElsewhere(project, name) || this.readOnly) return;
+        await this.runLifecycle(key, name, { type: "runProjectCommand", id: project, name });
+        return;
+      }
       const previous = this.operations[key];
       if (previous?.restarting || previous?.cancelling) return;
       const stillConfigured = () =>

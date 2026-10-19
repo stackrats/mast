@@ -641,7 +641,12 @@ export type Action =
  * in the app container (`sail …`) are refused: their address is the
  * app's own domain.
  */
-{ type: "setCommandDomain"; id: ProjectId; command: string; domain: string | null; port?: number | null }
+{ type: "setCommandDomain"; id: ProjectId; command: string; domain: string | null; port?: number | null } | 
+/**
+ * Stop one of the project's saved commands the engine is running,
+ * whoever started it, and wait for it to end (ADR-0013).
+ */
+{ type: "stopProjectCommand"; id: ProjectId; name: string }
 /**
  * Something wrong with a project that a click can fix, shown on its card.
  */
@@ -1374,6 +1379,13 @@ agentSessions?: AgentSession[];
  * worktrees: what agent sessions are running, and what they left.
  */
 hostRuns?: HostRun[]; 
+/**
+ * The saved commands the engine is running right now, by name —
+ * whichever client asked for them (ADR-0013). A client that did not
+ * start one still shows it running and stops it with
+ * [`Action::StopProjectCommand`].
+ */
+runningCommands?: string[]; 
 /**
  * The user's dragged position in the project list
  * ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the

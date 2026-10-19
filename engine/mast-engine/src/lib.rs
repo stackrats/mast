@@ -185,6 +185,9 @@ pub(crate) struct Inner {
     /// Sail commands this session is running, by the run id their record in
     /// the container carries: (project id, command name).
     pub(crate) command_runs: Mutex<HashMap<String, (String, String)>>,
+    /// Every saved command the engine is running, by (project id, command
+    /// name), whichever client asked (ADR-0013). One copy each.
+    pub(crate) command_ops: Mutex<HashMap<(String, String), OperationId>>,
     pub(crate) next_op: AtomicU64,
     pub adapter: Mutex<Option<Arc<dyn RuntimeAdapter>>>,
     pub hint_tx: Mutex<Option<mpsc::Sender<()>>>,
@@ -290,6 +293,7 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         worktrees: Vec::new(),
         agent_sessions: Vec::new(),
         host_runs: Vec::new(),
+        running_commands: Vec::new(),
         rank: record.rank,
         commands: commands_to_contract(record),
         processes: Vec::new(),
@@ -401,6 +405,7 @@ impl Engine {
                 ops: Mutex::new(HashMap::new()),
                 process_runs: Mutex::new(HashMap::new()),
                 command_runs: Mutex::new(HashMap::new()),
+                command_ops: Mutex::new(HashMap::new()),
                 next_op: AtomicU64::new(0),
                 adapter: Mutex::new(None),
                 hint_tx: Mutex::new(None),
@@ -710,6 +715,20 @@ impl Engine {
                     domain.clone(),
                     *port,
                 );
+            }
+            // One copy of a command at a time, whichever client asks: the
+            // desktop, the CLI and a bar widget all drive the same engine,
+            // and two of a dev server fight over its port. Reserved here,
+            // under the lock, so two dispatches cannot both get through.
+            Action::RunProjectCommand { id, name } => {
+                let mut ops = self.inner.command_ops.lock().unwrap();
+                let key = (id.0.clone(), name.clone());
+                if ops.contains_key(&key) {
+                    return Err(ErrorInfo::Conflict {
+                        message: format!("{name} is already running"),
+                    });
+                }
+                ops.insert(key, OperationId(u64::MAX));
             }
             _ => {}
         }
@@ -1227,8 +1246,19 @@ impl Engine {
             Action::RunProjectCommand { id: project, name } => {
                 let engine = self.clone();
                 let h = handle.clone();
+                let running = project_ops::RunningCommand::register(self, &project, &name, id);
                 self.spawn_operation(id, handle, async move {
+                    // Dropped as the work ends, before the terminal event, so
+                    // a client that reruns on Cancelled finds the slot free.
+                    let _running = running;
                     engine.run_project_command(&h, id, &project, &name).await
+                });
+            }
+            Action::StopProjectCommand { id: project, name } => {
+                let engine = self.clone();
+                let h = handle.clone();
+                self.spawn_operation(id, handle, async move {
+                    engine.stop_project_command(&h, id, &project, &name).await
                 });
             }
             Action::OpenTerminal { id: project } => {

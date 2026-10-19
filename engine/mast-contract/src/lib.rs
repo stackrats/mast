@@ -475,6 +475,12 @@ pub struct ProjectSummary {
     /// worktrees: what agent sessions are running, and what they left.
     #[serde(default)]
     pub host_runs: Vec<HostRun>,
+    /// The saved commands the engine is running right now, by name —
+    /// whichever client asked for them (ADR-0013). A client that did not
+    /// start one still shows it running and stops it with
+    /// [`Action::StopProjectCommand`].
+    #[serde(default)]
+    pub running_commands: Vec<String>,
     /// The user's dragged position in the project list
     /// ([`Action::ReorderProjects`]). Lists sort by (rank, name), so the
     /// pre-ordering world — every rank 0 — stays exactly alphabetical.
@@ -1476,6 +1482,9 @@ pub enum Action {
         #[serde(default)]
         port: Option<u16>,
     },
+    /// Stop one of the project's saved commands the engine is running,
+    /// whoever started it, and wait for it to end (ADR-0013).
+    StopProjectCommand { id: ProjectId, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1704,6 +1713,7 @@ mod tests {
                 worktree: Some("/home/dev/code/fake-sail-app/.claude/worktrees/fix-login".into()),
                 started_at_unix: 1_791_960_000,
             }],
+            running_commands: vec!["dev".into()],
             host_runs: vec![
                 HostRun {
                     pid: 2_453_807,
@@ -2011,6 +2021,7 @@ mod tests {
                 domain: None,
                 port: None,
             },
+            Action::StopProjectCommand { id: ProjectId("p1".into()), name: "dev".into() },
         ] {
             roundtrip(&action);
         }

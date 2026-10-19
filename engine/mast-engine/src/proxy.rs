@@ -1399,18 +1399,38 @@ mod tests {
         assert_eq!(classify_probe(200, "<!doctype html>"), DomainProbe::Answers(200));
     }
 
-    /// A real listener on each loopback family is found; a closed port is
-    /// not. Runs on every platform: nothing here is Linux-only.
+    /// A real listener on each loopback family is found; a port nothing
+    /// listens on is not. Runs on every platform: nothing here is
+    /// Linux-only.
     #[tokio::test]
     async fn host_port_probe_sees_either_loopback() {
         let v4 = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = v4.local_addr().unwrap().port();
-        assert!(host_port_listening(port).await);
-        drop(v4);
-        assert!(!host_port_listening(port).await);
+        assert!(host_port_listening(v4.local_addr().unwrap().port()).await);
         // Not every machine has IPv6 loopback; where it does, it counts.
         if let Ok(v6) = std::net::TcpListener::bind(("::1", 0)) {
             assert!(host_port_listening(v6.local_addr().unwrap().port()).await);
         }
+        let (_held, port) = quiet_port();
+        assert!(!host_port_listening(port).await);
+    }
+
+    /// A port bound on both loopbacks but listened on by neither. A port
+    /// merely released could be anyone's by the time it is probed — tests
+    /// run in parallel, and on a CI runner so does everything else.
+    fn quiet_port() -> (Vec<tokio::net::TcpSocket>, u16) {
+        let has_v6 = std::net::TcpListener::bind(("::1", 0)).is_ok();
+        for _ in 0..50 {
+            let v4 = tokio::net::TcpSocket::new_v4().unwrap();
+            v4.bind(([127, 0, 0, 1], 0).into()).unwrap();
+            let port = v4.local_addr().unwrap().port();
+            if !has_v6 {
+                return (vec![v4], port);
+            }
+            let v6 = tokio::net::TcpSocket::new_v6().unwrap();
+            if v6.bind((std::net::Ipv6Addr::LOCALHOST, port).into()).is_ok() {
+                return (vec![v4, v6], port);
+            }
+        }
+        panic!("no port free on both loopbacks");
     }
 }

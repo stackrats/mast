@@ -60,6 +60,10 @@ function applyDeepLink(raw: string) {
     newProjectOpen.value = true;
     return;
   }
+  if (link.kind === "agents") {
+    store.selection = { kind: "agents" };
+    return;
+  }
   void selectProjectSoon(link.ref);
 }
 

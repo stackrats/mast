@@ -1000,3 +1000,48 @@ describe("toggleSidebar", () => {
     expect(store.sidebarOverlay).toBe(false);
   });
 });
+
+describe("commands the engine runs for someone else (ADR-0013)", () => {
+  function running(names: string[]) {
+    const store = useEngineStore();
+    store.projects = [
+      {
+        id: "p1",
+        status: "running",
+        commands: [{ name: "dev", command: "sail artisan dev", autoStart: true }],
+        runningCommands: names,
+      },
+    ] as never;
+    return store;
+  }
+
+  it("counts as running here only when this window did not start it", () => {
+    const store = running(["dev"]);
+    expect(store.commandRunningElsewhere("p1", "dev")).toBe(true);
+    store.operations["p1:cmd:dev"] = { terminal: null } as never;
+    expect(store.commandRunningElsewhere("p1", "dev")).toBe(false);
+    expect(running([]).commandRunningElsewhere("p1", "dev")).toBe(false);
+  });
+
+  it("is not auto-started a second time", async () => {
+    dispatchMock.mockResolvedValue(1);
+    const store = running(["dev"]);
+    await store.autoStartCommand("p1", store.projects[0].commands![0]);
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it("is stopped through the engine, by name", async () => {
+    dispatchMock.mockImplementation(async (_action, onEvent) => {
+      onEvent({ operation: 1, kind: { type: "completed" } });
+      return 1;
+    });
+    const store = running(["dev"]);
+    await store.stopCommand("p1", "dev");
+    expect(dispatchMock.mock.calls[0][0]).toEqual({
+      type: "stopProjectCommand",
+      id: "p1",
+      name: "dev",
+    });
+    expect(store.stoppingCommands["p1:cmd:dev"]).toBeUndefined();
+  });
+});

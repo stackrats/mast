@@ -3783,3 +3783,78 @@ async fn a_host_commands_announced_port_reaches_its_domain_claim() {
     });
     assert!(message.contains("shopapi's command web"), "{message}");
 }
+
+// ADR-0013: the engine, not the client that asked, knows which commands
+// run. A second client sees the command in the summary, cannot start a
+// second copy, and can stop the first client's run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_command_is_published_refused_twice_and_stoppable_by_anyone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_project(tmp.path(), "shared");
+    std::fs::write(project.join("serve.sh"), "#!/bin/sh\necho up and serving\nsleep 300\n")
+        .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("serve.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let adapter = FakeAdapter::new();
+    let engine = test_engine(tmp.path(), Arc::new(FakeConnector(adapter.clone())));
+    engine.start();
+    run_action(&engine, Action::ImportProject { path: project.to_string_lossy().into() }).await;
+    let snap = wait_until(&engine, "project listed", |s| !s.projects.is_empty()).await;
+    let pid = snap.projects[0].id.clone();
+    run_action(
+        &engine,
+        Action::SetProjectCommands {
+            id: pid.clone(),
+            commands: vec![mast_contract::ProjectCommand {
+                name: "serve".into(),
+                command: "./serve.sh".into(),
+                auto_start: false, cwd: None, after: None, ready_when: None,
+                auto_restart: false, restart_when_changed: Vec::new(), from_manifest: false,
+            }],
+        },
+    )
+    .await;
+
+    let first = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "serve".into() })
+        .unwrap();
+    let mut events = engine.operation_events(first).unwrap();
+    wait_until(&engine, "serve listed as running", |s| {
+        s.projects[0].running_commands == ["serve"]
+    })
+    .await;
+
+    let again = engine.dispatch(Action::RunProjectCommand { id: pid.clone(), name: "serve".into() });
+    assert!(
+        matches!(&again, Err(ErrorInfo::Conflict { message }) if message.contains("already running")),
+        "{again:?}"
+    );
+
+    // Another client stops it by name; the first client's operation reads
+    // as cancelled, and the slot is free by the time it says so.
+    run_action(&engine, Action::StopProjectCommand { id: pid.clone(), name: "serve".into() }).await;
+    let cancelled = loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("terminal event after the stop")
+        {
+            Some(event) if matches!(event.kind, OperationEventKind::Cancelled) => break true,
+            Some(event) if event.kind.is_terminal() => break false,
+            Some(_) => continue,
+            None => break false,
+        }
+    };
+    assert!(cancelled, "a stop from elsewhere reads as Cancelled to the starter");
+    assert!(engine.snapshot().projects[0].running_commands.is_empty());
+    let rerun = engine
+        .dispatch(Action::RunProjectCommand { id: pid.clone(), name: "serve".into() })
+        .expect("a stopped command runs again straight away");
+    engine.cancel(rerun).unwrap();
+
+    // Stopping what is not running is a no-op, not a failure.
+    run_action(&engine, Action::StopProjectCommand { id: pid, name: "nothing".into() }).await;
+}

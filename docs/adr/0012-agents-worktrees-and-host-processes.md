@@ -120,8 +120,10 @@ with a project is looked for. The card's copy leaves out the app
 container's process trees, which the card already lists in its own row,
 and its Clean up is scoped to that project.
 
-**Agents can see this too, but not act on it.** `mast agents` and the
-read-only MCP tool `mast_agents` report the same view, so an agent can
+**Agents can see this too, but not act on it.** (Since ADR-0013 the
+CLI — a person's tool — can stop listed runs and clean up; MCP stays
+read-only.) `mast agents` and the read-only MCP tool `mast_agents` report
+the same view, so an agent can
 check what it — or the one before it — left running. The MCP server's
 `initialize` instructions tell agents to check it before starting a dev
 server or `sail up`, and again before finishing: clients that load tool

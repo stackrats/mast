@@ -452,7 +452,7 @@ Put an **Open in Mast** link in your repo's README and onboarding becomes one cl
 mast://clone?url=git%40github.com%3Aacme%2Fshop.git
 ```
 
-opens the dialog prefilled (`mast://project/<name>` jumps to an existing project). Links can only navigate or prefill — never clone, start, or stop anything by themselves — because any webpage can fire a registered URL scheme, and a link that acted on its own would be remote control of your machine. You still click the button.
+opens the dialog prefilled (`mast://project/<name>` jumps to an existing project, `mast://agents` to the Agents page). Links can only navigate or prefill — never clone, start, or stop anything by themselves — because any webpage can fire a registered URL scheme, and a link that acted on its own would be remote control of your machine. You still click the button.
 
 ---
 
@@ -471,6 +471,19 @@ mast diagnose
 mast history
 mast agents
 ```
+
+Run a project's saved commands, start whole workspaces, and clear up after agents:
+
+```bash
+mast start <project> --command dev     # runs in the app's engine and keeps running
+mast stop <project> --command dev      # whoever started it
+mast workspace start <workspace>       # members in dependency order
+mast workspace stop <workspace>
+mast agents <project> --stop <pid>     # one process the agents report lists
+mast agents --clean-up                 # what the app's Clean up ticks by itself
+```
+
+A saved command runs inside the Mast engine, so it needs the desktop app (or `mast-daemon`) running; the app shows a command started from the CLI as running and can stop it, and starting one that is already running is refused.
 
 Control an individual service with:
 

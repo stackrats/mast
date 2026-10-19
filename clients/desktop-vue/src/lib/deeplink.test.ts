@@ -23,6 +23,12 @@ describe("parseDeepLink", () => {
     });
   });
 
+  it("an agents link shows the Agents page and nothing more", () => {
+    expect(parseDeepLink("mast://agents")).toEqual({ kind: "agents" });
+    expect(parseDeepLink("mast://agents/")).toEqual({ kind: "agents" });
+    expect(parseDeepLink("mast://agents/clean-up")).toBeNull();
+  });
+
   /// Unknown actions and malformed links are ignored, never guessed at — a
   /// registered scheme is reachable by any webpage.
   it("everything else is null", () => {
