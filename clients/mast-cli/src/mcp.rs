@@ -814,6 +814,17 @@ fn project_block(project: &ProjectSummary, detailed: bool) -> Vec<String> {
         if let Some(domain) = &project.local_domain {
             out.push(format!("  local domain: {domain}"));
         }
+        for claim in &project.command_domains {
+            let target = match (claim.port, claim.pinned) {
+                (Some(port), true) => format!("localhost:{port} (pinned)"),
+                (Some(port), false) => format!("localhost:{port}"),
+                (None, _) => "no port announced yet".into(),
+            };
+            out.push(format!(
+                "  local domain for command {}: https://{} → {target}",
+                claim.command, claim.domain
+            ));
+        }
         if !project.services.is_empty() {
             out.push("  services:".into());
             for service in &project.services {
@@ -1188,6 +1199,8 @@ mod tests {
             share_url: None,
             share_dashboard_url: None,
             local_domain: None,
+            command_domains: Vec::new(),
+            command_ports: Vec::new(),
         }
     }
 
@@ -1253,6 +1266,38 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], "mast");
         assert_eq!(result["serverInfo"]["version"], mast_contract::BUILD_VERSION);
         assert!(result["instructions"].as_str().unwrap().contains("mast_agents"));
+    }
+
+    #[test]
+    fn project_details_name_each_commands_domain_and_where_it_points() {
+        let mut api = project("api");
+        api.local_domain = Some("api.shop.test".into());
+        api.command_domains = vec![
+            mast_contract::CommandDomain {
+                command: "dev frontend".into(),
+                domain: "web.shop.test".into(),
+                port: Some(5173),
+                pinned: false,
+            },
+            mast_contract::CommandDomain {
+                command: "docs".into(),
+                domain: "docs.shop.test".into(),
+                port: None,
+                pinned: false,
+            },
+        ];
+        let block = project_block(&api, true).join("\n");
+        assert!(block.contains("  local domain: api.shop.test"), "{block}");
+        assert!(
+            block.contains(
+                "  local domain for command dev frontend: https://web.shop.test → localhost:5173"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("  local domain for command docs: https://docs.shop.test → no port"),
+            "{block}"
+        );
     }
 
     #[test]

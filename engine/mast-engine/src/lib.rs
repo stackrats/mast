@@ -5,6 +5,7 @@
 //! and cancellable-operation machinery carry over from M1 unchanged.
 
 pub mod captures;
+mod command_https;
 mod commands;
 mod custom_command;
 mod db_repair;
@@ -299,6 +300,8 @@ fn initial_summary(record: &ProjectRecord) -> ProjectSummary {
         share_url: None,
         share_dashboard_url: None,
         local_domain: record.local_domain.clone(),
+        command_domains: command_https::to_contract(&record.command_domains),
+        command_ports: Vec::new(),
     }
 }
 
@@ -699,6 +702,14 @@ impl Engine {
             }
             Action::SetLocalDomain { id, domain } => {
                 return self.dispatch_set_local_domain(id.clone(), domain.clone());
+            }
+            Action::SetCommandDomain { id, command, domain, port } => {
+                return self.dispatch_set_command_domain(
+                    id.clone(),
+                    command.clone(),
+                    domain.clone(),
+                    *port,
+                );
             }
             _ => {}
         }
@@ -1502,6 +1513,7 @@ impl Engine {
             | Action::SetPhpExtensions { .. }
             | Action::ShareProject { .. }
             | Action::SetLocalDomain { .. }
+            | Action::SetCommandDomain { .. }
             | Action::SnapshotServiceData { .. }
             | Action::RestoreServiceData { .. } => unreachable!("handled above"),
         }

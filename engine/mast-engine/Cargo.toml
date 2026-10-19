@@ -9,6 +9,9 @@ mast-compose.workspace = true
 mast-docker.workspace = true
 mast-project.workspace = true
 mast-registry.workspace = true
+# The domain probe: one request through the local HTTPS proxy. Same build as
+# mast-registry's, so it adds no crates.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 async-trait.workspace = true
 futures.workspace = true
 notify = "8.2.0"

@@ -168,6 +168,25 @@ pub struct ProjectRecord {
     /// pre-ordering records at 0) fall back to name order.
     #[serde(default)]
     pub rank: u32,
+    /// Local HTTPS domains for the project's host commands, served by the
+    /// same proxy. Kept apart from `commands`: a claim is machine-local
+    /// (it needs this machine's hosts file and trust), while the command
+    /// may come from a committed mast.yml.
+    #[serde(default)]
+    pub command_domains: Vec<CommandDomainRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDomainRecord {
+    /// The command's name — the identity it runs under.
+    pub command: String,
+    pub domain: String,
+    /// The host port the proxy forwards to: pinned by the user, or the last
+    /// one the command announced.
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +425,7 @@ impl MetadataStore {
             path: canonical,
             commands: Vec::new(),
             local_domain: None,
+            command_domains: Vec::new(),
             rank: 0,
         };
         projects.push(record.clone());

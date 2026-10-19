@@ -2635,6 +2635,7 @@ dependencies = [
  "mast-yaml-edit",
  "notify",
  "notify-debouncer-full",
+ "reqwest 0.12.28",
  "rusqlite",
  "saphyr",
  "serde_json",

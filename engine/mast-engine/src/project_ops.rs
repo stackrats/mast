@@ -962,6 +962,9 @@ impl Engine {
         if argv.is_empty() {
             return Err(ErrorInfo::InvalidInput { message: "empty command".into() });
         }
+        // A command on this machine may serve a domain; one in the app
+        // container is reached through the app's.
+        let on_host = argv[0] != "sail";
         // A relative override walks from the project; absolute stands alone.
         // Resolved at run time, not save time — the sibling repo may be
         // cloned after the command is.
@@ -1041,6 +1044,10 @@ impl Engine {
                 stderr: false,
             },
         );
+        // After the echoed command line: only what the command prints says
+        // where it serves.
+        let _announces = on_host
+            .then(|| crate::command_https::AnnounceGuard::new(self, handle, project, name));
         if cmd.auto_restart || !cmd.restart_when_changed.is_empty() || stop_argv.is_some() {
             let result = self.supervise_command(handle, op, &cmd, &argv, &run_dir, &redactor, stop_argv.as_deref()).await;
             if handle.cancel_failed.load(std::sync::atomic::Ordering::Relaxed)
