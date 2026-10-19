@@ -177,6 +177,62 @@ pub(crate) fn project_report(project: &ProjectSummary, now_unix: u64) -> Vec<Str
     lines
 }
 
+/// One step of a clean-up: what it does, in words, and the action.
+pub(crate) struct CleanupStep {
+    pub label: String,
+    pub action: mast_contract::Action,
+}
+
+/// What the app's Clean up ticks by itself (ADR-0012): what nothing live is
+/// using. Orphaned host runs, container trees whose starter has gone, the
+/// containers of worktrees no agent works in, and worktrees whose directory
+/// is gone. What a live session runs, and container trees started outside
+/// Mast — someone's terminal, perhaps — are left alone, and no worktree is
+/// ever removed.
+pub(crate) fn cleanup_plan(projects: &[ProjectSummary]) -> Vec<CleanupStep> {
+    use mast_contract::Action;
+    let mut steps = Vec::new();
+    for p in projects {
+        for run in p.host_runs.iter().filter(|r| r.owner == HostRunOwner::Orphaned) {
+            steps.push(CleanupStep {
+                label: format!("stop {} in {} ({}, orphaned)", run.title, p.name, bytes(run.memory_bytes)),
+                action: Action::StopHostRun { id: p.id.clone(), pid: run.pid, start_ticks: run.start_ticks },
+            });
+        }
+        for run in p.container_runs.iter().filter(|r| {
+            matches!(r.owner, ContainerRunOwner::Orphaned | ContainerRunOwner::EarlierMast { .. })
+        }) {
+            steps.push(CleanupStep {
+                label: format!("stop {} in {}'s app container ({})", run.title, p.name, bytes(run.memory_bytes)),
+                action: Action::StopContainerRun { id: p.id.clone(), pid: run.pid, start_ticks: run.start_ticks },
+            });
+        }
+        for w in &p.worktrees {
+            let worked_in = p.agent_sessions.iter().any(|s| s.worktree.as_deref() == Some(w.path.as_str()));
+            if !w.containers.is_empty() && !worked_in {
+                steps.push(CleanupStep {
+                    label: format!(
+                        "remove the {} container{} started from {}'s worktree {}",
+                        w.containers.len(),
+                        if w.containers.len() == 1 { "" } else { "s" },
+                        p.name,
+                        w.name
+                    ),
+                    action: Action::RemoveWorktreeContainers { id: p.id.clone(), path: w.path.clone() },
+                });
+            }
+        }
+        let missing = p.worktrees.iter().filter(|w| w.missing && !w.locked).count();
+        if missing > 0 {
+            steps.push(CleanupStep {
+                label: format!("forget {} worktree{} of {} whose directory is gone", missing, if missing == 1 { "" } else { "s" }, p.name),
+                action: Action::PruneWorktrees { id: p.id.clone() },
+            });
+        }
+    }
+    steps
+}
+
 /// The whole report: the projects with something to say, and one line for
 /// the rest.
 pub(crate) fn report(projects: &[ProjectSummary], now_unix: u64) -> String {
@@ -230,6 +286,7 @@ mod tests {
             worktrees: Vec::new(),
             agent_sessions: Vec::new(),
             host_runs: Vec::new(),
+            running_commands: Vec::new(),
             rank: 0,
         }
     }
@@ -284,6 +341,90 @@ mod tests {
              1 commit the checkout does not have; made 2h ago"
         ), "{text}");
         assert!(text.contains("nothing from agents in blog"), "{text}");
+    }
+
+    #[test]
+    fn clean_up_takes_only_what_nothing_live_is_using() {
+        use mast_contract::{Action, ContainerRun, WorktreeContainer};
+        let mut p = project();
+        let wt = |path: &str, missing: bool, containers: usize| Worktree {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            branch: None,
+            head: None,
+            tool: None,
+            created_at_unix: None,
+            missing,
+            locked: false,
+            changed_files: None,
+            unmerged_commits: None,
+            containers: (0..containers)
+                .map(|i| WorktreeContainer {
+                    id: format!("c{i}"),
+                    name: format!("c{i}"),
+                    service: "app".into(),
+                    compose_project: "x".into(),
+                    running: true,
+                    ports: Vec::new(),
+                })
+                .collect(),
+        };
+        p.worktrees = vec![wt("/w/busy", false, 1), wt("/w/idle", false, 2), wt("/w/gone", true, 0)];
+        p.agent_sessions.push(AgentSession {
+            agent: "Codex".into(),
+            pid: 9,
+            start_ticks: 1,
+            cwd: "/w/busy".into(),
+            worktree: Some("/w/busy".into()),
+            started_at_unix: 0,
+        });
+        let host = |pid, owner| HostRun {
+            pid,
+            start_ticks: 5,
+            owner,
+            title: "Vite".into(),
+            command_line: String::new(),
+            cwd: String::new(),
+            worktree: None,
+            cwd_deleted: false,
+            started_at_unix: 0,
+            memory_bytes: 1_000_000_000,
+            process_count: 2,
+            kinds: Vec::new(),
+        };
+        p.host_runs = vec![
+            host(1, HostRunOwner::Orphaned),
+            host(2, HostRunOwner::Agent { agent: "Codex".into(), pid: 9 }),
+        ];
+        let container = |pid, owner| ContainerRun {
+            pid,
+            start_ticks: 7,
+            owner,
+            title: "dev".into(),
+            command_line: String::new(),
+            started_at_unix: 0,
+            memory_bytes: 0,
+            process_count: 1,
+            kinds: Vec::new(),
+        };
+        p.container_runs = vec![
+            container(3, ContainerRunOwner::EarlierMast { command: "dev".into() }),
+            container(4, ContainerRunOwner::Outside),
+            container(5, ContainerRunOwner::Mast { command: "dev".into() }),
+        ];
+        let plan = cleanup_plan(&[p]);
+        let actions: Vec<String> = plan
+            .iter()
+            .map(|step| match &step.action {
+                Action::StopHostRun { pid, .. } => format!("host {pid}"),
+                Action::StopContainerRun { pid, .. } => format!("container {pid}"),
+                Action::RemoveWorktreeContainers { path, .. } => format!("stack {path}"),
+                Action::PruneWorktrees { .. } => "prune".into(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(actions, ["host 1", "container 3", "stack /w/idle", "prune"]);
+        assert_eq!(plan[0].label, "stop Vite in shop (1.0 GB, orphaned)");
     }
 
     #[test]

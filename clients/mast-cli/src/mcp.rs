@@ -1189,6 +1189,7 @@ mod tests {
             worktrees: Vec::new(),
             agent_sessions: Vec::new(),
             host_runs: Vec::new(),
+            running_commands: Vec::new(),
             rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),

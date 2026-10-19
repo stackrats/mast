@@ -9,7 +9,9 @@ export type DeepLink =
    * From Git mode with the URL filled in. */
   | { kind: "clone"; url: string }
   /** `mast://project/<name or path suffix>` — select that project. */
-  | { kind: "project"; ref: string };
+  | { kind: "project"; ref: string }
+  /** `mast://agents` — show the Agents page (ADR-0012). */
+  | { kind: "agents" };
 
 function splitOnce(text: string, separator: string): [string, string] {
   const at = text.indexOf(separator);
@@ -27,6 +29,7 @@ export function parseDeepLink(raw: string): DeepLink | null {
     const url = new URLSearchParams(query).get("url")?.trim();
     return url ? { kind: "clone", url } : null;
   }
+  if (action === "agents" && segments.length === 1) return { kind: "agents" };
   if (action === "project" && segments.length > 1) {
     try {
       return { kind: "project", ref: decodeURIComponent(segments.slice(1).join("/")) };

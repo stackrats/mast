@@ -555,11 +555,17 @@ const commandFormError = computed<string | null>(() => {
 function commandOp(name: string) {
   return store.operations[commandKey(project.id, name)];
 }
+/** Running from this window, or by the engine for someone else — the CLI,
+ * the bar, an agent (ADR-0013). */
 function commandRunning(name: string): boolean {
   const view = commandOp(name);
-  return view != null && view.terminal === null;
+  return (view != null && view.terminal === null) || commandElsewhere(name);
+}
+function commandElsewhere(name: string): boolean {
+  return store.commandRunningElsewhere(project.id, name);
 }
 function commandPending(name: string): boolean {
+  if (store.stoppingCommands[commandKey(project.id, name)]) return true;
   const view = commandOp(name);
   return !!view && (!!view.cancelling || !!view.restarting || (!view.terminal && view.id < 0));
 }
@@ -577,7 +583,7 @@ function runCommand(cmd: ProjectCommand) {
   });
 }
 function stopCommand(cmd: ProjectCommand) {
-  void store.cancelLifecycle(commandKey(project.id, cmd.name));
+  void store.stopCommand(project.id, cmd.name);
 }
 function restartCommand(cmd: ProjectCommand) {
   void store.restartCommand(project.id, cmd.name);
@@ -1322,7 +1328,8 @@ async function clearAppLog() {
                   ? ` · restarts when ${cmd.restartWhenChanged.join(' ')} change`
                   : '') +
                 (cmd.fromManifest ? ' · shared via mast.yml' : '') +
-                (commandDomain(cmd.name) ? ` · https://${commandDomain(cmd.name)!.domain}` : '')
+                (commandDomain(cmd.name) ? ` · https://${commandDomain(cmd.name)!.domain}` : '') +
+                (commandElsewhere(cmd.name) ? ' · running, started outside this window' : '')
               "
             >
               <Loader2
@@ -1383,12 +1390,18 @@ async function clearAppLog() {
                 :disabled="
                   store.readOnly ||
                   commandOp(cmd.name)?.cancelling ||
-                  commandOp(cmd.name)?.restarting
+                  commandOp(cmd.name)?.restarting ||
+                  commandPending(cmd.name)
                 "
                 @select="stopCommand(cmd)"
               >
                 <CircleStop class="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
-                {{ commandOp(cmd.name)?.cancelling ? "Stopping…" : "Stop" }}
+                {{
+                  commandOp(cmd.name)?.cancelling ||
+                  store.stoppingCommands[commandKey(project.id, cmd.name)]
+                    ? "Stopping…"
+                    : "Stop"
+                }}
               </DropdownMenuItem>
               <DropdownMenuItem
                 :class="menuItemClass"

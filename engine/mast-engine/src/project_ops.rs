@@ -2035,6 +2035,104 @@ impl Drop for CommandRunRegistration {
     }
 }
 
+/// A saved command the engine is running, held for as long as its
+/// operation's work runs (ADR-0013). Registering publishes the name in the
+/// project's `running_commands`; dropping takes it out again — and only its
+/// own entry, should a later run have taken the slot.
+pub(crate) struct RunningCommand {
+    engine: Engine,
+    key: (String, String),
+    op: OperationId,
+}
+
+impl RunningCommand {
+    pub(crate) fn register(engine: &Engine, project: &ProjectId, name: &str, op: OperationId) -> Self {
+        let key = (project.0.clone(), name.to_string());
+        engine.inner.command_ops.lock().unwrap().insert(key.clone(), op);
+        engine.publish_running_commands(&project.0);
+        Self { engine: engine.clone(), key, op }
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        {
+            let mut ops = self.engine.inner.command_ops.lock().unwrap();
+            if ops.get(&self.key) == Some(&self.op) {
+                ops.remove(&self.key);
+            }
+        }
+        self.engine.publish_running_commands(&self.key.0);
+    }
+}
+
+impl Engine {
+    /// Put the project's running command names into its summary, and tell
+    /// every client when they changed.
+    pub(crate) fn publish_running_commands(&self, project: &str) {
+        let mut names: Vec<String> = self
+            .inner
+            .command_ops
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(id, _)| id == project)
+            .map(|(_, name)| name.clone())
+            .collect();
+        names.sort();
+        self.with_state(|st, events| {
+            if let Some(entry) = st.projects.get_mut(project)
+                && entry.summary.running_commands != names
+            {
+                entry.summary.running_commands = names;
+                events.push(PatchEvent::ProjectUpdated { project: entry.summary.clone() });
+            }
+        });
+    }
+
+    /// Stop one of the project's saved commands, whoever started it, and
+    /// wait for it to end — cancelling its operation exactly as the client
+    /// that started it would.
+    pub(crate) async fn stop_project_command(
+        &self,
+        handle: &Arc<OpHandle>,
+        op: OperationId,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<(), ErrorInfo> {
+        let key = (project.0.clone(), name.to_string());
+        let running = self.inner.command_ops.lock().unwrap().get(&key).copied();
+        let Some(target) = running.filter(|id| id.0 != u64::MAX) else {
+            self.emit_op(
+                handle,
+                op,
+                OperationEventKind::Output { line: format!("{name} is not running"), stderr: false },
+            );
+            return Ok(());
+        };
+        self.emit_op(
+            handle,
+            op,
+            OperationEventKind::Output { line: format!("stopping {name}"), stderr: false },
+        );
+        // Gone already between the look and the cancel is as good as stopped.
+        let _ = self.cancel(target);
+        // A command gets ten seconds after TERM before it is killed; this
+        // waits that out with room to spare.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        while self.inner.command_ops.lock().unwrap().get(&key) == Some(&target) {
+            if std::time::Instant::now() >= deadline {
+                return Err(ErrorInfo::Internal {
+                    message: format!("{name} did not stop within 45 seconds"),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.emit_op(handle, op, OperationEventKind::Output { line: "stopped".into(), stderr: false });
+        Ok(())
+    }
+}
+
 /// `docker compose <files/profiles> exec -T <service> <tail…>` — the exact
 /// resolved invocation, non-interactive.
 pub(crate) fn compose_exec_argv(

@@ -21,6 +21,7 @@ use mast_project::MetadataStore;
 
 mod agents;
 mod mcp;
+mod workflow;
 
 /// Shown above `--help` and on a bare `mast`. Block glyphs, so it needs a
 /// monospace terminal — which is the only place it is ever printed.
@@ -55,23 +56,46 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// `up -d` a project (or one service with --service).
+    /// `up -d` a project (or one service with --service), or run one of its
+    /// saved commands with --command.
     Start {
         project: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "command")]
         service: Option<String>,
+        /// A saved command to run instead, e.g. `dev`. It runs in the Mast
+        /// app's (or daemon's) engine and keeps running after this exits.
+        #[arg(long)]
+        command: Option<String>,
+        /// With --command: seconds to show its output before leaving it running.
+        #[arg(long, default_value_t = 10, requires = "command")]
+        wait: u64,
     },
-    /// `stop` a project (or one service).
+    /// `stop` a project (or one service, or one running saved command).
     Stop {
         project: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "command")]
         service: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
     },
-    /// `restart` a project (or one service).
+    /// `restart` a project (or one service, or one saved command).
     Restart {
         project: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "command")]
         service: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        /// With --command: seconds to show its output before leaving it running.
+        #[arg(long, default_value_t = 10, requires = "command")]
+        wait: u64,
+    },
+    /// Start or stop a whole workspace: its projects in dependency order
+    /// (reversed for stop), as the app's Start all does.
+    Workspace {
+        #[arg(value_enum)]
+        verb: WorkspaceVerb,
+        /// Workspace name.
+        name: String,
     },
     /// Rebuild images, pull newer ones and recreate the containers — the
     /// recovery for a compose config that changed underneath the project
@@ -104,6 +128,21 @@ enum Command {
         /// Print each project's worktrees, sessions and runs as JSON.
         #[arg(long)]
         json: bool,
+        /// Stop one process tree on this machine the report lists, by PID
+        /// (needs the project).
+        #[arg(long, value_name = "PID", requires = "project", conflicts_with_all = ["stop_container", "clean_up"])]
+        stop: Option<u32>,
+        /// Stop one process tree in the project's app container, by the PID
+        /// the report gives it.
+        #[arg(long, value_name = "PID", requires = "project", conflicts_with = "clean_up")]
+        stop_container: Option<u32>,
+        /// Stop and clear what nothing live is using — what the app's Clean
+        /// up ticks by itself. Never removes a worktree.
+        #[arg(long)]
+        clean_up: bool,
+        /// With --clean-up: list the steps without taking them.
+        #[arg(long, requires = "clean_up")]
+        dry_run: bool,
     },
     /// List a project's data snapshots (labeled docker volumes).
     Snapshots { project: String },
@@ -115,6 +154,12 @@ enum Command {
     /// settings so it can see and drive your projects instead of shelling
     /// docker compose blind.
     Mcp,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum WorkspaceVerb {
+    Start,
+    Stop,
 }
 
 #[tokio::main]
@@ -129,9 +174,15 @@ async fn main() {
     };
     // Prefer a live daemon (shared engine — full mutation rights even while
     // the desktop runs); fall back to an embedded engine.
+    // Whether this talks to the app's or the daemon's engine, which outlives
+    // this process — what a saved command needs to keep running.
+    let mut shared_engine = false;
     let client: Arc<dyn MastClient> =
         match mast_client_ipc::IpcClient::connect(&mast_daemon::default_socket_path()).await {
-            Ok(ipc) => Arc::new(ipc),
+            Ok(ipc) => {
+                shared_engine = true;
+                Arc::new(ipc)
+            }
             // A version disagreement is the one connect failure that must NOT
             // fall back. The socket is there and answering; what is on the
             // other end is a Mast from a different install channel. Quietly
@@ -149,14 +200,31 @@ async fn main() {
 
     let code = match command {
         Command::Status { json } => status(client.as_ref(), json).await,
-        Command::Start { project, service } => {
+        Command::Start { project, command: Some(command), wait, .. } => {
+            workflow::command(client.as_ref(), shared_engine, &project, &command, "start", wait).await
+        }
+        Command::Stop { project, command: Some(command), .. } => {
+            workflow::command(client.as_ref(), shared_engine, &project, &command, "stop", 0).await
+        }
+        Command::Restart { project, command: Some(command), wait, .. } => {
+            workflow::command(client.as_ref(), shared_engine, &project, &command, "restart", wait)
+                .await
+        }
+        Command::Start { project, service, .. } => {
             lifecycle(client.as_ref(), &project, service, "start").await
         }
-        Command::Stop { project, service } => {
+        Command::Stop { project, service, .. } => {
             lifecycle(client.as_ref(), &project, service, "stop").await
         }
-        Command::Restart { project, service } => {
+        Command::Restart { project, service, .. } => {
             lifecycle(client.as_ref(), &project, service, "restart").await
+        }
+        Command::Workspace { verb, name } => {
+            let verb = match verb {
+                WorkspaceVerb::Start => "start",
+                WorkspaceVerb::Stop => "stop",
+            };
+            workflow::workspace(client.as_ref(), verb, &name).await
         }
         Command::Rebuild { project, service } => {
             lifecycle(client.as_ref(), &project, service, "rebuild").await
@@ -165,7 +233,16 @@ async fn main() {
         Command::History { background, limit } => {
             history(client.as_ref(), background, limit).await
         }
-        Command::Agents { project, json } => agents(client.as_ref(), project, json).await,
+        Command::Agents { project: Some(project), stop: Some(pid), .. } => {
+            workflow::stop_run(client.as_ref(), &project, pid, false).await
+        }
+        Command::Agents { project: Some(project), stop_container: Some(pid), .. } => {
+            workflow::stop_run(client.as_ref(), &project, pid, true).await
+        }
+        Command::Agents { project, clean_up: true, dry_run, .. } => {
+            workflow::clean_up(client.as_ref(), project.as_deref(), dry_run).await
+        }
+        Command::Agents { project, json, .. } => agents(client.as_ref(), project, json).await,
         Command::Snapshots { project } => snapshots(client.as_ref(), &project).await,
         Command::Snapshot { project, service } => {
             snapshot(client.as_ref(), &project, service).await
@@ -203,7 +280,8 @@ fn observes_only(command: &Command) -> bool {
         Command::Status { .. }
             | Command::Diagnose { .. }
             | Command::History { .. }
-            | Command::Agents { .. }
+            | Command::Agents { stop: None, stop_container: None, clean_up: false, .. }
+            | Command::Agents { clean_up: true, dry_run: true, .. }
             | Command::Snapshots { .. }
     )
 }
@@ -699,8 +777,26 @@ mod tests {
         assert!(observes_only(&Command::Diagnose { project: None }));
         assert!(observes_only(&Command::History { background: false, limit: 5 }));
         assert!(observes_only(&Command::Snapshots { project: "a".into() }));
-        assert!(!observes_only(&Command::Start { project: "a".into(), service: None }));
-        assert!(!observes_only(&Command::Stop { project: "a".into(), service: None }));
+        assert!(!observes_only(&Command::Start {
+            project: "a".into(),
+            service: None,
+            command: None,
+            wait: 10
+        }));
+        assert!(!observes_only(&Command::Stop { project: "a".into(), service: None, command: None }));
+        let agents = |stop, clean_up, dry_run| Command::Agents {
+            project: Some("a".into()),
+            json: false,
+            stop,
+            stop_container: None,
+            clean_up,
+            dry_run,
+        };
+        assert!(observes_only(&agents(None, false, false)), "the report only reads");
+        assert!(observes_only(&agents(None, true, true)), "a dry run only reads");
+        assert!(!observes_only(&agents(Some(42), false, false)), "stopping acts");
+        assert!(!observes_only(&agents(None, true, false)), "cleaning up acts");
+        assert!(!observes_only(&Command::Workspace { verb: WorkspaceVerb::Start, name: "w".into() }));
         assert!(!observes_only(&Command::Snapshot { project: "a".into(), service: "db".into() }));
         assert!(!observes_only(&Command::Mcp));
     }
@@ -778,6 +874,7 @@ mod tests {
             worktrees: Vec::new(),
             agent_sessions: Vec::new(),
             host_runs: Vec::new(),
+            running_commands: Vec::new(),
             rank: 0,
             commands: Vec::new(),
             processes: Vec::new(),
