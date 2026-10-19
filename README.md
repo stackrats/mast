@@ -302,6 +302,8 @@ That unlocks the parts of development that plain `http://localhost` quietly brea
 
 Projects running Reverb get their WebSocket on the same address: upgrades on `wss://myapp.test/app` go to the port the app container publishes for Reverb, while ordinary `/app/…` pages still reach the app. Sail doesn't publish that port by default, and Mast says so when it's missing. The proxy follows port changes on its own.
 
+A frontend in its own repo gets an address too. Any command Mast runs on your machine — `vp dev` for a separate SPA, say — can claim a domain from the same dialog or its chip's menu, and the proxy follows the port it prints when it starts, even when Vite moves to 5174 because 5173 was busy. Mast suggests names that share a parent with the app (`api.myapp.test` and `web.myapp.test`) and warns when they don't, because a session cookie never crosses sites. After enabling, it loads the address once through the proxy and says what's in the way: a dev server that refuses the host name, or a Laravel `.env` whose `SESSION_DOMAIN` or `SANCTUM_STATEFUL_DOMAINS` still names the old addresses.
+
 Mast asks before touching anything system-level. The two one-time steps — a line in `/etc/hosts` and trusting the certificate authority — appear as previewed Fix buttons, each showing exactly what will change before an elevation prompt runs it.
 
 Prefer doing it yourself? The dialog shows the exact hosts line and the certificate — path and PEM, each copyable — with a button that opens your hosts file.
