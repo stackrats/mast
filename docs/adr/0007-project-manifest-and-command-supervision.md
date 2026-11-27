@@ -70,6 +70,11 @@ auto-restart off. And file watches land on the literal prefix of each glob
 - `restart_when_changed` restarts are debounced (400ms) and reset the
   crash-loop count: a change during backoff may be the fix and restarts
   immediately.
+- A restart never lands where Stop cannot reach. A Sail command's stop is
+  pinned to the container it started in; when a rebuild removes that
+  container (or it stops), the stop counts as done — its processes went
+  with it — but the supervisor ends rather than relaunching into the
+  replacement, and the next Run pins to the new container.
 - Auto-start remains client-driven; the manifest only changes where the
   command list comes from. Engine-side triggers stay on the roadmap
   unchanged.
