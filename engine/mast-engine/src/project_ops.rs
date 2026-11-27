@@ -1989,7 +1989,18 @@ fn process_stop_argv(
     compose_exec_argv(invocation, app_service, &tail)
 }
 
-pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<(), ErrorInfo> {
+/// How a stop that succeeded ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stopped {
+    /// The stop ran and left nothing of what it targets running.
+    Done,
+    /// The container the stop is pinned to is down — removed or stopped —
+    /// and its processes went with it. Anything started after this lands in
+    /// whichever container now serves the app, where this stop cannot reach.
+    ContainerGone,
+}
+
+pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<Stopped, ErrorInfo> {
     let out = mast_docker::run_command(
         argv,
         dir.is_dir().then_some(dir),
@@ -2000,6 +2011,15 @@ pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<(), 
     .await
     .map_err(internal_err)?;
     if !out.success() {
+        // A stop pinned to a container that has since gone — a rebuild
+        // recreates it — has nothing left to stop: its processes ended with
+        // it. Reporting that as a failure would keep the cleanup remembered
+        // and block every later Run behind a stop that can never succeed.
+        if let Some(container) = exec_container(argv)
+            && container_is_down(&argv[0], container).await
+        {
+            return Ok(Stopped::ContainerGone);
+        }
         let detail = if out.stderr.trim().is_empty() {
             format!("exec exited with status {}", out.status)
         } else {
@@ -2007,7 +2027,54 @@ pub(crate) async fn run_process_stop(argv: &[String], dir: &Path) -> Result<(), 
         };
         return Err(ErrorInfo::Internal { message: format!("stop failed: {detail}") });
     }
-    Ok(())
+    Ok(Stopped::Done)
+}
+
+/// The container a `docker exec [options] <container> …` argv targets.
+fn exec_container(argv: &[String]) -> Option<&str> {
+    let mut args = match argv {
+        [docker, exec, rest @ ..]
+            if exec == "exec"
+                && Path::new(docker).file_stem().is_some_and(|stem| stem == "docker") =>
+        {
+            rest.iter()
+        }
+        _ => return None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-u" | "--user" | "-e" | "--env" | "-w" | "--workdir" | "--env-file"
+            | "--detach-keys" => {
+                args.next();
+            }
+            option if option.starts_with('-') => {}
+            container => return Some(container),
+        }
+    }
+    None
+}
+
+/// Whether Docker positively reports the container — an id, as Mast records
+/// it — as neither running nor paused: removed, or stopped. A Docker that
+/// cannot answer says nothing, so an unreachable daemon is never taken for
+/// a finished stop. Nor is a name: the `id` filter never matches one, so a
+/// running container named in place of its id would look removed.
+async fn container_is_down(docker: &str, container: &str) -> bool {
+    if container.is_empty() || !container.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let argv: Vec<String> = vec![
+        docker.into(),
+        "ps".into(),
+        "-q".into(),
+        "--no-trunc".into(),
+        "--filter".into(),
+        format!("id={container}"),
+    ];
+    match mast_docker::run_command(&argv, None, &[], Duration::from_secs(10), 64 * 1024).await {
+        Ok(out) => out.success() && out.stdout.trim().is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// A Sail command's run id, registered for as long as the command runs (see
@@ -2241,6 +2308,195 @@ mod tests {
         let cleanups = std::fs::read_to_string(path.join("cleanups")).unwrap();
         assert_eq!(cleanups.lines().filter(|line| *line == "process").count(), 3);
         assert_eq!(cleanups.lines().filter(|line| *line == "command").count(), 1);
+    }
+
+    #[test]
+    fn exec_container_skips_options_and_ignores_compose_exec() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(exec_container(&argv(&["docker", "exec", "abc", "sh"])), Some("abc"));
+        assert_eq!(
+            exec_container(&argv(&["/usr/bin/docker", "exec", "-u", "sail", "-i", "abc", "sh"])),
+            Some("abc")
+        );
+        assert_eq!(exec_container(&argv(&["docker", "compose", "exec", "-T", "app"])), None);
+        assert_eq!(exec_container(&argv(&["sh", "exec", "abc"])), None);
+        assert_eq!(exec_container(&argv(&["docker", "exec", "-u", "sail"])), None);
+    }
+
+    /// A rebuild replaces the container a stop was pinned to. The processes
+    /// went with it, so the stop is done — not a failure that blocks the
+    /// next Run forever. A container still up, a Docker that cannot say, or
+    /// a container named rather than identified keeps the original error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_pinned_to_a_removed_container_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nhere=$(dirname \"$0\")\ncase \"$1\" in\n\
+             exec) echo 'Error response from daemon: No such container: c0ffee' >&2; exit 1 ;;\n\
+             ps) [ -f \"$here/daemon-down\" ] && { echo 'Cannot connect to the Docker daemon' >&2; exit 1; }\n\
+                 cat \"$here/running\" 2>/dev/null; exit 0 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned_to = |container: &str| -> Vec<String> {
+            [docker.to_str().unwrap(), "exec", "-u", "sail", container, "sh", "-c", "true"]
+                .map(String::from)
+                .to_vec()
+        };
+        let stop = pinned_to("c0ffee");
+
+        assert_eq!(run_process_stop(&stop, dir.path()).await.unwrap(), Stopped::ContainerGone);
+
+        std::fs::write(dir.path().join("running"), "c0ffee\n").unwrap();
+        let error = run_process_stop(&stop, dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("No such container"), "{error}");
+
+        std::fs::remove_file(dir.path().join("running")).unwrap();
+        assert!(run_process_stop(&pinned_to("app-1"), dir.path()).await.is_err());
+
+        std::fs::write(dir.path().join("daemon-down"), "").unwrap();
+        assert!(run_process_stop(&stop, dir.path()).await.is_err());
+    }
+
+    /// The bug end to end, against a real Docker. A Sail command's stop is
+    /// pinned to the container it started in, and a rebuild removes that
+    /// container while the command runs, so the stop that follows meets
+    /// "No such container". That failure used to be remembered as a cleanup
+    /// that every later Run retried first and could never finish. Now: the
+    /// Run ends on the command's own exit and leaves nothing remembered; a
+    /// cleanup an earlier failure left behind is finished by the next Run;
+    /// and an auto-restarting command ends instead of restarting in a
+    /// container its stop cannot reach.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_a_rebuild_removed_never_blocks_the_next_run() {
+        use crate::custom_command::{CleanupTarget, FailedCleanup};
+        use crate::test_docker::docker_usable;
+
+        if !docker_usable().await {
+            eprintln!("skipping: no usable docker daemon");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join("vendor/bin")).unwrap();
+        std::fs::write(project_dir.join("compose.yaml"), "services: {}\n").unwrap();
+        // A numeric user needs no passwd entry in the stand-in container.
+        std::fs::write(project_dir.join(".env"), "APP_USER=1000\n").unwrap();
+        let engine = Engine::new(
+            crate::EngineConfig::default(),
+            crate::EngineDeps {
+                connector: Arc::new(crate::RealConnector),
+                store: mast_project::MetadataStore::open(dir.path().join("meta")).unwrap(),
+                process_env: Default::default(),
+                runner: Arc::new(crate::RealLifecycleRunner),
+                ownership: crate::acquire_ownership(Some(dir.path().join("lock"))),
+            },
+        );
+        engine.import_project_at(project_dir).await.unwrap();
+        let project = engine.snapshot().projects[0].id.clone();
+        let path = engine.inner.state.lock().unwrap().projects[&project.0].record.path.clone();
+        let runs = || std::fs::read_to_string(path.join("runs")).unwrap_or_default().lines().count();
+        let remembered = || engine.inner.failed_cleanup.lock().unwrap().len();
+
+        let first = run_in_a_container_a_rebuild_removes(&engine, &project, false).await;
+        let error = first.result.unwrap_err();
+        assert!(error.to_string().contains("exited with status 137"), "{error}");
+        assert_eq!(runs(), 1);
+        assert_eq!(remembered(), 0, "a stop pinned to a removed container must not be remembered");
+
+        // What that stop met, and what an earlier Mast remembered because of it.
+        let stop_argv = crate::custom_command::prepare(
+            &path, None, "laravel.test", Some(&first.container), "dev",
+            &["npm".to_string(), "run".into(), "dev".into()], OperationId(1),
+        )
+        .unwrap()
+        .unwrap()
+        .stop_argv;
+        let raw = mast_docker::run_command(&stop_argv, None, &[], Duration::from_secs(15), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(!raw.success() && raw.stderr.contains("No such container"), "{}", raw.stderr);
+        let (old_op, _) = engine.new_operation();
+        engine.inner.failed_cleanup.lock().unwrap().insert(
+            (project.0.clone(), CleanupTarget::Command("dev".into())),
+            FailedCleanup { argv: stop_argv, dir: path.clone(), operation: old_op },
+        );
+        let second = run_in_a_container_a_rebuild_removes(&engine, &project, false).await;
+        assert!(second.result.unwrap_err().to_string().contains("exited with status 137"));
+        assert_eq!(runs(), 2, "the remembered cleanup must not block the next Run");
+        assert_eq!(remembered(), 0);
+
+        let third = run_in_a_container_a_rebuild_removes(&engine, &project, true).await;
+        let error = third.result.unwrap_err();
+        assert!(error.to_string().contains("was not restarted"), "{error}");
+        assert_eq!(runs(), 3, "auto-restart must not start where no Stop can reach");
+        assert_eq!(remembered(), 0);
+    }
+
+    #[cfg(unix)]
+    struct RebuiltRun {
+        result: Result<(), ErrorInfo>,
+        container: String,
+    }
+
+    /// Run `sail npm run dev` pinned to a fresh container — as a rebuild
+    /// leaves it — through a stand-in Sail that removes that container
+    /// partway, as the next rebuild does, and exits as `docker exec` then
+    /// does.
+    #[cfg(unix)]
+    async fn run_in_a_container_a_rebuild_removes(
+        engine: &Engine,
+        project: &ProjectId,
+        auto_restart: bool,
+    ) -> RebuiltRun {
+        use crate::test_docker::{alpine, docker};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (name, _remove) = alpine().await;
+        let id = docker(&["inspect", "-f", "{{.Id}}", &name]).await.stdout.trim().to_string();
+        let path = {
+            let mut state = engine.inner.state.lock().unwrap();
+            let entry = state.projects.get_mut(&project.0).unwrap();
+            entry.summary.services = vec![mast_contract::ServiceState {
+                name: "laravel.test".into(),
+                container_id: Some(id.clone()),
+                state: Some(mast_contract::ContainerState::Running),
+                health: mast_contract::ServiceHealth::Unknown,
+                ui_url: None,
+                db_port: None,
+                orphaned: false,
+                data_volumes: vec![],
+            }];
+            entry.summary.commands = vec![mast_contract::ProjectCommand {
+                name: "dev".into(),
+                command: "sail npm run dev".into(),
+                auto_start: false,
+                cwd: None,
+                after: None,
+                ready_when: None,
+                auto_restart,
+                restart_when_changed: vec![],
+                from_manifest: false,
+            }];
+            entry.record.path.clone()
+        };
+        let sail = path.join("vendor/bin/sail");
+        std::fs::write(
+            &sail,
+            format!("#!/bin/sh\necho run >> runs\ndocker rm -f {name} >/dev/null 2>&1\nexit 137\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sail, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (op, handle) = engine.new_operation();
+        let result = engine.run_project_command(&handle, op, project, "dev").await;
+        RebuiltRun { result, container: id }
     }
 
     #[test]

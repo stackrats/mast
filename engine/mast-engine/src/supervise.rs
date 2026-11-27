@@ -155,26 +155,31 @@ impl Engine {
             };
             child_cancel.cancel();
             let _ = (&mut run).await;
-            let stopped = crate::project_ops::run_process_stop(stop_argv, dir).await;
-            if let Err(error) = stopped {
-                handle
-                    .cancel_failed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.emit_op(
-                    handle,
-                    op,
-                    OperationEventKind::Output {
-                        line: redactor.redact(&error.to_string()),
-                        stderr: true,
-                    },
-                );
-                return Err(error);
-            }
+            let stopped = match crate::project_ops::run_process_stop(stop_argv, dir).await {
+                Ok(stopped) => stopped,
+                Err(error) => {
+                    handle
+                        .cancel_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.emit_op(
+                        handle,
+                        op,
+                        OperationEventKind::Output {
+                            line: redactor.redact(&error.to_string()),
+                            stderr: true,
+                        },
+                    );
+                    return Err(error);
+                }
+            };
             let Some(path) = changed.filter(|_| !handle.cancel.is_cancelled()) else {
                 return Err(ErrorInfo::Internal {
                     message: "cancelled".into(),
                 });
             };
+            if stopped == crate::project_ops::Stopped::ContainerGone {
+                return Err(container_gone(def.title));
+            }
             self.emit_op(
                 handle,
                 op,
@@ -262,21 +267,33 @@ impl Engine {
                     Next::Changed(path)
                 }
             };
-            if let Some(stop_argv) = stop_argv
-                && let Err(error) = crate::project_ops::run_process_stop(stop_argv, run_dir).await
-            {
-                handle
-                    .cancel_failed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.emit_op(
-                    handle,
-                    op,
-                    OperationEventKind::Output {
-                        line: redactor.redact(&error.to_string()),
-                        stderr: true,
-                    },
-                );
-                return Err(error);
+            let mut stopped = crate::project_ops::Stopped::Done;
+            if let Some(stop_argv) = stop_argv {
+                match crate::project_ops::run_process_stop(stop_argv, run_dir).await {
+                    Ok(result) => stopped = result,
+                    Err(error) => {
+                        handle
+                            .cancel_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.emit_op(
+                            handle,
+                            op,
+                            OperationEventKind::Output {
+                                line: redactor.redact(&error.to_string()),
+                                stderr: true,
+                            },
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            let restarts = match &next {
+                Next::Changed(_) => true,
+                Next::Exited(Ok(mast_docker::CommandOutcome::Exited(_))) => cmd.auto_restart,
+                _ => false,
+            };
+            if restarts && stopped == crate::project_ops::Stopped::ContainerGone {
+                return Err(container_gone(&cmd.name));
             }
             match next {
                 Next::Changed(path) => {
@@ -373,6 +390,20 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+/// Why a supervised run ends instead of restarting: its stop is pinned to a
+/// container that is now down, and a restart would land in whichever one
+/// replaced it — running, with no Stop that could reach it. The stop itself
+/// succeeded, so nothing is left to clean up and the next Run starts fresh,
+/// pinned to the new container.
+fn container_gone(name: &str) -> ErrorInfo {
+    ErrorInfo::Internal {
+        message: format!(
+            "the container {name} ran in has stopped or been replaced (a rebuild does \
+             this), so it was not restarted — Run starts it again in the current one"
+        ),
     }
 }
 
@@ -774,6 +805,59 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(error.to_string().contains("still running"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lifecycle")).unwrap(),
+            "start\n"
+        );
+    }
+
+    /// A code change restarts a daemon by stopping it first. When that stop
+    /// finds its pinned container gone, the restart would land in the one
+    /// that replaced it, beyond the reach of every later Stop — so the
+    /// supervisor ends, with nothing left to clean up.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_whose_container_is_gone_is_not_restarted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\ncase \"$1\" in\n\
+             exec) echo 'Error response from daemon: No such container: c0ffee' >&2; exit 1 ;;\n\
+             ps) exit 0 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let engine = test_engine(dir.path());
+        let (op, handle) = engine.new_operation();
+        let path = dir.path().to_path_buf();
+        let flags = handle.clone();
+        let task = tokio::spawn(async move {
+            let argv = ["sh", "-c", "echo start >> lifecycle; exec sleep 300"].map(String::from);
+            let stop = [docker.to_str().unwrap(), "exec", "c0ffee", "sh", "-c", "true"].map(String::from);
+            engine
+                .supervise_process(
+                    &handle,
+                    op,
+                    &mast_laravel::processes::PROCESSES[0],
+                    &argv,
+                    &stop,
+                    &path,
+                    &Redactor::default(),
+                )
+                .await
+        });
+        wait_for_lives(dir.path(), 1).await;
+        std::fs::write(dir.path().join(".env"), "APP_ENV=local\n").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("was not restarted"), "{error}");
+        assert!(!flags.cancel_failed.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("lifecycle")).unwrap(),
             "start\n"
